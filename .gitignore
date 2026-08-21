@@ -18,6 +18,10 @@ env/
 models/
 data/
 
+# ...but the parity fixtures ARE the answer key and must be committed.
+!tests/fixtures/
+!tests/fixtures/*.pt
+
 # CUDA build artifacts (Phase 3)
 *.o
 *.obj

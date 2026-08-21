@@ -1,0 +1,9 @@
+# Normalize line endings: LF in the repo, checked out native on each platform.
+* text=auto eol=lf
+
+# Binary / generated — never touch line endings.
+*.safetensors binary
+*.pt binary
+*.pth binary
+*.bin binary
+*.png binary
