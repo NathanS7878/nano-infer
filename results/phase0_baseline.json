@@ -1,0 +1,94 @@
+{
+  "hardware": "NVIDIA GeForce RTX 3070 (see HARDWARE.md)",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dtype": "torch.float16",
+  "new_tokens": 128,
+  "warmup": 2,
+  "runs": 3,
+  "results": [
+    {
+      "engine": "HF generate()",
+      "batch_size": 1,
+      "new_tokens": 128,
+      "ttft_ms": 63.02579999828595,
+      "inter_token_ms": 51.258307874033605,
+      "tokens_per_sec": 19.474105137862168,
+      "variance_pct": 2.324421582222959,
+      "stable": true,
+      "runs": 3,
+      "ttft_ms_runs": [
+        66.37639999826206,
+        60.23710000226856,
+        63.02579999828595
+      ],
+      "full_ms_runs": [
+        6601.508200001263,
+        6448.72789999863,
+        6572.830900000554
+      ]
+    },
+    {
+      "engine": "HF generate()",
+      "batch_size": 4,
+      "new_tokens": 128,
+      "ttft_ms": 59.92879999757861,
+      "inter_token_ms": 51.94284803151886,
+      "tokens_per_sec": 76.91532876683074,
+      "variance_pct": 1.1945476346275261,
+      "stable": true,
+      "runs": 3,
+      "ttft_ms_runs": [
+        59.92879999757861,
+        64.54470000244328,
+        58.6622000009811
+      ],
+      "full_ms_runs": [
+        6631.70959999843,
+        6711.226700001134,
+        6656.670500000473
+      ]
+    },
+    {
+      "engine": "HF generate()",
+      "batch_size": 16,
+      "new_tokens": 128,
+      "ttft_ms": 67.24709999980405,
+      "inter_token_ms": 50.93992913385219,
+      "tokens_per_sec": 313.3118638214925,
+      "variance_pct": 2.320903526527744,
+      "stable": true,
+      "runs": 3,
+      "ttft_ms_runs": [
+        66.5499999995518,
+        67.24709999980405,
+        68.78440000218689
+      ],
+      "full_ms_runs": [
+        6685.200399999303,
+        6533.491800000775,
+        6536.618099999032
+      ]
+    },
+    {
+      "engine": "HF generate()",
+      "batch_size": 32,
+      "new_tokens": 128,
+      "ttft_ms": 68.32760000179405,
+      "inter_token_ms": 51.35522755904455,
+      "tokens_per_sec": 621.506161612954,
+      "variance_pct": 1.0412686312603372,
+      "stable": true,
+      "runs": 3,
+      "ttft_ms_runs": [
+        66.37409999893862,
+        72.85359999877983,
+        68.32760000179405
+      ],
+      "full_ms_runs": [
+        6618.216899998515,
+        6549.592699997447,
+        6590.441500000452
+      ]
+    }
+  ]
+}
