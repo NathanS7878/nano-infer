@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Model weights & large downloads — pulled from HF cache, never committed
+*.safetensors
+*.bin
+*.pt
+*.pth
+models/
+data/
+
+# CUDA build artifacts (Phase 3)
+*.o
+*.obj
+*.so
+*.pyd
+build/
+*.ninja*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Benchmark scratch — keep committed results in results/ explicitly
+*.tmp
+scratch/

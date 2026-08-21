@@ -1,0 +1,23 @@
+# Reproduce the nano-infer environment:
+#   conda env create -f environment.yml
+#   conda activate nano-infer
+#
+# NOTE: PyTorch is installed via pip from the CUDA 12.4 index (below), NOT from
+# conda, so we get the official CUDA-enabled wheel that bundles the runtime.
+name: nano-infer
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - --index-url https://download.pytorch.org/whl/cu124
+      - torch
+      - --extra-index-url https://pypi.org/simple
+      - transformers
+      - safetensors
+      - tokenizers
+      - huggingface_hub
+      - datasets
+      - accelerate
+      - numpy
