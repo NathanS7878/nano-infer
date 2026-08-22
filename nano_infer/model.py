@@ -7,7 +7,7 @@ raw safetensors weights onto our own code. HF is used only to obtain the weights
 Growth log (append as components land):
   - [x] QwenConfig + weight loader
   - [x] token embedding
-  - [ ] RMSNorm
+  - [x] RMSNorm
   - [ ] RoPE
   - [ ] grouped-query attention
   - [ ] SwiGLU MLP
@@ -77,3 +77,26 @@ def embed_tokens(input_ids: torch.Tensor, weights: dict) -> torch.Tensor:
     """
     table = weights["model.embed_tokens.weight"]      # [vocab, hidden]
     return table[input_ids]                            # fancy-indexing gather
+
+
+# --- component 2: RMSNorm ---------------------------------------------------
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Root-mean-square normalization (no mean-subtraction, no bias).
+
+    x      : [..., hidden]
+    weight : [hidden]   learned per-dimension rescale
+    returns: [..., hidden]  same shape, magnitude-normalized
+
+        rms = sqrt(mean(x^2) + eps)
+        out = (x / rms) * weight
+
+    Dtype choreography matches HF exactly: the normalize is done in fp32 for
+    stability, cast back to the input dtype, THEN multiplied by the weight. Skip
+    the fp32 step and the parity diff balloons — the formula alone isn't enough.
+    """
+    in_dtype = x.dtype
+    x = x.to(torch.float32)
+    variance = x.pow(2).mean(dim=-1, keepdim=True)     # mean of squares
+    x = x * torch.rsqrt(variance + eps)                # 1/rms, in fp32
+    return weight * x.to(in_dtype)                      # back to fp16, then rescale

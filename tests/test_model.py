@@ -41,3 +41,18 @@ def test_embedding_matches_hf(hf, weights):
           f"hidden {tuple(ours.shape)}")
     print(f"[embedding] max abs diff vs HF: {max_diff:.2e}")
     assert max_diff == 0.0, "same table + same gather must be bit-identical"
+
+
+def test_rmsnorm_matches_hf(hf, weights):
+    model, tok = hf
+    cf = M.QwenConfig()
+    ids = encode_prompt(tok, PROMPT)
+    x = M.embed_tokens(ids, weights)                    # feed real hidden states in
+
+    w = weights["model.layers.0.input_layernorm.weight"]
+    ours = M.rms_norm(x, w, cf.rms_norm_eps)            # our RMSNorm
+    ref = model.model.layers[0].input_layernorm(x)      # HF's RMSNorm, same input
+
+    max_diff = (ours.float() - ref.float()).abs().max().item()
+    print(f"\n[rmsnorm] max abs diff vs HF: {max_diff:.2e}  (fp16 tol 1e-3)")
+    assert max_diff < 1e-3, f"RMSNorm diff {max_diff:.2e} exceeds fp16 tolerance"
