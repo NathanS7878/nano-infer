@@ -9,7 +9,7 @@ Growth log (append as components land):
   - [x] token embedding
   - [x] RMSNorm
   - [x] RoPE
-  - [ ] grouped-query attention
+  - [x] grouped-query attention
   - [ ] SwiGLU MLP
   - [ ] full block / stack / final norm + tied logits
   - [ ] greedy decode (no cache)
@@ -21,6 +21,7 @@ import os
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
@@ -147,3 +148,68 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
     q_rot = q * cos + rotate_half(q) * sin
     k_rot = k * cos + rotate_half(k) * sin
     return q_rot, k_rot
+
+
+# --- component 4: grouped-query attention ----------------------------------
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """GQA: make each of the few KV heads serve n_rep query heads by repeating it.
+
+    x : [batch, num_kv_heads, seq, head_dim]  ->  [batch, num_kv_heads*n_rep, seq, head_dim]
+
+    The reshape order maps query head h to KV head h // n_rep, so query heads
+    0..6 share KV head 0, and 7..13 share KV head 1 (n_rep = 14/2 = 7). This is
+    memory, not compute: we don't store 14 KV heads, only 2 — that's the whole
+    point of GQA, and why the KV cache is 7x smaller than it would be otherwise.
+    """
+    if n_rep == 1:
+        return x
+    b, n_kv, seq, hd = x.shape
+    return (x[:, :, None, :, :]
+            .expand(b, n_kv, n_rep, seq, hd)
+            .reshape(b, n_kv * n_rep, seq, hd))
+
+
+def attention(x: torch.Tensor, weights: dict, layer: int, cos: torch.Tensor,
+              sin: torch.Tensor, cf: "QwenConfig") -> torch.Tensor:
+    """Full self-attention for one layer (input already RMSNorm'd by the caller).
+
+    x : [batch, seq, hidden]  ->  returns [batch, seq, hidden]
+    """
+    b, seq, _ = x.shape
+    p = f"model.layers.{layer}.self_attn."
+
+    # 1. project to Q, K, V. Qwen puts a bias on all three (o_proj has none).
+    q = F.linear(x, weights[p + "q_proj.weight"], weights[p + "q_proj.bias"])  # [b,seq,896]
+    k = F.linear(x, weights[p + "k_proj.weight"], weights[p + "k_proj.bias"])  # [b,seq,128]
+    v = F.linear(x, weights[p + "v_proj.weight"], weights[p + "v_proj.bias"])  # [b,seq,128]
+
+    # 2. split into heads: q has 14 heads, k/v have 2. -> [b, heads, seq, head_dim]
+    q = q.view(b, seq, cf.num_q_heads, cf.head_dim).transpose(1, 2)   # [b,14,seq,64]
+    k = k.view(b, seq, cf.num_kv_heads, cf.head_dim).transpose(1, 2)  # [b, 2,seq,64]
+    v = v.view(b, seq, cf.num_kv_heads, cf.head_dim).transpose(1, 2)  # [b, 2,seq,64]
+
+    # 3. rotate Q and K by position (RoPE). V is never rotated.
+    q, k = apply_rope(q, k, cos, sin)
+
+    # 4. GQA: expand the 2 KV heads up to 14 so every query head has a partner.
+    n_rep = cf.num_q_heads // cf.num_kv_heads
+    k = repeat_kv(k, n_rep)                                           # [b,14,seq,64]
+    v = repeat_kv(v, n_rep)
+
+    # 5. attention scores: every query dotted with every key, scaled by 1/sqrt(d).
+    scale = cf.head_dim ** -0.5
+    scores = (q @ k.transpose(-1, -2)) * scale                       # [b,14,seq,seq]
+
+    # 6. causal mask: token i may only attend to j <= i (no peeking ahead).
+    mask = torch.triu(torch.full((seq, seq), float("-inf"), device=x.device,
+                                 dtype=torch.float32), diagonal=1)
+    scores = scores.float() + mask                                   # upcast for stable softmax
+
+    # 7. softmax over keys (in fp32, like HF), then blend the values.
+    probs = torch.softmax(scores, dim=-1).to(x.dtype)                # [b,14,seq,seq]
+    out = probs @ v                                                  # [b,14,seq,64]
+
+    # 8. merge heads back and apply the output projection (no bias).
+    out = out.transpose(1, 2).reshape(b, seq, cf.q_dim)              # [b,seq,896]
+    return F.linear(out, weights[p + "o_proj.weight"])

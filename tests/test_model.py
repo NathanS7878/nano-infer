@@ -20,7 +20,8 @@ PROMPT = "The capital of France is"
 
 @pytest.fixture(scope="module")
 def hf():
-    model, tok = load_hf()
+    # eager attention = explicit softmax, the unambiguous reference for parity
+    model, tok = load_hf(attn_implementation="eager")
     return model, tok
 
 
@@ -84,3 +85,36 @@ def test_rope_matches_hf(hf, weights):
     print(f"\n[rope] theta={theta:g}  cos-table diff {cos_diff:.2e}")
     print(f"[rope] rotated Q diff {q_diff:.2e}   rotated K diff {k_diff:.2e}  (tol 1e-3)")
     assert q_diff < 1e-3 and k_diff < 1e-3, "RoPE output exceeds fp16 tolerance"
+
+
+def test_attention_matches_hf(hf, weights):
+    model, tok = hf
+    cf = M.QwenConfig()
+    ids = encode_prompt(tok, PROMPT)
+    seq = ids.shape[1]
+
+    # attention receives the RMSNorm'd hidden states, so normalize first
+    x = M.embed_tokens(ids, weights)
+    normed = M.rms_norm(x, weights["model.layers.0.input_layernorm.weight"], cf.rms_norm_eps)
+
+    # HF reference: call layer 0's attention submodule directly (eager)
+    position_ids = torch.arange(seq, device=cfg.DEVICE).unsqueeze(0)
+    hf_cos, hf_sin = model.model.rotary_emb(normed, position_ids)
+    min_val = torch.finfo(cfg.DTYPE).min
+    causal = torch.triu(torch.full((seq, seq), min_val, dtype=cfg.DTYPE,
+                                   device=cfg.DEVICE), diagonal=1)[None, None]
+    ref = model.model.layers[0].self_attn(
+        hidden_states=normed,
+        position_embeddings=(hf_cos, hf_sin),
+        attention_mask=causal,
+    )[0]
+
+    # ours
+    theta = float(model.config.rope_parameters["rope_theta"])
+    cos, sin = M.build_rope_cache(seq, cf.head_dim, theta)
+    ours = M.attention(normed, weights, 0, cos, sin, cf)
+
+    max_diff = (ours.float() - ref.float()).abs().max().item()
+    print(f"\n[attention] output {tuple(ours.shape)}  max abs diff vs HF: "
+          f"{max_diff:.2e}  (tol 1e-3)")
+    assert max_diff < 1e-3, f"attention diff {max_diff:.2e} exceeds fp16 tolerance"

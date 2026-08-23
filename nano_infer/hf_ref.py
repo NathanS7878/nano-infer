@@ -14,10 +14,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from . import config
 
 
-def load_hf(dtype: torch.dtype = config.DTYPE, device: str = config.DEVICE):
-    """Load Qwen in eval mode, on the GPU, at the given dtype. Returns (model, tok)."""
+def load_hf(dtype: torch.dtype = config.DTYPE, device: str = config.DEVICE,
+            attn_implementation: str | None = None):
+    """Load Qwen in eval mode, on the GPU, at the given dtype. Returns (model, tok).
+
+    attn_implementation: pass "eager" to force explicit-softmax attention (the
+    unambiguous math reference for per-component parity tests); None uses HF's
+    default (sdpa, a fused kernel)."""
     tok = AutoTokenizer.from_pretrained(config.MODEL_NAME)
-    model = AutoModelForCausalLM.from_pretrained(config.MODEL_NAME, dtype=dtype)
+    kwargs = {"dtype": dtype}
+    if attn_implementation is not None:
+        kwargs["attn_implementation"] = attn_implementation
+    model = AutoModelForCausalLM.from_pretrained(config.MODEL_NAME, **kwargs)
     model.to(device).eval()
     return model, tok
 
