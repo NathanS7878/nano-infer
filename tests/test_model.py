@@ -118,3 +118,19 @@ def test_attention_matches_hf(hf, weights):
     print(f"\n[attention] output {tuple(ours.shape)}  max abs diff vs HF: "
           f"{max_diff:.2e}  (tol 1e-3)")
     assert max_diff < 1e-3, f"attention diff {max_diff:.2e} exceeds fp16 tolerance"
+
+
+def test_mlp_matches_hf(hf, weights):
+    model, tok = hf
+    cf = M.QwenConfig()
+    ids = encode_prompt(tok, PROMPT)
+    x = M.embed_tokens(ids, weights)
+    normed = M.rms_norm(x, weights["model.layers.0.post_attention_layernorm.weight"],
+                        cf.rms_norm_eps)
+
+    ours = M.mlp(normed, weights, 0)
+    ref = model.model.layers[0].mlp(normed)
+
+    max_diff = (ours.float() - ref.float()).abs().max().item()
+    print(f"\n[mlp] output {tuple(ours.shape)}  max abs diff vs HF: {max_diff:.2e}  (tol 1e-3)")
+    assert max_diff < 1e-3, f"MLP diff {max_diff:.2e} exceeds fp16 tolerance"

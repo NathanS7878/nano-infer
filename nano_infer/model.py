@@ -10,7 +10,7 @@ Growth log (append as components land):
   - [x] RMSNorm
   - [x] RoPE
   - [x] grouped-query attention
-  - [ ] SwiGLU MLP
+  - [x] SwiGLU MLP
   - [ ] full block / stack / final norm + tied logits
   - [ ] greedy decode (no cache)
 """
@@ -213,3 +213,25 @@ def attention(x: torch.Tensor, weights: dict, layer: int, cos: torch.Tensor,
     # 8. merge heads back and apply the output projection (no bias).
     out = out.transpose(1, 2).reshape(b, seq, cf.q_dim)              # [b,seq,896]
     return F.linear(out, weights[p + "o_proj.weight"])
+
+
+# --- component 5: SwiGLU MLP ------------------------------------------------
+
+def mlp(x: torch.Tensor, weights: dict, layer: int) -> torch.Tensor:
+    """SwiGLU feed-forward. No biases on any projection.
+
+    x : [batch, seq, hidden] -> [batch, seq, hidden]
+
+        gate = x @ Wgate      up = x @ Wup       (both hidden -> intermediate)
+        hidden = silu(gate) * up                 (the gated valve)
+        out    = hidden @ Wdown                  (intermediate -> hidden)
+
+    silu(z) = z * sigmoid(z). The silu(gate) term acts as a smooth, learned gate
+    on `up`: where gate is very negative the valve nearly closes, where positive
+    it opens. Fusing this elementwise step is the Phase 3 SwiGLU kernel.
+    """
+    p = f"model.layers.{layer}.mlp."
+    gate = F.linear(x, weights[p + "gate_proj.weight"])              # [b,seq,4864]
+    up = F.linear(x, weights[p + "up_proj.weight"])                 # [b,seq,4864]
+    hidden = F.silu(gate) * up
+    return F.linear(hidden, weights[p + "down_proj.weight"])         # [b,seq,896]
