@@ -56,3 +56,31 @@ def test_rmsnorm_matches_hf(hf, weights):
     max_diff = (ours.float() - ref.float()).abs().max().item()
     print(f"\n[rmsnorm] max abs diff vs HF: {max_diff:.2e}  (fp16 tol 1e-3)")
     assert max_diff < 1e-3, f"RMSNorm diff {max_diff:.2e} exceeds fp16 tolerance"
+
+
+def test_rope_matches_hf(hf, weights):
+    from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+
+    model, tok = hf
+    cf = M.QwenConfig()
+    seq = 12
+    torch.manual_seed(0)
+    q = torch.randn(1, cf.num_q_heads, seq, cf.head_dim, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    k = torch.randn(1, cf.num_kv_heads, seq, cf.head_dim, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    position_ids = torch.arange(seq, device=cfg.DEVICE).unsqueeze(0)
+
+    # HF reference: its rotary module produces cos/sin, its apply fn rotates
+    hf_cos, hf_sin = model.model.rotary_emb(q, position_ids)
+    ref_q, ref_k = apply_rotary_pos_emb(q, k, hf_cos, hf_sin)
+
+    # ours — rope_theta moved into config.rope_parameters in transformers 5.x
+    theta = float(model.config.rope_parameters["rope_theta"])
+    cos, sin = M.build_rope_cache(seq, cf.head_dim, theta)
+    our_q, our_k = M.apply_rope(q, k, cos, sin)
+
+    cos_diff = (cos.float() - hf_cos.squeeze(0).float()).abs().max().item()
+    q_diff = (our_q.float() - ref_q.float()).abs().max().item()
+    k_diff = (our_k.float() - ref_k.float()).abs().max().item()
+    print(f"\n[rope] theta={theta:g}  cos-table diff {cos_diff:.2e}")
+    print(f"[rope] rotated Q diff {q_diff:.2e}   rotated K diff {k_diff:.2e}  (tol 1e-3)")
+    assert q_diff < 1e-3 and k_diff < 1e-3, "RoPE output exceeds fp16 tolerance"

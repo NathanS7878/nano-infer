@@ -8,7 +8,7 @@ Growth log (append as components land):
   - [x] QwenConfig + weight loader
   - [x] token embedding
   - [x] RMSNorm
-  - [ ] RoPE
+  - [x] RoPE
   - [ ] grouped-query attention
   - [ ] SwiGLU MLP
   - [ ] full block / stack / final norm + tied logits
@@ -100,3 +100,50 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     variance = x.pow(2).mean(dim=-1, keepdim=True)     # mean of squares
     x = x * torch.rsqrt(variance + eps)                # 1/rms, in fp32
     return weight * x.to(in_dtype)                      # back to fp16, then rescale
+
+
+# --- component 3: RoPE (rotary position embedding) -------------------------
+
+def build_rope_cache(seq_len: int, head_dim: int, theta: float,
+                     device: str = cfg.DEVICE, dtype: torch.dtype = cfg.DTYPE):
+    """Precompute cos/sin tables for positions 0..seq_len-1.
+
+    Returns cos, sin each of shape [seq_len, head_dim]. Each of the head_dim/2
+    frequency pairs spins at its own rate theta_i = theta^(-2i/head_dim) — fast
+    hands (small i) and slow hands (large i). The tables are duplicated across the
+    two halves (cat(freqs, freqs)) to match HF's rotate_half layout below.
+
+    Computed in fp32 for a clean trig result, then cast to fp16 like HF does.
+    """
+    # inv_freq[i] = 1 / theta^(2i/head_dim), i = 0..head_dim/2-1   -> [head_dim/2]
+    i = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+    inv_freq = 1.0 / (theta ** (i / head_dim))
+    pos = torch.arange(seq_len, dtype=torch.float32, device=device)   # [seq]
+    freqs = torch.outer(pos, inv_freq)                 # [seq, head_dim/2]
+    emb = torch.cat((freqs, freqs), dim=-1)            # [seq, head_dim] (duplicated)
+    return emb.cos().to(dtype), emb.sin().to(dtype)
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """HF/Llama layout: pair dim i with dim i+head_dim/2. Takes the second half,
+    negates it, and moves it to the front: [x1, x2] -> [-x2, x1]."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
+               sin: torch.Tensor):
+    """Rotate the query and key vectors by their positions.
+
+    q, k    : [batch, heads, seq, head_dim]
+    cos,sin : [seq, head_dim]  -> broadcast over batch and heads
+    returns : rotated q, k of the same shapes
+
+        x_rotated = x * cos + rotate_half(x) * sin
+    """
+    cos = cos.unsqueeze(0).unsqueeze(0)                 # [1, 1, seq, head_dim]
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    q_rot = q * cos + rotate_half(q) * sin
+    k_rot = k * cos + rotate_half(k) * sin
+    return q_rot, k_rot
