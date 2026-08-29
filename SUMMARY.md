@@ -1,0 +1,421 @@
+# nano-infer — Project Summary
+
+A single-GPU LLM inference engine written from scratch: custom forward pass, KV
+cache, CUDA kernels, and INT8/INT4 quantization. This document is the complete
+record — what it is, how it was built, what was measured, what was learned, and
+what went wrong along the way.
+
+**Author:** Nathan (Iceboy66) · **Started:** 2026-08-20 · **Status:** Phases 0–1 complete
+
+---
+
+## 1. What this is and why it exists
+
+The goal, in one sentence: **load an open-weights transformer, generate tokens
+without `model.generate()`, vLLM, TensorRT-LLM, or FlashAttention, and beat a
+naive PyTorch baseline by a measured, honestly-reported margin.**
+
+This is the GPU-worker layer beneath **MiniDynamo**, a distributed
+KV-cache-aware LLM inference *router* (Rust + Python, modeled on NVIDIA Dynamo).
+The two projects tell one coherent story across the serving stack:
+
+| Layer | Project | Question it answers |
+|---|---|---|
+| Distributed routing | MiniDynamo | *Which worker* should run this request? |
+| Single-GPU execution | **nano-infer** | What does that worker *actually do* on the GPU? |
+
+They share one central idea at two scales. MiniDynamo routes a request to the
+worker that already holds its **prefix** in cache, so an expensive prefill is
+skipped *across requests*. nano-infer uses a KV cache so the frozen past is not
+recomputed *within* a request. Same insight — cached work is reusable because the
+past never changes — applied at the cluster level and at the kernel level.
+
+### Rules the project holds itself to
+
+1. HuggingFace is used for **weights and tokenizer download only**. The forward
+   pass, sampling loop, and cache are ours.
+2. No vLLM, TensorRT-LLM, FlashAttention, or xformers. We benchmark *against*
+   them; we do not import them.
+3. Every performance claim needs a number, a methodology, and a hardware spec —
+   reproducible by a script in this repo.
+4. **Correctness gates every optimization.** Numerical parity tests run before
+   speed is ever measured.
+5. **Report where it gets worse.** Quantization degrades quality; small batches
+   waste the GPU. Say so, with numbers.
+6. Commit incrementally with real messages. The git history is part of the artifact.
+
+---
+
+## 2. Hardware and environment
+
+Every number in this document came from one machine. Full detail in
+[HARDWARE.md](HARDWARE.md).
+
+| Component | Spec |
+|---|---|
+| GPU | NVIDIA GeForce RTX 3070, 8 GB GDDR6, Ampere **sm_86**, 46 SMs |
+| **Theoretical peak memory bandwidth** | **448 GB/s** (256-bit bus × 14 Gbps) |
+| FP16 tensor peak | ~163 TFLOP/s |
+| CPU / RAM | Intel i5-8600K (6C/6T) · 31.9 GB |
+| OS | Windows 10 Home 19045 |
+| Python / PyTorch | 3.12 (conda-forge) · torch 2.6.0+cu124 |
+| transformers | 5.15.1 (weights + tokenizer only) |
+
+The 448 GB/s figure is the denominator for every bandwidth-utilization claim in
+Phase 3. The **roofline ridge** is ~364 FLOP/byte (163e12 / 448e9): any operation
+doing less arithmetic than that per byte moved is memory-bound on this card. LLM
+decode sits far below the ridge — which is why decode is memory-bound, and why
+the whole optimization strategy targets memory traffic rather than math.
+
+**Known gap:** `nvcc` (the CUDA compiler) is not installed. The torch wheel
+bundles the CUDA *runtime*, which is enough to run PyTorch's GPU kernels, but
+compiling our own `.cu` files in Phase 3 requires the toolkit. First task of Phase 3.
+
+### Model
+
+`Qwen/Qwen2.5-0.5B-Instruct` — architecture read from the checkpoint, not assumed:
+
+| Property | Value | Consequence |
+|---|---|---|
+| Layers | 24 | |
+| hidden_size | 896 | |
+| intermediate_size | 4864 | SwiGLU width |
+| Attention heads | **14 query / 2 KV** | GQA: 7 query heads per KV head |
+| head_dim | 64 | |
+| vocab_size | 151,936 | logits vector length |
+| rms_norm_eps | 1e-6 | |
+| rope_theta | 1,000,000 | supports 32k context |
+| **tie_word_embeddings** | **True** | no `lm_head` — output projection reuses the embedding matrix |
+| Params | 494,032,768 | "0.5B" is rounded up |
+
+GQA is visible directly in the weight shapes: `q_proj` outputs 896 (14×64) while
+`k_proj`/`v_proj` output only 128 (2×64). The KV cache is 7× smaller than it
+would be under full multi-head attention. Qwen also puts a **bias on q/k/v** but
+not on `o_proj` or any MLP projection — a detail that would silently corrupt
+output if assumed rather than checked.
+
+---
+
+## 3. Phase 0 — Ground truth ✅
+
+**Goal:** build the ruler and the answer key *before* building the engine, so
+every later speed claim is measurable and every optimization is checked.
+
+### Deliverable 1: the benchmark harness (`bench/harness.py`)
+
+Measures **TTFT** (time to first token), **inter-token latency**, and
+**tokens/sec** at batch sizes 1/4/16/32. Two correctness rules are baked in:
+
+- **`torch.cuda.synchronize()` before every timer stop.** GPU kernel launches are
+  asynchronous — the Python call returns while the GPU is still working. Stopping
+  the clock without synchronizing measures *how long it took to ask*, not how long
+  the work took. This is the classic way to publish impossibly-fast fake numbers.
+- **Warmup runs, discarded.** The first calls pay one-time costs (CUDA context
+  creation, allocator warmup, kernel autotuning).
+
+The harness is generic over a `generate_fn(input_ids, max_new_tokens)` callable,
+so the same ruler measures HuggingFace and our engine under identical conditions.
+
+### Deliverable 2: the correctness answer key (`tests/`)
+
+`tests/capture_reference.py` runs HF in a manual greedy loop and freezes: the
+prompt token ids, the 50 greedily-decoded continuation tokens, the **full fp16
+logit vector** at the first decode step, and per-step top-5 (id, logit) pairs —
+for 5 varied prompts. 1.47 MB, committed to the repo.
+
+`tests/test_parity.py` verifies the fixture is well-formed and — critically —
+that a fresh HF run **reproduces it exactly**. That determinism check is what
+makes the answer key trustworthy.
+
+### Baseline results (Qwen2.5-0.5B, fp16, 128 new tokens)
+
+| Batch | Tokens/sec | TTFT (ms) | Inter-token (ms) | Variance |
+|---|---|---|---|---|
+| 1 | 19.5 | 63.0 | 51.3 | 2.3% |
+| 4 | 76.9 | 59.9 | 51.9 | 1.2% |
+| 16 | 313.3 | 67.3 | 50.9 | 2.3% |
+| 32 | 621.5 | 68.3 | 51.4 | 1.0% |
+
+**Acceptance: PASS** — variance 1.0–2.3%, all under the 3% bar.
+
+### Finding #1: the baseline measured the project's own thesis
+
+**Inter-token latency is flat (~51 ms) whether serving 1 sequence or 32**, so
+tokens/sec scales almost linearly with batch (19.5 → 621.5, a 32× batch giving a
+31.9× throughput). The reason: each decode step's dominant cost is hauling the
+model's weights out of VRAM, and that haul is paid **once per step regardless of
+batch size**. Thirty-two sequences share one haul.
+
+The corollary is Rule 5 made visible: **at batch 1 the GPU is almost entirely
+wasted** — the full weight-streaming cost is paid to produce a single token. The
+gap between the batch-1 and batch-32 rows is the inefficiency the rest of the
+project exists to reclaim.
+
+---
+
+## 4. Phase 1 — Correct but slow ✅
+
+**Goal:** rebuild the entire forward pass in plain PyTorch, loading raw
+safetensors onto our own code. No HF model classes, no `generate()`. Greedy
+decode with **no cache** — recompute the whole sequence every step. Deliberately
+the slow, obviously-correct version.
+
+### Method: one component at a time, each verified before the next
+
+Correctness was accrued incrementally so a bug would surface the moment the piece
+containing it was added, rather than as a wall of wrong logits 300 lines later.
+Each component was checked against the equivalent HuggingFace internal output.
+
+| # | Component | What it does | Max abs diff vs HF |
+|---|---|---|---|
+| 1 | Token embedding | Gather each token id's row from a (151936, 896) table | **0.00e+00** |
+| 2 | RMSNorm | `x / sqrt(mean(x²)+eps) * weight`; no mean-subtraction, no bias | **0.00e+00** |
+| 3 | RoPE | Rotate Q and K by position × frequency | **0.00e+00** |
+| 4 | GQA attention | Q/K/V → heads → RoPE → repeat_kv → scores → causal mask → softmax → blend → o_proj | **0.00e+00** |
+| 5 | SwiGLU MLP | `silu(gate) * up`, then down-projection | **0.00e+00** |
+| — | **Full forward** (24 layers + final norm + tied logits) | | **0.00e+00** |
+
+### The components, briefly
+
+**RoPE** encodes word order. Attention's dot products are position-blind on their
+own. RoPE rotates each token's Q and K by an angle proportional to its position,
+which makes the dot product of a query at position *m* with a key at position *n*
+depend only on `cos((m−n)·θ)` — **absolute positions cancel, relative distance
+survives.** The 64-dim head vector is split into 32 pairs, each rotating at its
+own frequency (fast and slow "clock hands"), so every position gets a unique
+fingerprint without wrapping out to 32k tokens.
+
+**GQA** is the memory optimization. `repeat_kv` expands the 2 stored KV heads up
+to 14 so every query head has a partner (query head *h* uses KV head *h*//7).
+This is a memory decision, not a compute one: we store 2 heads of K and V, not
+14, which is exactly why the KV cache is 7× smaller.
+
+**Residual connections** are what let 24 layers stack. Each block computes a
+small *refinement* that is added onto the signal (`x = residual + attention(...)`)
+rather than replacing it, so a block never has to rebuild the whole representation.
+
+### Finding #2: fp16 is deterministic, and that is a testing superpower
+
+I predicted a small nonzero difference at RMSNorm ("it does real arithmetic"),
+then at RoPE ("lots of multiply-adds"), then at attention. **All three came back
+bit-identical.** Floating-point is deterministic: the same operations, in the same
+order, at the same precision, produce the same bits. Every rounding error we make,
+HF makes identically.
+
+The corollary matters for later: nonzero diffs appear when an implementation
+**diverges in structure**, not merely when it does arithmetic. That is what the
+1e-3 tolerance is really reserved for — Phase 3, when our fused kernels stop
+mirroring PyTorch op-for-op.
+
+The dtype choreography had to be matched exactly, though. RMSNorm normalizes in
+**fp32**, casts back to fp16, *then* multiplies by the learned weight. Getting the
+formula right but the cast order wrong would have produced a real error.
+
+### Finding #3 (the debugging story): the answer key was wrong, not the engine
+
+The Phase 1 acceptance test — greedy-decode 5 prompts × 50 tokens, require
+token-for-token identity — failed twice. Neither failure was a bug in our code.
+
+**Failure A — prompt 2 diverged at step 0.** Our top-2 logits were
+`'Certainly'=23.9062` and `` '```' ``=23.8750; the fixture's were
+`` '```' ``=23.9062 and `'Certainly'=23.9062`. A near-tie, broken differently.
+
+Diagnosis: the fixture had been captured with HuggingFace's **default SDPA**
+attention (a fused kernel), while our engine mirrors **eager** attention (explicit
+softmax). Measured difference: our forward was `0.00e+00` vs HF eager on all five
+prompts, but ~0.06–0.13 logit vs HF SDPA — small per-layer rounding accumulated
+over 24 layers, enough to flip a coin-flip token.
+
+**Failure B — prompt 4 diverged at step 9.** Diagnosis: the fixture used a **KV
+cache**; our Phase 1 engine has none and recomputes the full sequence. Verified by
+running HF's *own* eager model both ways: **it diverges from itself at exactly
+step 9**, with a steady ~0.04 logit difference between the cached and uncached
+paths.
+
+**The fix was to the reference, not the engine:** regenerate the fixture using the
+same procedure the engine under test uses — eager attention, no cache.
+
+> **Lesson:** a correctness answer key must be produced by a *deterministic
+> reference implementation matching the engine under test* — not by an optimized
+> kernel, and not by a different decode path. Otherwise a benign near-tie reads as
+> a false failure, and the temptation is to loosen the tolerance until the test
+> passes, which destroys the test's value.
+
+This has a direct consequence for Phase 2: adding a KV cache may legitimately flip
+near-tied tokens relative to Phase 1's no-cache output. "Output still matches
+Phase 1 exactly" needs to be evaluated with that in mind, and any divergence
+proven to be a near-tie rather than a bug.
+
+### Acceptance: PASS
+
+All 5 prompts, 50 tokens each, **token-for-token identical to HuggingFace**. Full
+forward bit-identical (0.00e+00) to HF eager. 9 tests green.
+
+```
+[0] OK  'What is the capital of France?'       -> 'The capital of France is Paris...'
+[1] OK  'If a train travels 60 miles...'       -> 'To calculate the average speed...'
+[2] OK  'Write a one-line Python function...'  -> "Certainly! Here's a one-line..."
+[3] OK  'List three primary colors.'           -> 'Three primary colors are red, blue, and yellow...'
+[4] OK  'Explain in one sentence why...'       -> 'The sky is blue because...'
+```
+
+---
+
+## 5. Measuring the Phase 1 engine — the honest "before"
+
+Reproduce with `python -m bench.phase1_nocache`. Results in
+`results/phase1_nocache.json`.
+
+### Measurement A: cost of one forward pass vs sequence length
+
+| Sequence length | One forward pass | µs per token |
+|---|---|---|
+| 32 | 38.5 ms | 1203.4 |
+| 64 | 37.7 ms | 588.8 |
+| 128 | 37.0 ms | 289.2 |
+| 256 | 39.9 ms | 155.8 |
+| 512 | 39.7 ms | 77.5 |
+| 1024 | 77.9 ms | 76.0 |
+| 2048 | 223.4 ms | 109.1 |
+| 4096 | 692.1 ms | 169.0 |
+
+### Finding #4: there are two regimes, and the knee is around 512–1024 tokens
+
+I expected this curve to grow quadratically from the start. **It does not.** From
+32 to 512 tokens the forward pass costs a flat ~38–40 ms — processing 16× more
+tokens for free.
+
+The reason is Finding #1 again: at batch 1 and short sequences the pass is
+**bound by streaming ~1 GB of fp16 weights out of VRAM** (plus roughly 170 kernel
+launches across 24 layers). The attention math over 32 vs 512 positions is noise
+next to that fixed cost. Only past ~1024 tokens does attention's O(seq²) term
+dominate — and then it bites hard: 2048→4096 costs 3.1×, converging on the 4× of
+true quadratic scaling.
+
+At 448 GB/s theoretical peak, streaming 988 MB of weights should take ~2.2 ms. We
+measure ~38 ms — roughly **6% of peak bandwidth**. That gap is PyTorch's
+per-operation overhead and unfused memory round-trips, and it is precisely what
+Phase 3's custom kernels target.
+
+### Measurement B: head-to-head vs the HuggingFace baseline
+
+128 new tokens, identical prompt, CUDA-synchronized, 2 runs, 1 warmup.
+
+| Batch | nano-infer Phase 1 (tok/s) | HF `generate()` (tok/s) | Ratio | Wall clock |
+|---|---|---|---|---|
+| 1 | **25.4** | 22.5 | **1.13×** | 5.0 s vs 5.7 s |
+| 4 | 76.4 | 88.6 | 0.86× | 6.7 s vs 5.8 s |
+| 16 | 50.5 | 356.5 | 0.14× | 40.5 s vs 5.7 s |
+| 32 | 53.3 | 712.4 | **0.07×** | 76.8 s vs 5.7 s |
+
+### Finding #5: no-cache wins at batch 1 and collapses at batch 32
+
+At **batch 1 our from-scratch engine is 13% faster than HuggingFace** despite
+recomputing the entire sequence every step. Two reasons: (a) as Finding #4 shows,
+recompute is nearly free in the weight-bound regime, and (b) our decode loop is a
+tight `forward → argmax → append`, while `generate()` carries logits processors,
+stopping criteria, and cache bookkeeping in Python on every step.
+
+At **batch 32 we are 13× slower.** Once the batch is large, recompute stops being
+free: every step processes batch × sequence token-positions (32 × ~160 ≈ 5,120)
+against HF's cached 32. The engine crosses from memory-bound into compute-bound,
+and the redundant work becomes the entire cost.
+
+Our own scaling shows the crossover clearly: 25.4 → 76.4 tok/s from batch 1→4
+(near-linear, still memory-bound), then **50.5 → 53.3** from batch 16→32 —
+essentially flat. The "extra sequences are free" property has evaporated because
+the GPU is now saturated with redundant arithmetic instead of waiting on memory.
+
+**This is exactly the gap Phase 2 closes**, and it is why the KV cache is the
+right next step rather than jumping to custom kernels: the largest win available
+is algorithmic, not hardware-level.
+
+---
+
+## 6. What was learned
+
+1. **Decode is memory-bound.** Flat ~51 ms inter-token latency across a 32× range
+   of batch sizes is the measurement that proves it, and it explains why batching,
+   quantization, and fused kernels all attack *memory traffic* rather than math.
+2. **Small batches waste the GPU.** The full weight-streaming cost buys one token.
+3. **Quadratic attention cost does not matter until it does.** Below ~512 tokens
+   the O(seq²) term is invisible under weight streaming; past ~1024 it dominates.
+   Optimizing for it earlier would have been optimizing the wrong thing.
+4. **fp16 is deterministic**, so an implementation that mirrors a reference
+   op-for-op matches bit-for-bit. Differences signal structural divergence.
+5. **A correctness baseline must match the engine's own procedure** — same
+   attention implementation, same cache behavior — or near-ties produce false
+   failures. (The debugging story, §4 Finding #3.)
+6. **Build the measuring tools first.** Every finding above came from Phase 0
+   infrastructure that existed before there was anything to measure.
+
+---
+
+## 7. Roadmap
+
+| Phase | Status | Content |
+|---|---|---|
+| 0 — Ground truth | ✅ Complete | Hardware spec, benchmark harness, reference fixture, HF baseline |
+| 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
+| 2 — KV cache & batching | ▶ Next | Paged KV cache (blocks, block table, free-list), prefill/decode split, continuous batching |
+| 3 — Custom CUDA kernels | Planned | Fused RMSNorm → fused SwiGLU → RoPE → decode attention with online softmax. Each with parity test, microbenchmark, and **% of peak bandwidth** |
+| 4 — Quantization | Planned | INT8 weight-only, then INT4 group-wise (g=128) + fused dequant-matmul. Perplexity cost measured on WikiText-2 |
+| 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |
+
+### Phase 2 specifics
+
+- **Paged KV cache** — fixed-size blocks, a block table per sequence, a free-block
+  allocator. Less fragmentation than one contiguous reservation per sequence, and
+  it is the storage layer that MiniDynamo's prefix-affinity routing sits on top of.
+- **Prefill / decode split** — prefill processes the whole prompt at once
+  (compute-bound); decode does one token at a time against the cache
+  (memory-bound). The two phases have opposite bottlenecks and want different code.
+- **Continuous batching** — sequences join and leave the running batch as they
+  finish, instead of the whole batch waiting for its slowest member.
+- **Measurement plan** — the fixed-batch table (1/4/16/32) will not by itself
+  capture continuous batching's benefit, because that benefit is about a *dynamic*
+  workload. A request-stream simulation with varied output lengths, comparing
+  continuous against static batching, is a separate Phase 2 deliverable.
+
+---
+
+## 8. Reproducing everything
+
+```bash
+conda create -y -n nano-infer -c conda-forge --override-channels python=3.12
+conda activate nano-infer
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+pip install transformers safetensors tokenizers huggingface_hub datasets accelerate numpy pytest
+```
+
+| Command | What it does |
+|---|---|
+| `python -m tests.capture_reference` | Regenerate the correctness fixture (eager, no cache) |
+| `python -m pytest tests/ -v` | All parity tests: components, full forward, greedy acceptance |
+| `python -m bench.harness` | HuggingFace baseline at batch 1/4/16/32 |
+| `python -m bench.phase1_nocache` | Growth curve + head-to-head vs baseline |
+
+### Repository layout
+
+```
+nano_infer/     config.py, hf_ref.py, model.py — the engine
+bench/          harness.py, phase1_nocache.py — measurement
+tests/          capture_reference.py, test_parity.py, test_model.py, fixtures/
+results/        committed benchmark outputs
+```
+
+### Commit history
+
+The git history is deliberately incremental — one verified component per commit.
+
+```
+Phase 1 COMPLETE: assemble full model + greedy decode (matches HF token-for-token)
+Phase 1: SwiGLU MLP (verified vs HF, bit-identical)
+Phase 1: grouped-query attention (verified vs HF eager)
+Phase 1: RoPE (verified vs HF, bit-identical)
+Phase 1: RMSNorm (verified vs HF, bit-identical)
+Phase 1: model skeleton + token embedding (verified vs HF)
+Phase 0: benchmark harness + HF baseline — ground truth complete
+Phase 0: capture HF reference fixture and parity tests
+Phase 0: scaffold repo and record hardware ground truth
+```

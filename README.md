@@ -9,7 +9,9 @@ It is the GPU-worker layer beneath [MiniDynamo](https://github.com/) *(link TBD)
 a distributed KV-cache-aware inference router. MiniDynamo decides *which worker*
 runs a request; nano-infer is what that worker actually does on the GPU.
 
-> **Status:** Phase 0 (ground truth) — in progress. See [PROGRESS.md](PROGRESS.md).
+> **Status:** Phases 0–1 complete (from-scratch forward pass matches HuggingFace
+> token-for-token). **Full project write-up: [SUMMARY.md](SUMMARY.md)** — what was
+> built, what was measured, and what went wrong. Running log: [PROGRESS.md](PROGRESS.md).
 
 ## Hardware
 

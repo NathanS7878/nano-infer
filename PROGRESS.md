@@ -80,6 +80,33 @@ the engine under test, not an optimized kernel or a different decode path.
 - [x] Token-for-token identical to HF greedy decode, 5 prompts × 50 tokens.
 - [x] Max abs logit diff < 1e-3 in fp16 (actually 0.00e+00 vs HF eager).
 
+### Measured "before" (bench/phase1_nocache.py)
+
+Forward-pass cost vs sequence length — **two regimes**, knee at ~512–1024 tokens:
+
+| seq | 32 | 128 | 512 | 1024 | 2048 | 4096 |
+|---|---|---|---|---|---|---|
+| one forward | 38.5 ms | 37.0 ms | 39.7 ms | 77.9 ms | 223.4 ms | 692.1 ms |
+
+Flat to 512 (weight-streaming-bound: ~1 GB of fp16 weights dominates), then
+O(seq²) attention takes over (2048→4096 = 3.1×, approaching quadratic 4×).
+~38 ms to stream 988 MB is ~6% of the 448 GB/s peak — the headroom Phase 3 targets.
+
+Head-to-head vs HF baseline, 128 new tokens:
+
+| Batch | ours (tok/s) | HF (tok/s) | ratio |
+|---|---|---|---|
+| 1 | 25.4 | 22.5 | **1.13×** |
+| 4 | 76.4 | 88.6 | 0.86× |
+| 16 | 50.5 | 356.5 | 0.14× |
+| 32 | 53.3 | 712.4 | **0.07×** |
+
+**We beat HF at batch 1** (recompute is nearly free in the weight-bound regime;
+our loop has less Python overhead than `generate()`), and lose 13× at batch 32
+(recompute becomes the bottleneck — our own scaling flattens, 50.5→53.3 from
+batch 16→32, as the GPU crosses from memory-bound to compute-bound). This is the
+gap Phase 2's KV cache closes. Full analysis in [SUMMARY.md](SUMMARY.md).
+
 ---
 
 ## Phase 2 — KV cache and batching (not started)

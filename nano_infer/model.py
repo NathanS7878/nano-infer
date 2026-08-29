@@ -283,13 +283,18 @@ def forward(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig") -> torch.T
 def greedy_decode(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
                   max_new_tokens: int) -> torch.Tensor:
     """Greedy decode with NO cache: recompute the whole sequence every step, take
-    the argmax of the last position, append, repeat. Returns [max_new_tokens] ids."""
+    the argmax of the last position, append, repeat.
+
+    input_ids : [batch, seq]  ->  returns [batch, max_new_tokens]
+
+    Step t recomputes seq+t tokens, so total work grows with the SQUARE of the
+    output length. That is the cost Phase 2's KV cache exists to remove.
+    """
     ids = input_ids
     generated = []
     for _ in range(max_new_tokens):
-        logits = forward(ids, weights, cf)                           # [1,seq,vocab]
-        next_id = int(logits[0, -1].argmax())
-        generated.append(next_id)
-        ids = torch.cat(
-            [ids, torch.tensor([[next_id]], device=ids.device)], dim=1)
-    return torch.tensor(generated, dtype=torch.long)
+        logits = forward(ids, weights, cf)                           # [b,seq,vocab]
+        next_ids = logits[:, -1].argmax(dim=-1)                      # [b]
+        generated.append(next_ids)
+        ids = torch.cat([ids, next_ids.unsqueeze(1)], dim=1)
+    return torch.stack(generated, dim=1)                             # [b, new_tokens]

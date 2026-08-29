@@ -170,7 +170,7 @@ def test_greedy_matches_fixture(weights):
 
     for i, (prompt, ref_p) in enumerate(zip(cfg.PROMPTS, ref["prompts"])):
         ids = encode_prompt(tok, prompt)
-        got = M.greedy_decode(ids, weights, cf, cfg.PARITY_NEW_TOKENS)
+        got = M.greedy_decode(ids, weights, cf, cfg.PARITY_NEW_TOKENS)[0]
         ok, div = compare_tokens(ref_p["greedy_ids"], got)
         text = tok.decode(got, skip_special_tokens=True)
         status = "OK" if ok else f"DIVERGES@{div}"
