@@ -109,4 +109,56 @@ gap Phase 2's KV cache closes. Full analysis in [SUMMARY.md](SUMMARY.md).
 
 ---
 
-## Phase 2 — KV cache and batching (not started)
+## Phase 2 — KV cache and batching (in progress)
+
+### Step 1 — Contiguous KV cache + prefill/decode split ✅ (2026-08-20)
+
+`nano_infer/cache.py` (KVCache) + cached paths in `model.py` (`attention_cached`,
+`decoder_block_cached`, `forward_cached`, `generate_cached`). Phase 1's code is
+left untouched as the reference implementation.
+
+**Correctness.** Proving the cache correct required separating two things:
+- *Cache logic*: given the same input, cached hidden states are **bit-identical**
+  to Phase 1 on all 5 prompts (`torch.equal`). The cache is exactly right.
+- *Token output*: 1 divergence in 250 tokens (0.4%), at prompt 4 step 9, where
+  the reference top-1/top-2 gap is **0.0234** — a verified near-tie.
+
+Root cause of that near-tie flip, isolated by experiment: the cache's whole
+purpose is to process one token per step instead of the whole sequence, which
+changes the shape of every matmul in the decode path. Projecting the *same*
+hidden state as `[1,36,896]` vs `[1,1,896]` against the 151936x896 output matrix
+differs by **7.81e-03** — cuBLAS picks different kernels for different shapes and
+they accumulate in different orders. Invisible on a confident token, decisive on
+a coin-flip. **Different matmul shapes are inherent to caching, not a bug.**
+
+**Results** (`bench/phase2_cache.py`, 128 new tokens):
+
+| Batch | Phase 1 no cache | **Phase 2 KV cache** | HF generate() | vs Phase 1 | vs HF |
+|---|---|---|---|---|---|
+| 1 | 25.4 | **26.7** | 22.4 | 1.05x | 1.19x |
+| 4 | 76.4 | **104.5** | 86.8 | 1.37x | 1.20x |
+| 16 | 50.5 | **410.1** | 344.7 | 8.12x | 1.19x |
+| 32 | 53.3 | **831.6** | 686.9 | **15.60x** | 1.21x |
+
+Prefill vs decode — the two phases have opposite bottlenecks, measured:
+
+| Batch | prefill ms | prefill tok/s | decode ms/step | decode tok/s |
+|---|---|---|---|---|
+| 1 | 41.7 | 1,006 | 37.3 | 26.8 |
+| 4 | 45.2 | 3,717 | 38.4 | 104.1 |
+| 16 | 61.0 | 11,013 | 38.3 | 418.3 |
+| 32 | 72.7 | 18,485 | 38.7 | 826.8 |
+
+**Decode is flat at ~38 ms/step across a 32x batch range** — memory-bound, the
+per-step cost is streaming weights + cache out of VRAM regardless of batch.
+**Prefill scales 18x in throughput** for a 1.7x time increase — compute-bound with
+headroom. Prefill moves tokens ~22x more efficiently than decode (18,485 vs 827
+tok/s at batch 32), which is precisely why skipping a prefill via prefix-cache
+routing (MiniDynamo) is worth so much.
+
+**Phase 3 headroom, quantified:** decode at batch 1 takes 37.3 ms to stream ~988 MB
+of weights = **26.5 GB/s, or 5.9% of the RTX 3070's 448 GB/s peak**. That gap is
+PyTorch's unfused memory round-trips, and it is exactly what the custom kernels target.
+
+- [ ] Step 2 — paged cache (fixed blocks, block table, free-block allocator)
+- [ ] Step 3 — continuous batching + request-stream simulation

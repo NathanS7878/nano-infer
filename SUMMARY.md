@@ -5,7 +5,12 @@ cache, CUDA kernels, and INT8/INT4 quantization. This document is the complete
 record — what it is, how it was built, what was measured, what was learned, and
 what went wrong along the way.
 
-**Author:** Nathan (Iceboy66) · **Started:** 2026-08-20 · **Status:** Phases 0–1 complete
+**Author:** Nathan (Iceboy66) · **Started:** 2026-08-20 · **Status:** Phases 0–1 complete, Phase 2 in progress
+
+> **Headline (RTX 3070, Qwen2.5-0.5B-Instruct, fp16, 128 new tokens):** at batch 32
+> the engine reaches **831.6 tok/s — 15.6× faster than its own no-cache version and
+> 1.21× faster than HuggingFace `generate()`** — with output verified against a
+> frozen HuggingFace reference. Full method and caveats below.
 
 ---
 
@@ -332,7 +337,110 @@ is algorithmic, not hardware-level.
 
 ---
 
-## 6. What was learned
+## 6. Phase 2 — KV cache and batching (in progress)
+
+**Goal:** remove the redundant recomputation, algorithmically, before touching a
+single GPU kernel. Phase 1's code stays intact as the reference implementation —
+the cached path is added alongside it, never replacing it.
+
+### Step 1 — Contiguous KV cache + prefill/decode split ✅
+
+`nano_infer/cache.py` holds a preallocated `[layers, batch, kv_heads, max_seq,
+head_dim]` tensor pair. K is cached **after RoPE** — the rotation is part of the
+frozen past. Only the 2 KV heads are stored, not 14 query heads: at batch 32 /
+max_seq 512 that is **192 MB instead of 1,344 MB**, GQA's payoff in bytes, and
+the difference between fitting and not fitting in 8 GB alongside the weights.
+
+Prefill and decode became separate code paths because they want different things.
+Prefill runs the whole prompt at once and needs a causal mask. **Decode needs no
+mask at all** — there is a single query and every cached position is, by
+construction, already in its past.
+
+One further optimization: `forward_cached` projects only the *last* position to
+logits. Computing all positions (as Phase 1 does) is waste during generation —
+at batch 32 with a 34-token prompt that is 330 MB of logits computed to use 9.7 MB.
+
+### Finding #6: proving a cache correct means separating two questions
+
+The Phase 2 acceptance test failed at first, and untangling it produced the most
+useful result of the phase.
+
+**Question 1 — is the cache logic right?** Given the same input, does the cached
+path compute the same hidden states? **Yes, bit-identically** (`torch.equal`) on
+all five prompts. The cache is exactly correct.
+
+**Question 2 — does the output match token-for-token?** Not quite: **1 divergence
+in 250 tokens (0.4%)**, at prompt 4 step 9, where the reference's own top-1/top-2
+logit gap was **0.0234** — a coin flip.
+
+The cause is not a bug, and isolating it was the interesting part. The cache's
+entire purpose is to process **one token per step instead of the whole sequence**,
+which changes the **shape of every matmul in the decode path**. Projecting the
+*same* hidden state as `[1,36,896]` versus `[1,1,896]` against the 151936×896
+output matrix differs by **7.81e-03**, because cuBLAS selects different kernels
+for different shapes and those kernels accumulate in different orders.
+
+> **Lesson:** different matmul shapes are *inherent* to caching, so a real
+> inference engine cannot be bit-identical to its own uncached reference. The
+> right correctness standard is: prove the logic exact where shapes match, then
+> require that any token divergence be a demonstrated near-tie and that the
+> divergence rate stay negligible — rather than loosening a tolerance until the
+> test goes green.
+
+### Results
+
+| Batch | Phase 1 no cache | **Phase 2 KV cache** | HF `generate()` | vs Phase 1 | vs HF |
+|---|---|---|---|---|---|
+| 1 | 25.4 | **26.7** | 22.4 | 1.05× | 1.19× |
+| 4 | 76.4 | **104.5** | 86.8 | 1.37× | 1.20× |
+| 16 | 50.5 | **410.1** | 344.7 | 8.12× | 1.19× |
+| 32 | 53.3 | **831.6** | 686.9 | **15.60×** | 1.21× |
+
+**15.6× over our own Phase 1 at batch 32, and ahead of HuggingFace at every batch
+size** — from an algorithmic change alone, with no custom kernels yet. That
+ordering was deliberate: the largest available win was algorithmic, so it came first.
+
+### Finding #7: the two phases have opposite bottlenecks, measured
+
+| Batch | prefill ms | prefill tok/s | decode ms/step | decode tok/s |
+|---|---|---|---|---|
+| 1 | 41.7 | 1,006 | 37.3 | 26.8 |
+| 4 | 45.2 | 3,717 | 38.4 | 104.1 |
+| 16 | 61.0 | 11,013 | 38.3 | 418.3 |
+| 32 | 72.7 | 18,485 | 38.7 | 826.8 |
+
+**Decode is flat at ~38 ms/step across a 32× range of batch sizes** — memory-bound,
+because the per-step cost is streaming weights and cache out of VRAM and that is
+paid once per step no matter how many sequences ride along. **Prefill throughput
+scales 18×** for a 1.7× increase in time — compute-bound, with the GPU actually
+busy doing arithmetic.
+
+Prefill moves tokens roughly **22× more efficiently than decode** (18,485 vs 827
+tok/s at batch 32). That ratio is the economic argument for prefix-cache routing:
+skipping a prefill is worth far more than speeding up a decode step, which is
+exactly the bet MiniDynamo makes at the cluster level.
+
+### Phase 3 headroom, quantified
+
+Decode at batch 1 takes 37.3 ms to stream ~988 MB of fp16 weights — about
+**26.5 GB/s, or 5.9% of this card's 448 GB/s peak**. The other 94% is lost to
+PyTorch's per-operation overhead and unfused memory round-trips. That is the
+target Phase 3's custom kernels aim at, now measured rather than assumed.
+
+### Remaining in Phase 2
+
+- **Step 2 — paged cache.** Fixed-size blocks, a block table per sequence, a
+  free-block allocator. The contiguous cache preallocates `max_seq` per sequence,
+  so a sequence using 50 of 512 slots still holds all 512 and no memory can be
+  shared. Paging fixes exactly that, and is the storage layer prefix-cache
+  routing sits on.
+- **Step 3 — continuous batching** plus a request-stream simulation, since a
+  fixed-batch table cannot capture a benefit that is about *dynamic* arrival and
+  varied output lengths.
+
+---
+
+## 7. What was learned
 
 1. **Decode is memory-bound.** Flat ~51 ms inter-token latency across a 32× range
    of batch sizes is the measurement that proves it, and it explains why batching,
@@ -348,16 +456,23 @@ is algorithmic, not hardware-level.
    failures. (The debugging story, §4 Finding #3.)
 6. **Build the measuring tools first.** Every finding above came from Phase 0
    infrastructure that existed before there was anything to measure.
+7. **A cache cannot be bit-identical to its uncached reference**, because
+   processing one token instead of many changes every matmul's shape and
+   therefore its fp16 rounding. Prove the logic exact where shapes match; hold
+   token output to "any divergence must be a demonstrated near-tie."
+8. **Take the algorithmic win before the hardware win.** The KV cache delivered
+   15.6× at batch 32 with no GPU code. The measured 5.9%-of-peak bandwidth then
+   tells us where the *next* win lives.
 
 ---
 
-## 7. Roadmap
+## 8. Roadmap
 
 | Phase | Status | Content |
 |---|---|---|
 | 0 — Ground truth | ✅ Complete | Hardware spec, benchmark harness, reference fixture, HF baseline |
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
-| 2 — KV cache & batching | ▶ Next | Paged KV cache (blocks, block table, free-list), prefill/decode split, continuous batching |
+| 2 — KV cache & batching | ◐ In progress | ✅ Contiguous cache + prefill/decode split (15.6× at batch 32). Remaining: paged cache, continuous batching |
 | 3 — Custom CUDA kernels | Planned | Fused RMSNorm → fused SwiGLU → RoPE → decode attention with online softmax. Each with parity test, microbenchmark, and **% of peak bandwidth** |
 | 4 — Quantization | Planned | INT8 weight-only, then INT4 group-wise (g=128) + fused dequant-matmul. Perplexity cost measured on WikiText-2 |
 | 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |
@@ -379,7 +494,7 @@ is algorithmic, not hardware-level.
 
 ---
 
-## 8. Reproducing everything
+## 9. Reproducing everything
 
 ```bash
 conda create -y -n nano-infer -c conda-forge --override-channels python=3.12
@@ -394,6 +509,7 @@ pip install transformers safetensors tokenizers huggingface_hub datasets acceler
 | `python -m pytest tests/ -v` | All parity tests: components, full forward, greedy acceptance |
 | `python -m bench.harness` | HuggingFace baseline at batch 1/4/16/32 |
 | `python -m bench.phase1_nocache` | Growth curve + head-to-head vs baseline |
+| `python -m bench.phase2_cache` | Prefill/decode split + Phase 1 vs Phase 2 vs HF |
 
 ### Repository layout
 

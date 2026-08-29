@@ -298,3 +298,136 @@ def greedy_decode(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
         generated.append(next_ids)
         ids = torch.cat([ids, next_ids.unsqueeze(1)], dim=1)
     return torch.stack(generated, dim=1)                             # [b, new_tokens]
+
+
+# ===========================================================================
+# Phase 2 — KV cache. Everything above is the Phase 1 reference implementation
+# and is deliberately left untouched: it is what the cached path is graded
+# against. The functions below add prefill/decode paths alongside it.
+# ===========================================================================
+
+def attention_cached(x: torch.Tensor, weights: dict, layer: int,
+                     cos: torch.Tensor, sin: torch.Tensor, cf: "QwenConfig",
+                     cache: "KVCache", start_pos: int) -> torch.Tensor:
+    """Attention that reads and writes the KV cache.
+
+    x         : [batch, n, hidden]   n = prompt length (prefill) or 1 (decode)
+    start_pos : absolute position of x[0] in the sequence
+    cos, sin  : [n, head_dim] rotations for exactly those positions
+
+    Prefill (n > 1) needs a causal mask so a token cannot see its future. Decode
+    (n == 1) needs NO mask at all: there is a single query and every cached
+    position is, by construction, in its past.
+    """
+    b, n, _ = x.shape
+    p = f"model.layers.{layer}.self_attn."
+
+    q = F.linear(x, weights[p + "q_proj.weight"], weights[p + "q_proj.bias"])
+    k = F.linear(x, weights[p + "k_proj.weight"], weights[p + "k_proj.bias"])
+    v = F.linear(x, weights[p + "v_proj.weight"], weights[p + "v_proj.bias"])
+
+    q = q.view(b, n, cf.num_q_heads, cf.head_dim).transpose(1, 2)     # [b,14,n,64]
+    k = k.view(b, n, cf.num_kv_heads, cf.head_dim).transpose(1, 2)    # [b, 2,n,64]
+    v = v.view(b, n, cf.num_kv_heads, cf.head_dim).transpose(1, 2)
+
+    # RoPE first, THEN cache: the rotation is part of the frozen past.
+    q, k = apply_rope(q, k, cos, sin)
+
+    cache.append(layer, k, v, start_pos)
+    total = start_pos + n
+    k_all, v_all = cache.view(layer, total)                           # [b,2,total,64]
+
+    n_rep = cf.num_q_heads // cf.num_kv_heads
+    k_all = repeat_kv(k_all, n_rep)                                   # [b,14,total,64]
+    v_all = repeat_kv(v_all, n_rep)
+
+    scale = cf.head_dim ** -0.5
+    scores = (q @ k_all.transpose(-1, -2)) * scale                    # [b,14,n,total]
+    scores = scores.float()
+
+    if n > 1:
+        # causal mask over the [n, total] window: query i (absolute start_pos+i)
+        # may attend to key j only when j <= start_pos + i.
+        q_pos = torch.arange(start_pos, total, device=x.device).unsqueeze(1)
+        k_pos = torch.arange(total, device=x.device).unsqueeze(0)
+        scores = scores.masked_fill(k_pos > q_pos, float("-inf"))
+
+    probs = torch.softmax(scores, dim=-1).to(x.dtype)
+    out = probs @ v_all                                               # [b,14,n,64]
+    out = out.transpose(1, 2).reshape(b, n, cf.q_dim)
+    return F.linear(out, weights[p + "o_proj.weight"])
+
+
+def decoder_block_cached(x: torch.Tensor, weights: dict, layer: int,
+                         cos: torch.Tensor, sin: torch.Tensor, cf: "QwenConfig",
+                         cache: "KVCache", start_pos: int) -> torch.Tensor:
+    """Same pre-norm block as Phase 1, using the cached attention path."""
+    ln = f"model.layers.{layer}."
+    residual = x
+    h = rms_norm(x, weights[ln + "input_layernorm.weight"], cf.rms_norm_eps)
+    x = residual + attention_cached(h, weights, layer, cos, sin, cf, cache, start_pos)
+
+    residual = x
+    h = rms_norm(x, weights[ln + "post_attention_layernorm.weight"], cf.rms_norm_eps)
+    x = residual + mlp(h, weights, layer)
+    return x
+
+
+def forward_cached(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
+                   cache: "KVCache", start_pos: int, rope: tuple) -> torch.Tensor:
+    """Run the stack over `input_ids`, updating the cache. Returns LAST-position
+    logits only: [batch, vocab].
+
+    Computing logits for every position (as Phase 1's forward does) is pure waste
+    during generation — only the last position picks the next token, and the vocab
+    is 151,936 wide. At batch 32 / prompt 34 that is 330 MB of logits computed to
+    use 9.7 MB of them.
+    """
+    cos_all, sin_all = rope
+    n = input_ids.shape[1]
+    cos = cos_all[start_pos:start_pos + n]
+    sin = sin_all[start_pos:start_pos + n]
+
+    x = embed_tokens(input_ids, weights)
+    for i in range(cf.num_layers):
+        x = decoder_block_cached(x, weights, i, cos, sin, cf, cache, start_pos)
+    x = x[:, -1:]                                                     # last position only
+    x = rms_norm(x, weights["model.norm.weight"], cf.rms_norm_eps)
+    return F.linear(x, weights["model.embed_tokens.weight"])[:, 0]    # [b, vocab]
+
+
+@torch.no_grad()
+def generate_cached(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
+                    max_new_tokens: int, cache: "KVCache | None" = None):
+    """Greedy decode with a KV cache: one prefill over the prompt, then one
+    cheap decode step per new token.
+
+    input_ids : [batch, seq]  ->  returns [batch, max_new_tokens]
+    """
+    from .cache import KVCache
+
+    b, seq = input_ids.shape
+    if cache is None:
+        cache = KVCache(cf.num_layers, b, cf.num_kv_heads,
+                        seq + max_new_tokens, cf.head_dim,
+                        dtype=weights["model.norm.weight"].dtype,
+                        device=input_ids.device)
+
+    rope = build_rope_cache(seq + max_new_tokens, cf.head_dim, cf.rope_theta,
+                            device=input_ids.device,
+                            dtype=weights["model.norm.weight"].dtype)
+
+    # --- prefill: whole prompt at once, compute-bound ---
+    logits = forward_cached(input_ids, weights, cf, cache, 0, rope)
+    next_ids = logits.argmax(dim=-1)                                  # [b]
+    generated = [next_ids]
+
+    # --- decode: one token at a time against the cache, memory-bound ---
+    for step in range(1, max_new_tokens):
+        pos = seq + step - 1
+        logits = forward_cached(next_ids.unsqueeze(1), weights, cf, cache, pos, rope)
+        next_ids = logits.argmax(dim=-1)
+        generated.append(next_ids)
+
+    cache.length = seq + max_new_tokens - 1
+    return torch.stack(generated, dim=1)                              # [b, new_tokens]

@@ -1,0 +1,78 @@
+{
+  "hardware": "NVIDIA GeForce RTX 3070 (see HARDWARE.md)",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dtype": "torch.float16",
+  "new_tokens": 128,
+  "prefill_decode_split": [
+    {
+      "batch_size": 1,
+      "prompt_tokens": 42,
+      "prefill_ms": 41.72980000021198,
+      "prefill_tokens_per_sec": 1006.4749890914082,
+      "decode_total_ms": 4737.844500000392,
+      "decode_ms_per_step": 37.3058622047275,
+      "decode_tokens_per_sec": 26.805438633536724
+    },
+    {
+      "batch_size": 4,
+      "prompt_tokens": 42,
+      "prefill_ms": 45.19550000077288,
+      "prefill_tokens_per_sec": 3717.1842328799785,
+      "decode_total_ms": 4877.794399999402,
+      "decode_ms_per_step": 38.407829921255136,
+      "decode_tokens_per_sec": 104.14543097594729
+    },
+    {
+      "batch_size": 16,
+      "prompt_tokens": 42,
+      "prefill_ms": 61.02109999937966,
+      "prefill_tokens_per_sec": 11012.584171816496,
+      "decode_total_ms": 4857.962099999895,
+      "decode_ms_per_step": 38.25167007873933,
+      "decode_tokens_per_sec": 418.28239046987295
+    },
+    {
+      "batch_size": 32,
+      "prompt_tokens": 42,
+      "prefill_ms": 72.70710000011604,
+      "prefill_tokens_per_sec": 18485.127312158715,
+      "decode_total_ms": 4915.2749000004405,
+      "decode_ms_per_step": 38.702951968507406,
+      "decode_tokens_per_sec": 826.8103173638642
+    }
+  ],
+  "head_to_head": [
+    {
+      "batch_size": 1,
+      "phase1_tokens_per_sec": 25.423776617801042,
+      "phase2_tokens_per_sec": 26.694344809306212,
+      "hf_tokens_per_sec": 22.40432661153312,
+      "speedup_vs_phase1": 1.049975588230096,
+      "speedup_vs_hf": 1.191481684415577
+    },
+    {
+      "batch_size": 4,
+      "phase1_tokens_per_sec": 76.36971602764035,
+      "phase2_tokens_per_sec": 104.52592562452584,
+      "hf_tokens_per_sec": 86.81598541383022,
+      "speedup_vs_phase1": 1.3686829159701859,
+      "speedup_vs_hf": 1.2039940009466774
+    },
+    {
+      "batch_size": 16,
+      "phase1_tokens_per_sec": 50.52375949914363,
+      "phase2_tokens_per_sec": 410.1170263327928,
+      "hf_tokens_per_sec": 344.71521944627864,
+      "speedup_vs_phase1": 8.117310160573942,
+      "speedup_vs_hf": 1.1897270651164462
+    },
+    {
+      "batch_size": 32,
+      "phase1_tokens_per_sec": 53.29899718938777,
+      "phase2_tokens_per_sec": 831.5518714991081,
+      "hf_tokens_per_sec": 686.9112515694641,
+      "speedup_vs_phase1": 15.601641969816953,
+      "speedup_vs_hf": 1.2105666774261845
+    }
+  ]
+}
