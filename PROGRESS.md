@@ -160,5 +160,78 @@ routing (MiniDynamo) is worth so much.
 of weights = **26.5 GB/s, or 5.9% of the RTX 3070's 448 GB/s peak**. That gap is
 PyTorch's unfused memory round-trips, and it is exactly what the custom kernels target.
 
-- [ ] Step 2 — paged cache (fixed blocks, block table, free-block allocator)
+### Step 2 — Paged KV cache ✅ (2026-08-20)
+
+`PagedKVCache` + `BlockAllocator` in `cache.py`; `attention_paged` / `forward_paged`
+/ `generate_paged` in `model.py`. Storage is flattened to slots
+(`[num_blocks*block_size, kv_heads, head_dim]` per layer) so a logical position
+maps to a physical slot by one vectorized index:
+`block_table[seq][p // block_size] * block_size + (p % block_size)`.
+
+**Correctness:** paged prefill is **bit-identical** (0.00e+00) to the contiguous
+cache — paging changes where bytes live, not what is computed. Decode shows the
+same single near-tie divergence (1/250) as the contiguous path. Allocator tested
+for allocate / exhaust / release / reuse; uneven-length batches verified.
+
+**Memory** (8 sequences, lengths 50–400, block=16, vs contiguous max_seq=512):
+
+| | slots |
+|---|---|
+| contiguous reserved | 4,096 |
+| paged held | 1,072 (67 blocks) |
+| actually used | 1,025 |
+
+**3.8x fewer slots held, 4.4% internal fragmentation** — waste is bounded by one
+partial block per sequence, versus `max_seq` per sequence.
+
+### Debugging story #2: paging was 4.5x too slow, and the cause was not what I predicted
+
+Prediction before measuring: paging would be somewhat slower than contiguous,
+because gathering scattered blocks materializes a copy each step. Measured at
+batch 32: **0.22x** — paging cost 78% of throughput. Far worse than "somewhat."
+
+Profiling the two suspects separately (batch 32, length 160, per call):
+
+| | before |
+|---|---|
+| `_slots` — rebuild block table from Python lists | **2.263 ms** |
+| indexed read — the actual gather | 0.071 ms |
+| contiguous slice (no copy at all) | 0.018 ms |
+
+**The gather was never the problem.** The data movement cost 0.071 ms against a
+plain slice's 0.018 ms — both negligible. 97% of the cost was rebuilding the
+block-table tensor from Python lists, which happened on *every layer of every
+step* (24 x 128 = 3,072 times per generation, twice each for append and gather).
+
+Two fixes:
+1. **Cache the device-side block table**, rebuilding only when blocks are actually
+   allocated or freed. `_slots`: 2.263 -> 0.295 ms (**7.7x**).
+2. **Hoist slot computation out of the layer loop.** The slot indices and
+   attention mask depend only on positions, not layer contents, so they are
+   identical for all 24 layers. Computed once per step now (`SlotPlan`).
+
+Result:
+
+| Batch | paged before | paged after | gain | cost vs contiguous |
+|---|---|---|---|---|
+| 1 | 15.5 | **23.2** | 1.50x | 0.59x -> **0.86x** |
+| 4 | 53.1 | **92.2** | 1.74x | 0.51x -> **0.85x** |
+| 16 | 135.5 | **369.3** | 2.73x | 0.32x -> **0.89x** |
+| 32 | 183.7 | **664.9** | **3.62x** | 0.22x -> **0.90x** |
+
+Paging now costs ~10% instead of 78%, for 3.8x better memory efficiency.
+**Lesson: profile before optimizing.** The intuitive culprit (memory traffic from
+scattered gathers) was 3% of the cost; the unglamorous one (Python running inside
+the per-layer loop) was 97%.
+
+Current standing (128 new tokens; contiguous bs=32 read 736.4 this run vs 828.4
+earlier — run-to-run variance, the paged/contiguous *ratio* is the stable metric):
+
+| Batch | Phase 1 no cache | Phase 2 contiguous | Phase 2 paged | HF |
+|---|---|---|---|---|
+| 1 | 25.4 | **27.0** | 23.2 | 22.7 |
+| 4 | 76.4 | **107.8** | 92.2 | 88.4 |
+| 16 | 50.5 | **417.2** | 369.3 | 355.3 |
+| 32 | 53.3 | **736.4** | 664.9 | 638.3 |
+
 - [ ] Step 3 — continuous batching + request-stream simulation

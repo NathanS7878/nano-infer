@@ -120,40 +120,53 @@ def main():
         def ours(x, n):
             return M.generate_cached(x, weights, cf, n)
 
+        def paged(x, n):
+            return M.generate_paged(x, weights, cf, n)
+
         def hf(x, n):
             return hf_generate(model, x, n)
 
         for _ in range(args.warmup):
             ours(input_ids, 4)
+            paged(input_ids, 4)
             hf(input_ids, 4)
 
-        our_t, hf_t = [], []
+        our_t, pg_t, hf_t = [], [], []
         for _ in range(args.runs):
             our_t.append(_time_generate(ours, input_ids, args.new_tokens))
+            pg_t.append(_time_generate(paged, input_ids, args.new_tokens))
             hf_t.append(_time_generate(hf, input_ids, args.new_tokens))
 
-        our_s, hf_s = statistics.median(our_t), statistics.median(hf_t)
+        our_s = statistics.median(our_t)
+        pg_s = statistics.median(pg_t)
+        hf_s = statistics.median(hf_t)
         our_tps = bs * args.new_tokens / our_s
+        pg_tps = bs * args.new_tokens / pg_s
         hf_tps = bs * args.new_tokens / hf_s
         p1_tps = p1.get(bs)
         rows.append({
             "batch_size": bs,
             "phase1_tokens_per_sec": p1_tps,
             "phase2_tokens_per_sec": our_tps,
+            "paged_tokens_per_sec": pg_tps,
             "hf_tokens_per_sec": hf_tps,
             "speedup_vs_phase1": (our_tps / p1_tps) if p1_tps else None,
             "speedup_vs_hf": our_tps / hf_tps,
+            "paging_cost": pg_tps / our_tps,
         })
         sp1 = f"{our_tps / p1_tps:5.2f}x" if p1_tps else "  n/a"
-        print(f"   bs={bs:<3d} Phase2={our_tps:8.1f}  Phase1={p1_tps or float('nan'):8.1f}  "
-              f"HF={hf_tps:8.1f}   vs-P1={sp1}  vs-HF={our_tps / hf_tps:5.2f}x")
+        print(f"   bs={bs:<3d} contig={our_tps:8.1f}  paged={pg_tps:8.1f}  "
+              f"Phase1={p1_tps or float('nan'):7.1f}  HF={hf_tps:8.1f}   "
+              f"vs-P1={sp1}  vs-HF={our_tps / hf_tps:5.2f}x  "
+              f"paging={pg_tps / our_tps:5.2f}x")
 
-    lines = ["| Batch | Phase 1 no cache | **Phase 2 KV cache** | HF generate() | "
-             "vs Phase 1 | vs HF |", "|---|---|---|---|---|---|"]
+    lines = ["| Batch | Phase 1 no cache | **Phase 2 contiguous** | Phase 2 paged | "
+             "HF generate() | vs Phase 1 | vs HF |", "|---|---|---|---|---|---|---|"]
     for r in rows:
         p1v = f"{r['phase1_tokens_per_sec']:.1f}" if r["phase1_tokens_per_sec"] else "n/a"
         sp = f"{r['speedup_vs_phase1']:.2f}x" if r["speedup_vs_phase1"] else "n/a"
         lines.append(f"| {r['batch_size']} | {p1v} | **{r['phase2_tokens_per_sec']:.1f}** | "
+                     f"{r['paged_tokens_per_sec']:.1f} | "
                      f"{r['hf_tokens_per_sec']:.1f} | {sp} | {r['speedup_vs_hf']:.2f}x |")
     table = "\n".join(lines)
 

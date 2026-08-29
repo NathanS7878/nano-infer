@@ -427,13 +427,73 @@ Decode at batch 1 takes 37.3 ms to stream ~988 MB of fp16 weights — about
 PyTorch's per-operation overhead and unfused memory round-trips. That is the
 target Phase 3's custom kernels aim at, now measured rather than assumed.
 
+### Step 2 — Paged KV cache ✅
+
+The contiguous cache reserves `max_seq` slots per sequence, so a 50-token
+sequence still holds all 512 and no sequence can borrow another's spare room.
+Paging fixes that the way an operating system does: one shared pool of
+fixed-size **blocks**, a **block table** per sequence mapping logical positions
+to physical blocks, and a **free-list allocator** handing out blocks on demand.
+
+Storage is flattened to slots — `[num_blocks * block_size, kv_heads, head_dim]`
+per layer — so a logical position resolves in one vectorized index:
+
+```
+slot = block_table[seq][p // block_size] * block_size + (p % block_size)
+```
+
+**Correctness:** paged prefill is **bit-identical** (0.00e+00) to the contiguous
+cache. Paging changes where bytes live, not what is computed.
+
+**Memory** (8 sequences of length 50–400, block_size 16, vs contiguous max_seq 512):
+**3.8× fewer slots held** (1,072 vs 4,096), with **4.4% internal fragmentation**.
+Waste is bounded by one partly-filled block per sequence rather than `max_seq`
+per sequence.
+
+### Finding #8 (the best debugging story): profile before optimizing
+
+I predicted paging would be somewhat slower than contiguous, because gathering
+scattered blocks materializes a copy every step. Measured at batch 32: **0.22×**
+— paging cost 78% of throughput. Far worse than "somewhat," so it was worth
+finding out why rather than accepting it.
+
+Timing the two suspects separately (batch 32, length 160, per call):
+
+| Operation | Time |
+|---|---|
+| `_slots` — rebuild block table from Python lists | **2.263 ms** |
+| indexed read — the actual scattered gather | 0.071 ms |
+| contiguous slice (no copy at all) | 0.018 ms |
+
+**The gather was never the problem.** The scattered read cost 0.071 ms against a
+plain slice's 0.018 ms — both negligible. **97% of the cost was Python**,
+rebuilding the block-table tensor from lists on *every layer of every step*
+(24 × 128 = 3,072 times per generation, and twice each for append and gather).
+
+Two fixes followed directly from the measurement:
+
+1. **Cache the device-side block table**, rebuilding only when blocks are actually
+   allocated or freed. `_slots`: 2.263 → 0.295 ms, a **7.7×** improvement.
+2. **Hoist slot computation out of the layer loop.** Slot indices and the
+   attention mask depend only on positions, not on layer contents, so they are
+   identical across all 24 layers. Now computed once per step (`SlotPlan`).
+
+| Batch | paged before | paged after | gain | cost vs contiguous |
+|---|---|---|---|---|
+| 1 | 15.5 | **23.2** | 1.50× | 0.59× → **0.86×** |
+| 4 | 53.1 | **92.2** | 1.74× | 0.51× → **0.85×** |
+| 16 | 135.5 | **369.3** | 2.73× | 0.32× → **0.89×** |
+| 32 | 183.7 | **664.9** | **3.62×** | 0.22× → **0.90×** |
+
+Paging now costs ~10% instead of 78%, buying 3.8× better memory efficiency.
+
+> **Lesson:** the intuitive culprit — memory traffic from scattered gathers — was
+> 3% of the cost. The unglamorous one — Python executing inside the per-layer
+> loop — was 97%. Profiling took ten minutes and redirected the entire fix.
+> Optimizing the gather, as I had planned to, would have achieved nothing.
+
 ### Remaining in Phase 2
 
-- **Step 2 — paged cache.** Fixed-size blocks, a block table per sequence, a
-  free-block allocator. The contiguous cache preallocates `max_seq` per sequence,
-  so a sequence using 50 of 512 slots still holds all 512 and no memory can be
-  shared. Paging fixes exactly that, and is the storage layer prefix-cache
-  routing sits on.
 - **Step 3 — continuous batching** plus a request-stream simulation, since a
   fixed-batch table cannot capture a benefit that is about *dynamic* arrival and
   varied output lengths.
@@ -463,6 +523,10 @@ target Phase 3's custom kernels aim at, now measured rather than assumed.
 8. **Take the algorithmic win before the hardware win.** The KV cache delivered
    15.6× at batch 32 with no GPU code. The measured 5.9%-of-peak bandwidth then
    tells us where the *next* win lives.
+9. **Profile before optimizing — intuition about bottlenecks is unreliable.** The
+   paged cache's slowdown was 97% Python overhead inside the layer loop and 3%
+   the scattered memory access I had blamed. Fixing what I assumed was wrong
+   would have gained nothing.
 
 ---
 
@@ -472,7 +536,7 @@ target Phase 3's custom kernels aim at, now measured rather than assumed.
 |---|---|---|
 | 0 — Ground truth | ✅ Complete | Hardware spec, benchmark harness, reference fixture, HF baseline |
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
-| 2 — KV cache & batching | ◐ In progress | ✅ Contiguous cache + prefill/decode split (15.6× at batch 32). Remaining: paged cache, continuous batching |
+| 2 — KV cache & batching | ◐ In progress | ✅ Contiguous cache + prefill/decode split (15.6× at batch 32); ✅ paged cache (3.8× memory, ~10% speed cost). Remaining: continuous batching |
 | 3 — Custom CUDA kernels | Planned | Fused RMSNorm → fused SwiGLU → RoPE → decode attention with online softmax. Each with parity test, microbenchmark, and **% of peak bandwidth** |
 | 4 — Quantization | Planned | INT8 weight-only, then INT4 group-wise (g=128) + fused dequant-matmul. Perplexity cost measured on WikiText-2 |
 | 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |

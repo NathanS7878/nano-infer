@@ -7,72 +7,80 @@
     {
       "batch_size": 1,
       "prompt_tokens": 42,
-      "prefill_ms": 41.72980000021198,
-      "prefill_tokens_per_sec": 1006.4749890914082,
-      "decode_total_ms": 4737.844500000392,
-      "decode_ms_per_step": 37.3058622047275,
-      "decode_tokens_per_sec": 26.805438633536724
+      "prefill_ms": 47.53080000045884,
+      "prefill_tokens_per_sec": 883.6375571123261,
+      "decode_total_ms": 4727.495299999646,
+      "decode_ms_per_step": 37.22437244094209,
+      "decode_tokens_per_sec": 26.864119780300896
     },
     {
       "batch_size": 4,
       "prompt_tokens": 42,
-      "prefill_ms": 45.19550000077288,
-      "prefill_tokens_per_sec": 3717.1842328799785,
-      "decode_total_ms": 4877.794399999402,
-      "decode_ms_per_step": 38.407829921255136,
-      "decode_tokens_per_sec": 104.14543097594729
+      "prefill_ms": 45.211500000732485,
+      "prefill_tokens_per_sec": 3715.868750147157,
+      "decode_total_ms": 4705.118400000174,
+      "decode_ms_per_step": 37.04817637795413,
+      "decode_tokens_per_sec": 107.96752744840198
     },
     {
       "batch_size": 16,
       "prompt_tokens": 42,
-      "prefill_ms": 61.02109999937966,
-      "prefill_tokens_per_sec": 11012.584171816496,
-      "decode_total_ms": 4857.962099999895,
-      "decode_ms_per_step": 38.25167007873933,
-      "decode_tokens_per_sec": 418.28239046987295
+      "prefill_ms": 58.78759999995964,
+      "prefill_tokens_per_sec": 11430.98204384022,
+      "decode_total_ms": 4779.689299999518,
+      "decode_ms_per_step": 37.63534881889384,
+      "decode_tokens_per_sec": 425.13223610585
     },
     {
       "batch_size": 32,
       "prompt_tokens": 42,
-      "prefill_ms": 72.70710000011604,
-      "prefill_tokens_per_sec": 18485.127312158715,
-      "decode_total_ms": 4915.2749000004405,
-      "decode_ms_per_step": 38.702951968507406,
-      "decode_tokens_per_sec": 826.8103173638642
+      "prefill_ms": 73.14029999997729,
+      "prefill_tokens_per_sec": 18375.642429692212,
+      "decode_total_ms": 4827.555899999425,
+      "decode_ms_per_step": 38.01225118109783,
+      "decode_tokens_per_sec": 841.8338563413599
     }
   ],
   "head_to_head": [
     {
       "batch_size": 1,
       "phase1_tokens_per_sec": 25.423776617801042,
-      "phase2_tokens_per_sec": 26.694344809306212,
-      "hf_tokens_per_sec": 22.40432661153312,
-      "speedup_vs_phase1": 1.049975588230096,
-      "speedup_vs_hf": 1.191481684415577
+      "phase2_tokens_per_sec": 27.033102054589055,
+      "paged_tokens_per_sec": 23.244079578576283,
+      "hf_tokens_per_sec": 22.66515683668837,
+      "speedup_vs_phase1": 1.0633000148239662,
+      "speedup_vs_hf": 1.1927163023566745,
+      "paging_cost": 0.8598376735173994
     },
     {
       "batch_size": 4,
       "phase1_tokens_per_sec": 76.36971602764035,
-      "phase2_tokens_per_sec": 104.52592562452584,
-      "hf_tokens_per_sec": 86.81598541383022,
-      "speedup_vs_phase1": 1.3686829159701859,
-      "speedup_vs_hf": 1.2039940009466774
+      "phase2_tokens_per_sec": 107.79480669044602,
+      "paged_tokens_per_sec": 92.16009216009151,
+      "hf_tokens_per_sec": 88.41590218714849,
+      "speedup_vs_phase1": 1.4114862840583569,
+      "speedup_vs_hf": 1.2191789488533242,
+      "paging_cost": 0.8549585549584715
     },
     {
       "batch_size": 16,
       "phase1_tokens_per_sec": 50.52375949914363,
-      "phase2_tokens_per_sec": 410.1170263327928,
-      "hf_tokens_per_sec": 344.71521944627864,
-      "speedup_vs_phase1": 8.117310160573942,
-      "speedup_vs_hf": 1.1897270651164462
+      "phase2_tokens_per_sec": 417.1856108690377,
+      "paged_tokens_per_sec": 369.29752020140836,
+      "hf_tokens_per_sec": 355.2559193910342,
+      "speedup_vs_phase1": 8.257216307826596,
+      "speedup_vs_hf": 1.1743241649123284,
+      "paging_cost": 0.8852115475222795
     },
     {
       "batch_size": 32,
       "phase1_tokens_per_sec": 53.29899718938777,
-      "phase2_tokens_per_sec": 831.5518714991081,
-      "hf_tokens_per_sec": 686.9112515694641,
-      "speedup_vs_phase1": 15.601641969816953,
-      "speedup_vs_hf": 1.2105666774261845
+      "phase2_tokens_per_sec": 736.4091828858417,
+      "paged_tokens_per_sec": 664.8569658278471,
+      "hf_tokens_per_sec": 638.3499949278824,
+      "speedup_vs_phase1": 13.81656732244235,
+      "speedup_vs_hf": 1.153613517250889,
+      "paging_cost": 0.9028363324074863
     }
   ]
 }

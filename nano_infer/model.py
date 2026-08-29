@@ -431,3 +431,131 @@ def generate_cached(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
 
     cache.length = seq + max_new_tokens - 1
     return torch.stack(generated, dim=1)                              # [b, new_tokens]
+
+
+# ---------------------------------------------------------------------------
+# Paged KV cache path (Phase 2 step 2)
+# ---------------------------------------------------------------------------
+
+def attention_paged(x: torch.Tensor, weights: dict, layer: int,
+                    cos: torch.Tensor, sin: torch.Tensor, cf: "QwenConfig",
+                    cache: "PagedKVCache", plan, allowed) -> torch.Tensor:
+    """Attention against a paged cache.
+
+    Same math as attention_cached; the difference is that K/V are scattered into
+    blocks and gathered back through a block table rather than living in one
+    contiguous span.
+
+    `plan` (slot indices) and `allowed` (the combined causal + padding mask) are
+    computed once per step by the caller and shared across all 24 layers — they
+    depend only on positions, not on layer contents.
+    """
+    b, n, _ = x.shape
+    p = f"model.layers.{layer}.self_attn."
+
+    q = F.linear(x, weights[p + "q_proj.weight"], weights[p + "q_proj.bias"])
+    k = F.linear(x, weights[p + "k_proj.weight"], weights[p + "k_proj.bias"])
+    v = F.linear(x, weights[p + "v_proj.weight"], weights[p + "v_proj.bias"])
+
+    q = q.view(b, n, cf.num_q_heads, cf.head_dim).transpose(1, 2)
+    k = k.view(b, n, cf.num_kv_heads, cf.head_dim).transpose(1, 2)
+    v = v.view(b, n, cf.num_kv_heads, cf.head_dim).transpose(1, 2)
+
+    q, k = apply_rope(q, k, cos, sin)
+
+    cache.append(layer, k, v, plan)
+    k_all, v_all = cache.gather(layer, plan)                          # [b,kvh,L,hd]
+
+    n_rep = cf.num_q_heads // cf.num_kv_heads
+    k_all = repeat_kv(k_all, n_rep)
+    v_all = repeat_kv(v_all, n_rep)
+
+    scale = cf.head_dim ** -0.5
+    scores = (q @ k_all.transpose(-1, -2)).float() * scale            # [b,14,n,L]
+    scores = scores.masked_fill(~allowed, float("-inf"))
+
+    probs = torch.softmax(scores, dim=-1).to(x.dtype)
+    out = (probs @ v_all).transpose(1, 2).reshape(b, n, cf.q_dim)
+    return F.linear(out, weights[p + "o_proj.weight"])
+
+
+def forward_paged(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
+                  cache: "PagedKVCache", seq_ids: list, start_positions,
+                  rope: tuple) -> torch.Tensor:
+    """Run the stack over `input_ids` against a paged cache. Returns [batch, vocab]."""
+    cos_all, sin_all = rope
+    b, n = input_ids.shape
+    base = int(start_positions[0])
+    cos = cos_all[base:base + n]
+    sin = sin_all[base:base + n]
+    lengths = start_positions + n
+
+    for i, s in enumerate(seq_ids):
+        cache.ensure_capacity(s, int(lengths[i]))
+        cache.lengths[s] = int(lengths[i])
+
+    # Slot indices and the attention mask depend only on positions, so compute
+    # them once here and reuse across all 24 layers.
+    plan = cache.plan(seq_ids, start_positions, n, lengths)
+    L = plan.read.shape[1]
+    q_pos = start_positions.view(b, 1, 1, 1) + torch.arange(
+        n, device=input_ids.device).view(1, 1, n, 1)
+    k_pos = torch.arange(L, device=input_ids.device).view(1, 1, 1, L)
+    allowed = (k_pos <= q_pos) & plan.mask.view(b, 1, 1, L)
+
+    x = embed_tokens(input_ids, weights)
+    for i in range(cf.num_layers):
+        ln = f"model.layers.{i}."
+        residual = x
+        h = rms_norm(x, weights[ln + "input_layernorm.weight"], cf.rms_norm_eps)
+        x = residual + attention_paged(h, weights, i, cos, sin, cf, cache,
+                                       plan, allowed)
+        residual = x
+        h = rms_norm(x, weights[ln + "post_attention_layernorm.weight"],
+                     cf.rms_norm_eps)
+        x = residual + mlp(h, weights, i)
+
+    x = rms_norm(x[:, -1:], weights["model.norm.weight"], cf.rms_norm_eps)
+    return F.linear(x, weights["model.embed_tokens.weight"])[:, 0]
+
+
+@torch.no_grad()
+def generate_paged(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
+                   max_new_tokens: int, cache: "PagedKVCache | None" = None,
+                   block_size: int = 16, free_when_done: bool = True):
+    """Greedy decode against a paged KV cache. Returns [batch, max_new_tokens]."""
+    from .cache import PagedKVCache
+
+    b, seq = input_ids.shape
+    dtype = weights["model.norm.weight"].dtype
+    total = seq + max_new_tokens
+
+    owned = cache is None
+    if owned:
+        blocks_per_seq = (total + block_size - 1) // block_size
+        cache = PagedKVCache(cf.num_layers, b * blocks_per_seq + 4, block_size,
+                             cf.num_kv_heads, cf.head_dim,
+                             dtype=dtype, device=input_ids.device)
+
+    seq_ids = [cache.add_sequence() for _ in range(b)]
+    rope = build_rope_cache(total, cf.head_dim, cf.rope_theta,
+                            device=input_ids.device, dtype=dtype)
+
+    start = torch.zeros(b, dtype=torch.long, device=input_ids.device)
+    logits = forward_paged(input_ids, weights, cf, cache, seq_ids, start, rope)
+    next_ids = logits.argmax(dim=-1)
+    generated = [next_ids]
+
+    for step in range(1, max_new_tokens):
+        start = torch.full((b,), seq + step - 1, dtype=torch.long,
+                           device=input_ids.device)
+        logits = forward_paged(next_ids.unsqueeze(1), weights, cf, cache,
+                               seq_ids, start, rope)
+        next_ids = logits.argmax(dim=-1)
+        generated.append(next_ids)
+
+    out = torch.stack(generated, dim=1)
+    if free_when_done:
+        for s in seq_ids:
+            cache.remove_sequence(s)
+    return out
