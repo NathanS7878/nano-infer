@@ -47,8 +47,9 @@ def compare_tokens(ref_ids: torch.Tensor, got_ids: torch.Tensor) -> tuple[bool, 
 
 
 def compare_step0_logits(ref_logits: torch.Tensor, got_logits: torch.Tensor) -> float:
-    """Max absolute difference between two logit vectors (upcast to fp32)."""
-    return (ref_logits.float() - got_logits.float()).abs().max().item()
+    """Max absolute difference between two logit vectors (upcast to fp32, on CPU
+    so the two operands can live on different devices)."""
+    return (ref_logits.float().cpu() - got_logits.float().cpu()).abs().max().item()
 
 
 # --- Phase 0 tests ---------------------------------------------------------
@@ -70,7 +71,7 @@ def test_hf_reproduces_reference():
     exactly (tokens identical, step-0 logits within fp16 tolerance)."""
     ref = load_reference()
     torch.manual_seed(config.SEED)
-    model, tok = load_hf()
+    model, tok = load_hf(attn_implementation="eager")   # match the fixture's impl
 
     for i, (prompt, ref_p) in enumerate(zip(config.PROMPTS, ref["prompts"])):
         ids = encode_prompt(tok, prompt)

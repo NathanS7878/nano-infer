@@ -11,8 +11,8 @@ Growth log (append as components land):
   - [x] RoPE
   - [x] grouped-query attention
   - [x] SwiGLU MLP
-  - [ ] full block / stack / final norm + tied logits
-  - [ ] greedy decode (no cache)
+  - [x] full block / stack / final norm + tied logits
+  - [x] greedy decode (no cache)
 """
 from __future__ import annotations
 
@@ -235,3 +235,61 @@ def mlp(x: torch.Tensor, weights: dict, layer: int) -> torch.Tensor:
     up = F.linear(x, weights[p + "up_proj.weight"])                 # [b,seq,4864]
     hidden = F.silu(gate) * up
     return F.linear(hidden, weights[p + "down_proj.weight"])         # [b,seq,896]
+
+
+# --- assembly: block, full forward, greedy decode --------------------------
+
+def decoder_block(x: torch.Tensor, weights: dict, layer: int, cos: torch.Tensor,
+                  sin: torch.Tensor, cf: "QwenConfig") -> torch.Tensor:
+    """One transformer block, pre-norm with two residual connections.
+
+    The original signal flows straight through; attention and the MLP each add a
+    refinement onto it, so a block only has to learn a small nudge, not rebuild
+    the whole representation. That's what lets 24 of them stack.
+    """
+    ln = f"model.layers.{layer}."
+    residual = x
+    h = rms_norm(x, weights[ln + "input_layernorm.weight"], cf.rms_norm_eps)
+    x = residual + attention(h, weights, layer, cos, sin, cf)         # add attn refinement
+
+    residual = x
+    h = rms_norm(x, weights[ln + "post_attention_layernorm.weight"], cf.rms_norm_eps)
+    x = residual + mlp(h, weights, layer)                             # add mlp refinement
+    return x
+
+
+def forward(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig") -> torch.Tensor:
+    """Full forward pass: token ids -> logits over the vocabulary.
+
+    input_ids : [batch, seq]  ->  logits [batch, seq, vocab_size]
+
+    No KV cache — the whole sequence is recomputed each call. Deliberately the
+    slow, obviously-correct version (Phase 1). Phase 2 adds the cache.
+    """
+    b, seq = input_ids.shape
+    x = embed_tokens(input_ids, weights)                             # [b,seq,hidden]
+    cos, sin = build_rope_cache(seq, cf.head_dim, cf.rope_theta,
+                                device=input_ids.device, dtype=x.dtype)
+    for i in range(cf.num_layers):
+        x = decoder_block(x, weights, i, cos, sin, cf)
+    x = rms_norm(x, weights["model.norm.weight"], cf.rms_norm_eps)   # final norm
+
+    # tied embeddings: the output projection reuses embed_tokens.weight [vocab,hidden].
+    # F.linear(x, W) = x @ W.T -> [b, seq, vocab].
+    return F.linear(x, weights["model.embed_tokens.weight"])
+
+
+@torch.no_grad()
+def greedy_decode(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
+                  max_new_tokens: int) -> torch.Tensor:
+    """Greedy decode with NO cache: recompute the whole sequence every step, take
+    the argmax of the last position, append, repeat. Returns [max_new_tokens] ids."""
+    ids = input_ids
+    generated = []
+    for _ in range(max_new_tokens):
+        logits = forward(ids, weights, cf)                           # [1,seq,vocab]
+        next_id = int(logits[0, -1].argmax())
+        generated.append(next_id)
+        ids = torch.cat(
+            [ids, torch.tensor([[next_id]], device=ids.device)], dim=1)
+    return torch.tensor(generated, dtype=torch.long)

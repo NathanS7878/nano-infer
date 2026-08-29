@@ -14,6 +14,7 @@ import torch
 from nano_infer import config as cfg
 from nano_infer import model as M
 from nano_infer.hf_ref import encode_prompt, load_hf
+from tests.test_parity import compare_step0_logits, compare_tokens, load_reference
 
 PROMPT = "The capital of France is"
 
@@ -134,3 +135,44 @@ def test_mlp_matches_hf(hf, weights):
     max_diff = (ours.float() - ref.float()).abs().max().item()
     print(f"\n[mlp] output {tuple(ours.shape)}  max abs diff vs HF: {max_diff:.2e}  (tol 1e-3)")
     assert max_diff < 1e-3, f"MLP diff {max_diff:.2e} exceeds fp16 tolerance"
+
+
+def test_full_forward_logits_match(hf, weights):
+    """Whole forward pass: our final logits vs (a) HF's live logits and (b) the
+    frozen Phase 0 fixture's step-0 logits. Strict 1e-3 bar."""
+    model, tok = hf
+    cf = M.QwenConfig()
+    ref = load_reference()
+
+    max_vs_hf = 0.0
+    max_vs_fix = 0.0
+    for prompt, ref_p in zip(cfg.PROMPTS, ref["prompts"]):
+        ids = encode_prompt(tok, prompt)
+        ours = M.forward(ids, weights, cf)[0, -1]                    # last-position logits
+        hf_logits = model(ids).logits[0, -1]
+        max_vs_hf = max(max_vs_hf, (ours.float() - hf_logits.float()).abs().max().item())
+        max_vs_fix = max(max_vs_fix,
+                         compare_step0_logits(ref_p["step0_logits"], ours))
+
+    print(f"\n[forward] step-0 logits: max diff vs live HF {max_vs_hf:.2e}, "
+          f"vs fixture {max_vs_fix:.2e}  (tol 1e-3)")
+    assert max_vs_hf < 1e-3 and max_vs_fix < 1e-3
+
+
+@pytest.mark.slow
+def test_greedy_matches_fixture(weights):
+    """PHASE 1 ACCEPTANCE: greedy-decode all 5 prompts, 50 tokens each, and
+    require token-for-token identity with the HF fixture — a from-scratch
+    transformer reproducing HuggingFace exactly."""
+    cf = M.QwenConfig()
+    _, tok = load_hf()                                               # tokenizer only here
+    ref = load_reference()
+
+    for i, (prompt, ref_p) in enumerate(zip(cfg.PROMPTS, ref["prompts"])):
+        ids = encode_prompt(tok, prompt)
+        got = M.greedy_decode(ids, weights, cf, cfg.PARITY_NEW_TOKENS)
+        ok, div = compare_tokens(ref_p["greedy_ids"], got)
+        text = tok.decode(got, skip_special_tokens=True)
+        status = "OK" if ok else f"DIVERGES@{div}"
+        print(f"[{i}] {status}  {prompt!r}\n     -> {text[:70]!r}")
+        assert ok, f"prompt {i}: token divergence at step {div}"
