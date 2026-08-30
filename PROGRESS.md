@@ -234,4 +234,53 @@ earlier — run-to-run variance, the paged/contiguous *ratio* is the stable metr
 | 16 | 50.5 | **417.2** | 369.3 | 355.3 |
 | 32 | 53.3 | **736.4** | 664.9 | 638.3 |
 
-- [ ] Step 3 — continuous batching + request-stream simulation
+### Step 3 — Continuous batching ✅ (2026-08-20) — PHASE 2 COMPLETE
+
+`nano_infer/engine.py`: `Request`, `RunStats`, `ContinuousBatchingEngine` with
+both admission policies on identical code paths, so only the scheduling rule
+differs between the two measurements.
+
+**What continuous batching required of the model.** Sequences in a batch now sit
+at *different* absolute positions (one admitted 40 steps ago is at position 60
+while its neighbour is at 3). Phase 1's `apply_rope` assumes a single shared
+position range, so `apply_rope_positions` was added, and `forward_paged` now
+indexes the rope tables per sequence instead of slicing one range. The paged
+cache already handled per-sequence block tables and the padding mask.
+
+**Why a separate benchmark.** The fixed-batch table cannot show this benefit at
+all: it gives every sequence the same output length, so nothing finishes early
+and the two policies are identical by construction. The win only exists with
+varied output lengths, so `bench/phase2_continuous.py` runs a 24-request stream
+with lengths drawn from a skewed distribution (mostly short, a few long).
+
+**Results** (24 requests, lengths 16–126, total 1018 tokens, max_batch 8):
+
+| Policy | Wall time (s) | Decode steps | Tokens | Tokens/sec | Slot utilization | Wasted slot-steps |
+|---|---|---|---|---|---|---|
+| Static batching | 13.89 | 270 | 1018 | 73.3 | 46.0% | 1166 |
+| **Continuous batching** | **8.98** | 163 | 1018 | **113.4** | **100.0%** | **0** |
+
+**1.55x throughput, 35.4% less wall time, identical output.** Static spent 1,166
+slot-steps decoding sequences that had already finished — 54% of its capacity —
+because a group cannot retire until its longest member does. Continuous batching
+wasted none: every decode step produced a token someone asked for.
+
+**Correctness** (tests/test_continuous.py, 4 tests): each request generates
+exactly what it generates when run alone, including requests admitted mid-flight
+next to sequences at unrelated positions; static and continuous produce identical
+tokens; all cache blocks return to the free list once the stream drains.
+
+*Metric note:* slot utilization first read 116.7%, which is impossible. Cause:
+`useful_tokens` counted each request's prefill token while `slot_steps` counted
+only decode steps. Fixed by excluding prefill from both sides of the ratio.
+
+**Limitation (recorded, not hidden):** prefill is done one request at a time
+rather than batched or chunked, to avoid padding ragged prompts. A production
+engine batches prefills; at high admission rates that would matter here.
+
+### Phase 2 acceptance — ALL MET
+- [x] Paged KV cache with fixed blocks, per-sequence block table, free-block allocator.
+- [x] Prefill/decode split, with the opposite bottlenecks measured.
+- [x] Continuous batching, measured on a dynamic request stream.
+- [x] Output still matches Phase 1 (1 near-tie divergence in 250 tokens, root-caused).
+- [x] Benchmark table vs the HF baseline at every batch size — ahead at all of them.

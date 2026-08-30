@@ -150,6 +150,25 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
     return q_rot, k_rot
 
 
+def apply_rope_positions(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
+                         sin: torch.Tensor):
+    """RoPE where every sequence in the batch sits at its OWN position.
+
+    q, k    : [batch, heads, n, head_dim]
+    cos,sin : [batch, n, head_dim]  -> broadcast over heads only
+
+    Phase 1's apply_rope assumes one shared position range for the whole batch,
+    which holds while every sequence advances in lockstep. Continuous batching
+    breaks that: a sequence admitted 40 steps ago is at position 60 while its
+    neighbour is at position 3. Each row must be rotated by its own position.
+    """
+    cos = cos.unsqueeze(1)                              # [b, 1, n, head_dim]
+    sin = sin.unsqueeze(1)
+    q_rot = q * cos + rotate_half(q) * sin
+    k_rot = k * cos + rotate_half(k) * sin
+    return q_rot, k_rot
+
+
 # --- component 4: grouped-query attention ----------------------------------
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -461,7 +480,7 @@ def attention_paged(x: torch.Tensor, weights: dict, layer: int,
     k = k.view(b, n, cf.num_kv_heads, cf.head_dim).transpose(1, 2)
     v = v.view(b, n, cf.num_kv_heads, cf.head_dim).transpose(1, 2)
 
-    q, k = apply_rope(q, k, cos, sin)
+    q, k = apply_rope_positions(q, k, cos, sin)
 
     cache.append(layer, k, v, plan)
     k_all, v_all = cache.gather(layer, plan)                          # [b,kvh,L,hd]
@@ -485,9 +504,12 @@ def forward_paged(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
     """Run the stack over `input_ids` against a paged cache. Returns [batch, vocab]."""
     cos_all, sin_all = rope
     b, n = input_ids.shape
-    base = int(start_positions[0])
-    cos = cos_all[base:base + n]
-    sin = sin_all[base:base + n]
+    # Per-sequence absolute positions: [batch, n]. Indexing the rope tables with
+    # this (rather than slicing one shared range) is what lets sequences at
+    # different positions share a batch — the requirement continuous batching adds.
+    pos = start_positions.unsqueeze(1) + torch.arange(n, device=input_ids.device)
+    cos = cos_all[pos]                                  # [b, n, head_dim]
+    sin = sin_all[pos]
     lengths = start_positions + n
 
     for i, s in enumerate(seq_ids):

@@ -1,0 +1,53 @@
+{
+  "hardware": "NVIDIA GeForce RTX 3070 (see HARDWARE.md)",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "requests": 24,
+  "max_batch": 8,
+  "output_lengths": [
+    29,
+    126,
+    25,
+    27,
+    22,
+    25,
+    76,
+    24,
+    20,
+    18,
+    26,
+    19,
+    26,
+    22,
+    31,
+    32,
+    16,
+    115,
+    16,
+    26,
+    105,
+    18,
+    92,
+    82
+  ],
+  "results": [
+    {
+      "policy": "static",
+      "wall_s": 13.892711399999826,
+      "steps": 270,
+      "useful_tokens": 1018,
+      "slot_steps": 2160,
+      "tokens_per_sec": 73.27583296663117,
+      "slot_utilization_pct": 46.01851851851852
+    },
+    {
+      "policy": "continuous",
+      "wall_s": 8.980585499997687,
+      "steps": 163,
+      "useful_tokens": 1018,
+      "slot_steps": 994,
+      "tokens_per_sec": 113.355638115161,
+      "slot_utilization_pct": 100.0
+    }
+  ],
+  "speedup": 1.5469716757335483
+}

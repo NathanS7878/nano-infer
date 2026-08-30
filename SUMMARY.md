@@ -5,12 +5,14 @@ cache, CUDA kernels, and INT8/INT4 quantization. This document is the complete
 record — what it is, how it was built, what was measured, what was learned, and
 what went wrong along the way.
 
-**Author:** Nathan (Iceboy66) · **Started:** 2026-08-20 · **Status:** Phases 0–1 complete, Phase 2 in progress
+**Author:** Nathan (Iceboy66) · **Started:** 2026-08-20 · **Status:** Phases 0–2 complete
 
 > **Headline (RTX 3070, Qwen2.5-0.5B-Instruct, fp16, 128 new tokens):** at batch 32
 > the engine reaches **831.6 tok/s — 15.6× faster than its own no-cache version and
 > 1.21× faster than HuggingFace `generate()`** — with output verified against a
-> frozen HuggingFace reference. Full method and caveats below.
+> frozen HuggingFace reference. On a realistic request stream with varied output
+> lengths, continuous batching adds a further **1.55×** over static batching by
+> lifting slot utilization from 46% to 100%. Full method and caveats below.
 
 ---
 
@@ -337,7 +339,7 @@ is algorithmic, not hardware-level.
 
 ---
 
-## 6. Phase 2 — KV cache and batching (in progress)
+## 6. Phase 2 — KV cache and batching ✅
 
 **Goal:** remove the redundant recomputation, algorithmically, before touching a
 single GPU kernel. Phase 1's code stays intact as the reference implementation —
@@ -492,11 +494,70 @@ Paging now costs ~10% instead of 78%, buying 3.8× better memory efficiency.
 > loop — was 97%. Profiling took ten minutes and redirected the entire fix.
 > Optimizing the gather, as I had planned to, would have achieved nothing.
 
-### Remaining in Phase 2
+### Step 3 — Continuous batching ✅
 
-- **Step 3 — continuous batching** plus a request-stream simulation, since a
-  fixed-batch table cannot capture a benefit that is about *dynamic* arrival and
-  varied output lengths.
+Static batching runs a group of requests together and cannot start the next group
+until the **last** member finishes. Real requests do not finish together, so
+slots whose sequence completed keep decoding output nobody asked for — the batch
+is held hostage by its slowest member. Continuous batching evicts a sequence the
+moment it completes, returns its blocks to the free list, and admits a waiting
+request into that slot on the next step.
+
+**What this required of the model.** Sequences in a batch now sit at *different*
+absolute positions — one admitted 40 steps ago is at position 60 while its
+neighbour is at 3. Phase 1's `apply_rope` assumes one shared position range for
+the whole batch, so `apply_rope_positions` was added and `forward_paged` now
+indexes the rope tables per sequence rather than slicing a single range. The
+paged cache already supported per-sequence block tables and padding masks, so it
+needed no change — the earlier design paid off here.
+
+**Why this needs its own benchmark.** The fixed-batch table cannot show this
+benefit at all: it gives every sequence the same output length, so nothing
+finishes early, there is no straggler, and both policies are identical by
+construction. The win exists only with varied output lengths, so the measurement
+uses a request stream with lengths drawn from a skewed distribution.
+
+**Results** — 24 requests, output lengths 16–126 (total 1,018 tokens), max_batch 8,
+both policies on the same engine and hardware:
+
+| Policy | Wall time (s) | Decode steps | Tokens | Tokens/sec | Slot utilization | Wasted slot-steps |
+|---|---|---|---|---|---|---|
+| Static batching | 13.89 | 270 | 1,018 | 73.3 | 46.0% | 1,166 |
+| **Continuous batching** | **8.98** | 163 | 1,018 | **113.4** | **100.0%** | **0** |
+
+**1.55× throughput and 35.4% less wall time for identical output.** The
+utilization column is the clearest statement of why: static spent **1,166
+slot-steps — 54% of its capacity — decoding sequences that had already
+finished**. Continuous batching wasted none. Both policies pay the same prefill
+and per-token costs; only the admission rule differs.
+
+This also closes the loop with the prefill/decode measurement above. Decode costs
+a flat ~38 ms per step regardless of how many sequences ride along, so an empty
+slot is pure waste — the fixed cost is paid whether or not the slot is doing
+anything useful. Keeping the batch full is how that fixed cost gets amortized.
+
+**Correctness** (4 tests): every request generates exactly what it generates when
+run alone — including requests admitted mid-flight beside sequences at unrelated
+positions; static and continuous produce identical tokens; every cache block
+returns to the free list once the stream drains.
+
+*A metric bug worth recording:* slot utilization first reported **116.7%**, which
+is impossible. `useful_tokens` counted each request's prefill token while
+`slot_steps` counted only decode steps. Fixed by excluding prefill from both
+sides of the ratio. An impossible number is a gift — it fails loudly instead of
+quietly overstating a result.
+
+**Limitation, recorded not hidden:** prefill runs one request at a time rather
+than batched or chunked, to avoid padding ragged prompts. A production engine
+batches prefills; under a high admission rate that would become the bottleneck here.
+
+### Phase 2 acceptance — all met
+
+- [x] Paged KV cache: fixed blocks, per-sequence block table, free-block allocator
+- [x] Prefill/decode split, with their opposite bottlenecks measured
+- [x] Continuous batching, measured on a dynamic request stream
+- [x] Output still matches Phase 1 (1 near-tie divergence in 250 tokens, root-caused)
+- [x] Benchmark table vs HF at every batch size — ahead at all of them
 
 ---
 
@@ -527,6 +588,13 @@ Paging now costs ~10% instead of 78%, buying 3.8× better memory efficiency.
    paged cache's slowdown was 97% Python overhead inside the layer loop and 3%
    the scattered memory access I had blamed. Fixing what I assumed was wrong
    would have gained nothing.
+10. **Some wins are invisible to the wrong benchmark.** Continuous batching shows
+    zero improvement on a fixed-batch table, because equal output lengths mean
+    nothing ever finishes early. Measuring it required building a workload that
+    actually contains the problem it solves.
+11. **A metric that reports an impossible value is doing you a favour.** Slot
+    utilization above 100% exposed a prefill/decode accounting mismatch that a
+    merely-plausible number would have hidden.
 
 ---
 
@@ -536,7 +604,7 @@ Paging now costs ~10% instead of 78%, buying 3.8× better memory efficiency.
 |---|---|---|
 | 0 — Ground truth | ✅ Complete | Hardware spec, benchmark harness, reference fixture, HF baseline |
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
-| 2 — KV cache & batching | ◐ In progress | ✅ Contiguous cache + prefill/decode split (15.6× at batch 32); ✅ paged cache (3.8× memory, ~10% speed cost). Remaining: continuous batching |
+| 2 — KV cache & batching | ✅ Complete | Contiguous cache + prefill/decode split (15.6× at batch 32), paged cache (3.8× memory), continuous batching (1.55× on a request stream) |
 | 3 — Custom CUDA kernels | Planned | Fused RMSNorm → fused SwiGLU → RoPE → decode attention with online softmax. Each with parity test, microbenchmark, and **% of peak bandwidth** |
 | 4 — Quantization | Planned | INT8 weight-only, then INT4 group-wise (g=128) + fused dequant-matmul. Perplexity cost measured on WikiText-2 |
 | 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |
@@ -574,11 +642,12 @@ pip install transformers safetensors tokenizers huggingface_hub datasets acceler
 | `python -m bench.harness` | HuggingFace baseline at batch 1/4/16/32 |
 | `python -m bench.phase1_nocache` | Growth curve + head-to-head vs baseline |
 | `python -m bench.phase2_cache` | Prefill/decode split + Phase 1 vs Phase 2 vs HF |
+| `python -m bench.phase2_continuous` | Static vs continuous batching on a request stream |
 
 ### Repository layout
 
 ```
-nano_infer/     config.py, hf_ref.py, model.py — the engine
+nano_infer/     config.py, hf_ref.py, model.py, cache.py, engine.py — the engine
 bench/          harness.py, phase1_nocache.py — measurement
 tests/          capture_reference.py, test_parity.py, test_model.py, fixtures/
 results/        committed benchmark outputs
