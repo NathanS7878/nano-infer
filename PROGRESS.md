@@ -284,3 +284,80 @@ engine batches prefills; at high admission rates that would matter here.
 - [x] Continuous batching, measured on a dynamic request stream.
 - [x] Output still matches Phase 1 (1 near-tie divergence in 250 tokens, root-caused).
 - [x] Benchmark table vs the HF baseline at every batch size — ahead at all of them.
+
+---
+
+## Phase 3 — Custom CUDA kernels (in progress)
+
+### Toolchain (2026-08-20)
+
+`nvcc` 12.4.131 installed via **conda-forge, not the official NVIDIA installer** —
+the official one bundles a display driver and would have downgraded this
+machine's newer 610.62 driver for no benefit. MSVC 14.44 (VS 2022 Build Tools)
+as the host compiler, ninja 1.13 for the build. Three environment quirks, all
+handled in `nano_infer/kernels/__init__.py` and documented in HARDWARE.md:
+
+1. ninja lands in the env's `Scripts/` dir, which is not on PATH; torch shells
+   out to `ninja` by name.
+2. CUDA 12.4 rejects the newer MSVC 14.44 as unsupported —
+   `-allow-unsupported-compiler`.
+3. conda-forge puts import libraries in `Library/lib`, torch expects
+   `$CUDA_HOME/lib/x64` — `LNK1181: cannot open input file 'cudart.lib'` until an
+   explicit `/LIBPATH` is added.
+
+The CUDA math libraries are required even though our kernels never call them:
+torch's `ATen/cuda/CUDAContextLight.h` includes `cusparse.h`.
+
+### Kernel 1 — Fused RMSNorm ✅
+
+**Prediction first** (per the working style): Nathan predicted memory-bound
+before any measurement, correctly. RMSNorm moves ~3,584 bytes per 896-wide row
+and does ~3,600 FLOPs — about **1 FLOP/byte against this card's ~364 FLOP/byte
+roofline ridge**, so it sits 364x below the ridge and memory is the only thing
+that matters.
+
+Design: one thread block per row; strided (coalesced) loads; warp-tree reduction
+via `__shfl_down_sync` (threads trade values directly through registers, never
+touching memory); cross-warp combine through shared memory; single write.
+
+**Correctness, and a tolerance that was wrong.** The first parity test used a
+1e-3 absolute bound and failed at 0.00195. Measuring instead of loosening showed
+why: **99.997% of elements were bit-identical**, the rest differed by exactly
+**one ULP** — the smallest difference fp16 can represent — and the failing
+element had magnitude 2.19, where one ULP *is* 0.00195. The tolerance was wrong,
+not the kernel. Parity is now stated in hardware units: max ULP distance <= 2,
+>= 99% of elements exact, max relative error <= 4 eps. Stricter and more
+meaningful than any absolute number, and it cannot quietly widen.
+
+**Optimization: vectorized loads.** v1 loaded one 2-byte half per thread per
+iteration, leaving each thread with only 2 bytes in flight. Switching to `float4`
+(16 bytes = 8 halves) raised memory-level parallelism 8x for identical arithmetic:
+
+| Shape | v1 scalar loads | v2 float4 loads |
+|---|---|---|
+| 4096x896 | 48.8% of peak | **54.3%** |
+| 16384x896 | 66.7% of peak (299 GB/s) | **75.5%** (338 GB/s) |
+
+**Final results** (`bench/kernel_rmsnorm.py`, fp16, peak 448 GB/s):
+
+| Shape | PyTorch | Ours | Speedup | GB/s | % of peak | PyTorch % of peak |
+|---|---|---|---|---|---|---|
+| 1x896 | 197.9 us | 30.3 us | 6.53x | 0.1 | 0.0% | 0.0% |
+| 1088x896 | 199.7 us | 31.4 us | 6.36x | 124 | 27.7% | 4.4% |
+| 4096x896 | 367.5 us | 60.3 us | 6.09x | 243 | 54.3% | 8.9% |
+| 16384x896 | 1329.0 us | 173.6 us | **7.66x** | **338** | **75.5%** | 9.9% |
+
+Scored against the same compulsory-traffic ideal, PyTorch reaches at most 9.9% of
+peak — it moves roughly 7x the necessary bytes across five separate kernels.
+
+Two honest caveats:
+- **At small shapes the win is launch overhead, not bandwidth.** A 1x896 row is
+  3.6 KB — far too little to fill 46 SMs. The 6.5x there comes from making one
+  call instead of seven, not from memory efficiency.
+- **75.5% is good, not maxed.** The remaining gap is a genuine target, not
+  rounding.
+
+- [ ] Kernel 2 — fused SwiGLU
+- [ ] Kernel 3 — RoPE
+- [ ] Kernel 4 — decode fused attention (online softmax)
+- [ ] End-to-end tokens/sec improvement over Phase 2

@@ -5,7 +5,7 @@ cache, CUDA kernels, and INT8/INT4 quantization. This document is the complete
 record — what it is, how it was built, what was measured, what was learned, and
 what went wrong along the way.
 
-**Author:** Nathan (Iceboy66) · **Started:** 2026-08-20 · **Status:** Phases 0–2 complete
+**Author:** Nathan (Iceboy66) · **Started:** 2026-08-20 · **Status:** Phases 0–2 complete, Phase 3 in progress
 
 > **Headline (RTX 3070, Qwen2.5-0.5B-Instruct, fp16, 128 new tokens):** at batch 32
 > the engine reaches **831.6 tok/s — 15.6× faster than its own no-cache version and
@@ -561,7 +561,96 @@ batches prefills; under a high admission rate that would become the bottleneck h
 
 ---
 
-## 7. What was learned
+## 7. Phase 3 — Custom CUDA kernels (in progress)
+
+The measured target from Phase 2: decode achieves **26.5 GB/s, 5.9% of this
+card's 448 GB/s peak**. The other 94% is lost to PyTorch's per-operation overhead
+and unfused memory round trips. Phase 3 attacks that directly.
+
+### Toolchain
+
+`nvcc` 12.4 was installed via **conda-forge rather than the official NVIDIA
+installer**, deliberately: the official installer bundles a display driver and
+would have downgraded this machine's newer 610.62 driver for no benefit. Host
+compiler is MSVC 14.44 (VS 2022 Build Tools). Three environment quirks — ninja
+not on PATH, CUDA 12.4 rejecting the newer MSVC, and conda's import libraries
+sitting in `Library/lib` where torch expects `lib/x64` — are all handled in the
+kernel loader and written up in [HARDWARE.md](HARDWARE.md).
+
+### Kernel 1 — Fused RMSNorm ✅
+
+PyTorch runs RMSNorm as **five separate kernels**, each making a full round trip
+through VRAM, to perform arithmetic worth about **1 FLOP per byte moved**. With
+this card's roofline ridge at ~364 FLOP/byte, that is 364× below the point where
+compute could ever matter — so essentially all of that traffic is waste.
+
+The fused kernel does it in one trip: one thread block per row, coalesced strided
+loads, a warp-tree reduction via `__shfl_down_sync` (threads trade values
+directly through registers, never touching memory), a cross-warp combine through
+shared memory, and a single write.
+
+### Finding #10: an absolute tolerance was the wrong instrument
+
+The first parity test used a 1e-3 absolute bound and failed at 0.00195. The
+tempting move — the one this project has repeatedly refused — is to widen the
+tolerance until it passes. Measuring instead showed:
+
+| Metric | Value |
+|---|---|
+| Elements bit-identical | **99.997%** |
+| Elements differing by exactly 1 ULP | 0.003% |
+| Max ULP distance | **2** |
+| Max relative error | 1.245e-03 (**1.27× fp16 epsilon**) |
+
+The failing element had magnitude 2.19 — and at that magnitude **one ULP *is*
+0.00195**. The kernel was as correct as fp16 permits; the tolerance was measuring
+the wrong thing. A different summation order (warp-tree vs PyTorch's) cannot
+produce the same last bit, because floating-point addition is not associative.
+
+Parity is now stated in the hardware's own units: **max ULP distance ≤ 2, ≥99% of
+elements bit-identical, max relative error ≤ 4ε**. That is *stricter* than the
+absolute bound it replaced, and it cannot quietly widen as kernels get worse.
+
+### Optimization: vectorized loads
+
+Version 1 loaded one 2-byte half per thread per iteration, leaving each thread
+with just 2 bytes in flight while the memory system wants far wider transactions.
+Switching to `float4` loads (16 bytes = 8 halves) raised memory-level parallelism
+8× for identical arithmetic:
+
+| Shape | v1 scalar loads | v2 `float4` loads |
+|---|---|---|
+| 4096×896 | 48.8% of peak | **54.3%** |
+| 16384×896 | 66.7% of peak (299 GB/s) | **75.5%** (338 GB/s) |
+
+### Results
+
+| Shape | PyTorch | Ours | Speedup | GB/s | % of peak | PyTorch % of peak |
+|---|---|---|---|---|---|---|
+| 1×896 | 197.9 µs | 30.3 µs | 6.53× | 0.1 | 0.0% | 0.0% |
+| 1088×896 | 199.7 µs | 31.4 µs | 6.36× | 124 | 27.7% | 4.4% |
+| 4096×896 | 367.5 µs | 60.3 µs | 6.09× | 243 | 54.3% | 8.9% |
+| 16384×896 | 1329.0 µs | 173.6 µs | **7.66×** | **338** | **75.5%** | 9.9% |
+
+Scored against the same compulsory-traffic ideal, PyTorch reaches at most **9.9%
+of peak** — it moves roughly 7× the necessary bytes across five kernels. That gap
+is the entire thesis of kernel fusion, measured.
+
+**Two caveats stated plainly.** At small shapes the win is *launch overhead*, not
+bandwidth: a 1×896 row is 3.6 KB, far too little to fill 46 SMs, and the 6.5×
+there comes from making one call instead of seven. And **75.5% is good, not
+maxed** — the remaining quarter is a real target, not rounding error.
+
+### Remaining in Phase 3
+
+- Kernel 2 — fused SwiGLU (`silu(gate) * up`, elementwise)
+- Kernel 3 — RoPE, fused into the QKV projection output
+- Kernel 4 — decode fused attention with online softmax (flash-decoding in miniature)
+- End-to-end tokens/sec improvement over Phase 2
+
+---
+
+## 8. What was learned
 
 1. **Decode is memory-bound.** Flat ~51 ms inter-token latency across a 32× range
    of batch sizes is the measurement that proves it, and it explains why batching,
@@ -595,17 +684,24 @@ batches prefills; under a high admission rate that would become the bottleneck h
 11. **A metric that reports an impossible value is doing you a favour.** Slot
     utilization above 100% exposed a prefill/decode accounting mismatch that a
     merely-plausible number would have hidden.
+12. **Measure the tolerance, don't tune it.** A kernel that failed a 1e-3
+    absolute bound turned out to be correct to one ULP — the smallest difference
+    fp16 can represent. The fix was to express correctness in the hardware's
+    units, which produced a *stricter* test, not a looser one.
+13. **For a memory-bound kernel, percentage of peak bandwidth is the honest
+    metric.** "7.66× faster than PyTorch" flatters us; "75.5% of 448 GB/s" says
+    how much room is actually left.
 
 ---
 
-## 8. Roadmap
+## 9. Roadmap
 
 | Phase | Status | Content |
 |---|---|---|
 | 0 — Ground truth | ✅ Complete | Hardware spec, benchmark harness, reference fixture, HF baseline |
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
 | 2 — KV cache & batching | ✅ Complete | Contiguous cache + prefill/decode split (15.6× at batch 32), paged cache (3.8× memory), continuous batching (1.55× on a request stream) |
-| 3 — Custom CUDA kernels | Planned | Fused RMSNorm → fused SwiGLU → RoPE → decode attention with online softmax. Each with parity test, microbenchmark, and **% of peak bandwidth** |
+| 3 — Custom CUDA kernels | ◐ In progress | ✅ Fused RMSNorm (7.7×, 75.5% of peak bandwidth). Remaining: SwiGLU, RoPE, decode attention with online softmax |
 | 4 — Quantization | Planned | INT8 weight-only, then INT4 group-wise (g=128) + fused dequant-matmul. Perplexity cost measured on WikiText-2 |
 | 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |
 
@@ -626,7 +722,7 @@ batches prefills; under a high admission rate that would become the bottleneck h
 
 ---
 
-## 9. Reproducing everything
+## 10. Reproducing everything
 
 ```bash
 conda create -y -n nano-infer -c conda-forge --override-channels python=3.12
@@ -643,6 +739,7 @@ pip install transformers safetensors tokenizers huggingface_hub datasets acceler
 | `python -m bench.phase1_nocache` | Growth curve + head-to-head vs baseline |
 | `python -m bench.phase2_cache` | Prefill/decode split + Phase 1 vs Phase 2 vs HF |
 | `python -m bench.phase2_continuous` | Static vs continuous batching on a request stream |
+| `python -m bench.kernel_rmsnorm` | Fused RMSNorm vs PyTorch, with bandwidth utilization |
 
 ### Repository layout
 
