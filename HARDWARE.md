@@ -58,7 +58,9 @@ the whole reason the Phase 3 decode kernel exists.
 | Python | 3.12 (conda env `nano-infer`, conda-forge) |
 | PyTorch | 2.6.0+cu124 |
 | CUDA runtime (bundled in torch wheel) | 12.4 |
-| CUDA Toolkit (`nvcc`) | **not yet installed** — required for Phase 3 kernels |
+| CUDA Toolkit (`nvcc`) | **12.4.131** (conda-forge, matches the torch wheel) |
+| Host compiler | MSVC 14.44 (VS 2022 Build Tools, C++ workload) |
+| ninja | 1.13.0 (required by torch's JIT extension build) |
 | transformers | 5.15.1 (weights + tokenizer download only) |
 | safetensors | 0.8.0 |
 | tokenizers | 0.22.2 |
@@ -75,8 +77,28 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124
 pip install transformers safetensors tokenizers huggingface_hub datasets accelerate numpy
 ```
 
-## Known gaps to close
+## Building the CUDA kernels (Phase 3)
 
-- **`nvcc` / CUDA Toolkit not installed.** The torch wheel bundles the CUDA
-  *runtime* (enough to run GPU tensors), but compiling our own `.cu` kernels in
-  Phase 3 needs the *toolkit* compiler. Install before Phase 3.
+`nvcc` was installed **through conda, not the official NVIDIA installer**,
+deliberately: the official installer bundles a display driver and would have
+downgraded this machine's newer driver (610.62) for no benefit.
+
+```bash
+conda install -y -n nano-infer -c conda-forge --override-channels     cuda-nvcc=12.4 cuda-cudart-dev=12.4 cuda-cccl     libcusparse-dev libcublas-dev libcusolver-dev libcurand-dev libcufft-dev
+pip install ninja
+winget install --id Microsoft.VisualStudio.2022.BuildTools     --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+Three environment quirks are handled automatically in `nano_infer/kernels/__init__.py`:
+
+1. **ninja is not on PATH.** pip installs it into the env's `Scripts/` directory,
+   which conda does not add to PATH; torch shells out to `ninja` by name.
+2. **CUDA 12.4 rejects MSVC 14.44** as "unsupported" because the compiler is
+   newer than the toolkit. `-allow-unsupported-compiler` is passed to nvcc.
+3. **conda's library layout differs from NVIDIA's.** torch expects import
+   libraries in `$CUDA_HOME/lib/x64`; conda-forge puts them in `Library/lib`,
+   so the link fails with `LNK1181: cannot open input file 'cudart.lib'` until
+   an explicit `/LIBPATH` is added.
+
+The math libraries (`cusparse` and friends) are needed even though our kernels
+never call them: torch's `ATen/cuda/CUDAContextLight.h` includes `cusparse.h`.

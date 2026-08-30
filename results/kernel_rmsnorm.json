@@ -1,0 +1,81 @@
+{
+  "hardware": "NVIDIA GeForce RTX 3070 (see HARDWARE.md)",
+  "peak_bandwidth_gbs": 448.0,
+  "dtype": "torch.float16",
+  "runs": 50,
+  "warmup": 10,
+  "results": [
+    {
+      "rows": 1,
+      "hidden": 896,
+      "label": "decode, batch 1",
+      "torch_us": 206.50000078603625,
+      "cuda_us": 29.79999771923758,
+      "speedup": 6.929530758075489,
+      "cuda_gbs": 0.12026846558066431,
+      "cuda_pct_peak": 0.02684563963854114,
+      "torch_pct_peak": 0.003874091994938611,
+      "compulsory_bytes": 3584.0
+    },
+    {
+      "rows": 32,
+      "hidden": 896,
+      "label": "decode, batch 32",
+      "torch_us": 189.89999989571515,
+      "cuda_us": 49.94999835616909,
+      "speedup": 3.801801924829523,
+      "cuda_gbs": 2.2960561316181787,
+      "cuda_pct_peak": 0.5125125293790578,
+      "torch_pct_peak": 0.1348077936495967,
+      "compulsory_bytes": 114688.0
+    },
+    {
+      "rows": 34,
+      "hidden": 896,
+      "label": "prefill, batch 1",
+      "torch_us": 195.65000002330635,
+      "cuda_us": 60.64999979571439,
+      "speedup": 3.2258862437313844,
+      "cuda_gbs": 2.009167360436009,
+      "cuda_pct_peak": 0.4484748572401806,
+      "torch_pct_peak": 0.1390237669141828,
+      "compulsory_bytes": 121856.0
+    },
+    {
+      "rows": 1088,
+      "hidden": 896,
+      "label": "prefill, batch 32",
+      "torch_us": 199.4500016735401,
+      "cuda_us": 31.85000241501257,
+      "speedup": 6.262165982741933,
+      "cuda_gbs": 122.42988082669699,
+      "cuda_pct_peak": 27.32809839881629,
+      "torch_pct_peak": 4.364000966140233,
+      "compulsory_bytes": 3899392.0
+    },
+    {
+      "rows": 4096,
+      "hidden": 896,
+      "label": "large",
+      "torch_us": 367.95000050915405,
+      "cuda_us": 67.19999873894267,
+      "speedup": 5.4754465388988995,
+      "cuda_gbs": 218.45333743277058,
+      "cuda_pct_peak": 48.76190567695772,
+      "torch_pct_peak": 8.905557808032881,
+      "compulsory_bytes": 14680064.0
+    },
+    {
+      "rows": 16384,
+      "hidden": 896,
+      "label": "very large",
+      "torch_us": 1333.6500014702324,
+      "cuda_us": 196.59999998111743,
+      "speedup": 6.783570710062683,
+      "cuda_gbs": 298.6788199676492,
+      "cuda_pct_peak": 66.66937945706455,
+      "torch_pct_peak": 9.828065823529755,
+      "compulsory_bytes": 58720256.0
+    }
+  ]
+}
