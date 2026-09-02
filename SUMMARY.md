@@ -970,10 +970,93 @@ trusted reference, the possible culprits include the instrument you are measurin
 with.** Two implementations agreeing with each other and not with the oracle is
 the tell.
 
+### Phase 3 wrap-up — wiring the kernels in, and what end-to-end actually shows
+
+Four correct kernels are not the acceptance criterion; end-to-end tokens/sec is.
+
+**The wiring.** A module-level flag (`model.set_kernels` / `model.using_kernels`)
+rather than a parameter threaded through eight functions. The layering rule holds:
+**the Phase 1 functions are the answer key and do not consult the flag**, so
+`rms_norm`, `apply_rope`, `attention` and `forward` stay on the reference path and
+a pure-PyTorch comparison remains available in the same process. `mlp` is shared
+between Phase 1 and Phase 2, so it takes an explicit `use_kernels` keyword
+defaulting to `False` — Phase 1's call site is unchanged by construction, and a
+test asserts both of these rather than trusting them.
+
+#### Correctness: what actually changes when the kernels go in
+
+| check | result |
+|---|---|
+| batch 1, 40 tokens | **0 / 40 differ** |
+| batch 4, 160 tokens | 12 / 160 differ; first divergence top-1/top-2 gap **0.0000** |
+| kernel 4 routing | **0 calls during prefill, 24 during decode** (one per layer) |
+| prefill logit drift | 4.10e-02 with all kernels, **0.00e+00** with RMSNorm alone reverted |
+
+Three things worth pulling out.
+
+**A divergence count is a cascade, not a tally.** 12 differing tokens out of 160
+is one sequence flipping at step 28 and every later token in that sequence
+following. The first divergence had a top-1/top-2 gap of **exactly 0.0000** — a
+true tie, the strongest possible form of the near-tie standard from Gotcha #2.
+
+**Only two of the four kernels are bit-identical, and the first draft of the test
+assumed three were.** SwiGLU and RoPE are 0 ULP / 100% exact — elementwise, no
+reduction, no reordering. **RMSNorm is not, and cannot be**: it sums 896 squares
+through a warp-tree reduction while PyTorch uses its own order, and floating-point
+addition is not associative. Its bar has always been ≤ 2 ULP with ≥ 99% exact
+(Gotcha #3); what was new here is watching ~1 ULP per layer compound over 24
+layers into a 4.10e-02 logit shift — the same scale Gotcha #1 documents for
+eager-vs-SDPA.
+
+**That drift was attributed, not assumed.** Holding the kernel flag on while
+routing only RMSNorm back to the reference drops the difference to **exactly
+zero**. That single experiment proves three things at once: RMSNorm is the whole
+source, SwiGLU and RoPE contribute nothing, and prefill never reaches the decode
+kernel. Kernel 4's routing is *also* asserted structurally by counting calls
+rather than inferred from numerics — conflating a routing bug with rounding is
+exactly how a real bug hides.
+
+#### End-to-end: measured, but not yet a headline number
+
+**The honest expectation, written down before running it:** kernels 1–3 are
+launch-bound at decode sizes (RoPE's q at batch 32 is 57 KB; RMSNorm's rows are
+896 wide), so their 7.66× / 1.65× / 5.03× microbenchmark ratios cannot transfer.
+Kernel 4 is the only one touching a big tensor and it runs at 11.1% of peak.
+
+Three runs of the same A/B, same process, kernels off vs on:
+
+| batch | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| 1 | 3.29× | 2.88× | 2.48× |
+| 4 | 2.60× | 1.85× | 2.69× |
+| 16 | 2.45× | 2.83× | 2.93× |
+| 32 | 2.06× | 1.96× | 2.31× |
+
+**Consistently 1.85–3.29×, never below 1.8×** — better than expected, and the
+direction is robust. But **the precise numbers are not trustworthy yet**, and
+saying so is the point:
+
+- run-to-run spread reached **16–40%** against this project's 3% bar;
+- the GPU was at **36–53% utilization** and holding 5.8 of 8 GB for other
+  processes (Wallpaper Engine, Edge, Steam) throughout;
+- decisively, `bench/phase2_cache.py` — the benchmark that originally produced
+  the recorded 831/665 tok/s figures — **now times out after 10 minutes** on the
+  same machine. The environment, not the code, changed.
+
+An A/B ratio is more robust than an absolute figure here, because both sides
+shared the same contention in the same process. But a 3× claim resting on runs
+that disagree by 30% with each other is not a measurement, so it is recorded as
+provisional and the caveat is written into `results/phase3_end_to_end.md` itself
+— a warning that only ever appeared on stdout does not survive being pasted into
+a README.
+
+**Phase 3 is functionally complete and its headline number is pending one clean
+re-run on an idle GPU.**
+
 ### Remaining in Phase 3
 
-- End-to-end tokens/sec improvement over Phase 2 (wire the four kernels
-  into `model.py` behind a flag and measure)
+- One clean re-run of `bench/phase3_end_to_end.py` on an idle GPU, to turn the
+  provisional 1.85–3.29× into a headline number.
 
 ---
 
@@ -1059,6 +1142,17 @@ the tell.
     resolution becomes enormously fine — 2420 ULP at a flat 1.95e-03 absolute
     difference. Absolute error was wrong for RMSNorm and right here. Choose the
     metric from the value distribution, not from habit.
+22. **Attribute a divergence, do not just bound it.** Enabling the kernels moved
+    prefill logits by 4.10e-02. Reverting only RMSNorm to the reference — with
+    the flag still on — dropped it to exactly zero, proving in one experiment
+    that RMSNorm's reduction order was the entire cause, that SwiGLU and RoPE
+    contribute nothing, and that prefill never reaches the decode kernel.
+23. **Check what else is using the GPU before believing a benchmark.** Three runs
+    of the same A/B disagreed by up to 30%, and the Phase 2 benchmark that
+    produced this project's recorded figures now times out, because the desktop
+    was holding 36–53% of the card. The code did not change; the environment
+    did. Numbers were published as provisional with the contention recorded in
+    the results file itself.
 
 ---
 
@@ -1069,7 +1163,7 @@ the tell.
 | 0 — Ground truth | ✅ Complete | Hardware spec, benchmark harness, reference fixture, HF baseline |
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
 | 2 — KV cache & batching | ✅ Complete | Contiguous cache + prefill/decode split (15.6× at batch 32), paged cache (3.8× memory), continuous batching (1.55× on a request stream) |
-| 3 — Custom CUDA kernels | ◐ All 4 kernels done | RMSNorm 7.7× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention 2.48× @ 11.1% (latency-bound — diagnosed, not hidden). Remaining: end-to-end wiring |
+| 3 — Custom CUDA kernels | ◐ Functionally complete | RMSNorm 7.7× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention 2.48× @ 11.1%. Wired in behind a flag; end-to-end **1.85–3.29×**, provisional (GPU contended, see wrap-up) |
 | 4 — Quantization | Planned | INT8 weight-only, then INT4 group-wise (g=128) + fused dequant-matmul. Perplexity cost measured on WikiText-2 |
 | 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |
 
@@ -1111,6 +1205,7 @@ pip install transformers safetensors tokenizers huggingface_hub datasets acceler
 | `python -m bench.kernel_swiglu` | Fused SwiGLU vs PyTorch, with bandwidth utilization |
 | `python -m bench.kernel_rope` | Fused RoPE vs PyTorch, with bandwidth utilization |
 | `python -m bench.kernel_attention` | Fused decode attention; the two wins measured separately |
+| `python -m bench.phase3_end_to_end` | End-to-end tokens/sec, kernels off vs on |
 
 ### Repository layout
 

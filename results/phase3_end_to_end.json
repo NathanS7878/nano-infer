@@ -1,0 +1,69 @@
+{
+  "hardware": "NVIDIA GeForce RTX 3070 (see HARDWARE.md)",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dtype": "torch.float16",
+  "prompt_len": 32,
+  "new_tokens": 64,
+  "repeats": 3,
+  "warmup": 1,
+  "gpu_before": {
+    "utilization_pct": 42,
+    "memory_used_mib": 6002,
+    "memory_total_mib": 8192
+  },
+  "gpu_after": {
+    "utilization_pct": 64,
+    "memory_used_mib": 7095,
+    "memory_total_mib": 8192
+  },
+  "results": [
+    {
+      "batch": 1,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "torch_s": 10.43190549999963,
+      "kernels_s": 4.214862999999241,
+      "torch_tok_s": 6.1350249002928825,
+      "kernels_tok_s": 15.184360677918008,
+      "speedup": 2.475028369842984,
+      "torch_spread_pct": 28.333768936077426,
+      "kernels_spread_pct": 31.07206331498195
+    },
+    {
+      "batch": 4,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "torch_s": 11.366673000000446,
+      "kernels_s": 4.221204499999658,
+      "torch_tok_s": 22.52198158599178,
+      "kernels_tok_s": 60.64619707479719,
+      "speedup": 2.6927558236047004,
+      "torch_spread_pct": 9.396178635557346,
+      "kernels_spread_pct": 18.52497314450664
+    },
+    {
+      "batch": 16,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "torch_s": 11.635839800000213,
+      "kernels_s": 3.9751167999993413,
+      "torch_tok_s": 88.00396169084257,
+      "kernels_tok_s": 257.6024935921807,
+      "speedup": 2.9271692846867143,
+      "torch_spread_pct": 15.671852065206284,
+      "kernels_spread_pct": 6.946014768678402
+    },
+    {
+      "batch": 32,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "torch_s": 11.354807099999562,
+      "kernels_s": 4.909466499999326,
+      "torch_tok_s": 180.36413846256173,
+      "kernels_tok_s": 417.15326909762626,
+      "speedup": 2.312839307489138,
+      "torch_spread_pct": 14.89300245356111,
+      "kernels_spread_pct": 18.92818496675605
+    }
+  ]
+}

@@ -20,6 +20,8 @@ import glob
 import os
 from dataclasses import dataclass
 
+import contextlib
+
 import torch
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
@@ -236,7 +238,8 @@ def attention(x: torch.Tensor, weights: dict, layer: int, cos: torch.Tensor,
 
 # --- component 5: SwiGLU MLP ------------------------------------------------
 
-def mlp(x: torch.Tensor, weights: dict, layer: int) -> torch.Tensor:
+def mlp(x: torch.Tensor, weights: dict, layer: int,
+        use_kernels: bool = False) -> torch.Tensor:
     """SwiGLU feed-forward. No biases on any projection.
 
     x : [batch, seq, hidden] -> [batch, seq, hidden]
@@ -252,7 +255,9 @@ def mlp(x: torch.Tensor, weights: dict, layer: int) -> torch.Tensor:
     p = f"model.layers.{layer}.mlp."
     gate = F.linear(x, weights[p + "gate_proj.weight"])              # [b,seq,4864]
     up = F.linear(x, weights[p + "up_proj.weight"])                 # [b,seq,4864]
-    hidden = F.silu(gate) * up
+    # kernel 2 when opted in; the default keeps Phase 1 on the reference path.
+    hidden = (_k().swiglu_forward(gate, up) if use_kernels
+              else F.silu(gate) * up)
     return F.linear(hidden, weights[p + "down_proj.weight"])         # [b,seq,896]
 
 
@@ -325,6 +330,79 @@ def greedy_decode(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
 # against. The functions below add prefill/decode paths alongside it.
 # ===========================================================================
 
+# ---------------------------------------------------------------------------
+# Phase 3: optional custom CUDA kernels
+#
+# A module-level switch rather than a parameter threaded through eight
+# functions. The rule from `model.py`'s layering (see ROADMAP.md) is that the
+# PHASE 1 FUNCTIONS ARE THE ANSWER KEY and are never optimized in place, so
+# `rms_norm`, `apply_rope`, `attention` and `forward` deliberately do NOT
+# consult this flag. Only the Phase 2 cached/paged paths do, which keeps a
+# pure-PyTorch reference available in the same process for comparison.
+#
+# `mlp` is shared by Phase 1 and Phase 2, so it takes an explicit keyword that
+# defaults to False rather than reading the global — Phase 1's call site is
+# unchanged by construction.
+# ---------------------------------------------------------------------------
+
+_KERNELS_ENABLED = False
+
+
+def kernels_enabled() -> bool:
+    return _KERNELS_ENABLED
+
+
+def set_kernels(enabled: bool) -> bool:
+    """Turn the custom kernels on/off. Returns the previous setting.
+
+    Compiles on first enable (~40 s), then cached. Raises if CUDA or the
+    toolchain is unavailable, rather than silently falling back — a benchmark
+    that quietly measured the PyTorch path while claiming kernels would be
+    worse than no benchmark.
+    """
+    global _KERNELS_ENABLED
+    previous = _KERNELS_ENABLED
+    if enabled:
+        from nano_infer import kernels as _k
+        _k.load()
+    _KERNELS_ENABLED = bool(enabled)
+    return previous
+
+
+@contextlib.contextmanager
+def using_kernels(enabled: bool = True):
+    """Scoped version of set_kernels, so a benchmark can A/B in one process."""
+    previous = set_kernels(enabled)
+    try:
+        yield
+    finally:
+        set_kernels(previous)
+
+
+def _k():
+    from nano_infer import kernels as _mod
+    return _mod.load()
+
+
+def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Kernel 1 if enabled, else the Phase 1 reference."""
+    if _KERNELS_ENABLED:
+        return _k().rmsnorm_forward(x, weight, eps)
+    return rms_norm(x, weight, eps)
+
+
+def _rope(q, k, cos, sin, per_sequence: bool):
+    """Kernel 3 if enabled, else the Phase 1 / Phase 2 reference.
+
+    Both position layouts go to the same kernel: it takes cos/sin as either
+    [n, head_dim] (shared range) or [batch, n, head_dim] (per sequence).
+    """
+    if _KERNELS_ENABLED:
+        return _k().rope_forward(q, cos, sin), _k().rope_forward(k, cos, sin)
+    return (apply_rope_positions(q, k, cos, sin) if per_sequence
+            else apply_rope(q, k, cos, sin))
+
+
 def attention_cached(x: torch.Tensor, weights: dict, layer: int,
                      cos: torch.Tensor, sin: torch.Tensor, cf: "QwenConfig",
                      cache: "KVCache", start_pos: int) -> torch.Tensor:
@@ -350,7 +428,7 @@ def attention_cached(x: torch.Tensor, weights: dict, layer: int,
     v = v.view(b, n, cf.num_kv_heads, cf.head_dim).transpose(1, 2)
 
     # RoPE first, THEN cache: the rotation is part of the frozen past.
-    q, k = apply_rope(q, k, cos, sin)
+    q, k = _rope(q, k, cos, sin, per_sequence=False)
 
     cache.append(layer, k, v, start_pos)
     total = start_pos + n
@@ -383,12 +461,12 @@ def decoder_block_cached(x: torch.Tensor, weights: dict, layer: int,
     """Same pre-norm block as Phase 1, using the cached attention path."""
     ln = f"model.layers.{layer}."
     residual = x
-    h = rms_norm(x, weights[ln + "input_layernorm.weight"], cf.rms_norm_eps)
+    h = _rms(x, weights[ln + "input_layernorm.weight"], cf.rms_norm_eps)
     x = residual + attention_cached(h, weights, layer, cos, sin, cf, cache, start_pos)
 
     residual = x
-    h = rms_norm(x, weights[ln + "post_attention_layernorm.weight"], cf.rms_norm_eps)
-    x = residual + mlp(h, weights, layer)
+    h = _rms(x, weights[ln + "post_attention_layernorm.weight"], cf.rms_norm_eps)
+    x = residual + mlp(h, weights, layer, use_kernels=_KERNELS_ENABLED)
     return x
 
 
@@ -411,7 +489,7 @@ def forward_cached(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
     for i in range(cf.num_layers):
         x = decoder_block_cached(x, weights, i, cos, sin, cf, cache, start_pos)
     x = x[:, -1:]                                                     # last position only
-    x = rms_norm(x, weights["model.norm.weight"], cf.rms_norm_eps)
+    x = _rms(x, weights["model.norm.weight"], cf.rms_norm_eps)
     return F.linear(x, weights["model.embed_tokens.weight"])[:, 0]    # [b, vocab]
 
 
@@ -458,7 +536,8 @@ def generate_cached(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
 
 def attention_paged(x: torch.Tensor, weights: dict, layer: int,
                     cos: torch.Tensor, sin: torch.Tensor, cf: "QwenConfig",
-                    cache: "PagedKVCache", plan, allowed) -> torch.Tensor:
+                    cache: "PagedKVCache", plan, allowed,
+                    lengths=None) -> torch.Tensor:
     """Attention against a paged cache.
 
     Same math as attention_cached; the difference is that K/V are scattered into
@@ -480,16 +559,28 @@ def attention_paged(x: torch.Tensor, weights: dict, layer: int,
     k = k.view(b, n, cf.num_kv_heads, cf.head_dim).transpose(1, 2)
     v = v.view(b, n, cf.num_kv_heads, cf.head_dim).transpose(1, 2)
 
-    q, k = apply_rope_positions(q, k, cos, sin)
+    q, k = _rope(q, k, cos, sin, per_sequence=True)
 
     cache.append(layer, k, v, plan)
+    scale = cf.head_dim ** -0.5
+
+    # Kernel 4 — decode only. Prefill (n > 1) still needs the masked multi-query
+    # path: the kernel handles exactly one query token against the cached past,
+    # which is what makes the causal mask unnecessary rather than optional.
+    if _KERNELS_ENABLED and n == 1 and lengths is not None:
+        out = _k().decode_attention_forward(
+            q[:, :, 0, :].contiguous(),      # [b, q_heads, head_dim]
+            cache.k[layer], cache.v[layer],  # the pool, walked in place
+            plan.read, lengths, scale)       # no gather, no repeat_kv
+        out = out.reshape(b, n, cf.q_dim)
+        return F.linear(out, weights[p + "o_proj.weight"])
+
     k_all, v_all = cache.gather(layer, plan)                          # [b,kvh,L,hd]
 
     n_rep = cf.num_q_heads // cf.num_kv_heads
     k_all = repeat_kv(k_all, n_rep)
     v_all = repeat_kv(v_all, n_rep)
 
-    scale = cf.head_dim ** -0.5
     scores = (q @ k_all.transpose(-1, -2)).float() * scale            # [b,14,n,L]
     scores = scores.masked_fill(~allowed, float("-inf"))
 
@@ -529,15 +620,15 @@ def forward_paged(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
     for i in range(cf.num_layers):
         ln = f"model.layers.{i}."
         residual = x
-        h = rms_norm(x, weights[ln + "input_layernorm.weight"], cf.rms_norm_eps)
+        h = _rms(x, weights[ln + "input_layernorm.weight"], cf.rms_norm_eps)
         x = residual + attention_paged(h, weights, i, cos, sin, cf, cache,
-                                       plan, allowed)
+                                       plan, allowed, lengths)
         residual = x
-        h = rms_norm(x, weights[ln + "post_attention_layernorm.weight"],
-                     cf.rms_norm_eps)
-        x = residual + mlp(h, weights, i)
+        h = _rms(x, weights[ln + "post_attention_layernorm.weight"],
+                 cf.rms_norm_eps)
+        x = residual + mlp(h, weights, i, use_kernels=_KERNELS_ENABLED)
 
-    x = rms_norm(x[:, -1:], weights["model.norm.weight"], cf.rms_norm_eps)
+    x = _rms(x[:, -1:], weights["model.norm.weight"], cf.rms_norm_eps)
     return F.linear(x, weights["model.embed_tokens.weight"])[:, 0]
 
 

@@ -42,19 +42,19 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-02, after Phase 3 kernel 4 (all four kernels done)._
+_Last updated: 2026-09-02, after the Phase 3 wrap-up (kernels wired in)._
 
 | Phase | Status | Headline |
 |---|---|---|
 | 0 — Ground truth | ✅ Complete | Harness (<3% variance), HF baseline, reference fixture |
 | 1 — Correct but slow | ✅ Complete | From-scratch forward pass, token-for-token vs HF |
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
-| 3 — Custom CUDA kernels | ◐ **4 of 4 kernels**, wrap-up left | RMSNorm 7.66× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention **2.48×** @ 11.1% — **latency-bound, diagnosed** |
+| 3 — Custom CUDA kernels | ◐ **Functionally complete** | 4/4 kernels, wired in behind a flag, output verified. End-to-end **1.85–3.29×** but **provisional** — GPU contended, see Gotcha #18 |
 | 4 — Quantization | ⬜ Not started | INT8 → INT4 group-wise + fused dequant-matmul |
 | 5 — Make it legible | ⬜ Not started | README table, diagram, WRITEUP.md, limitations |
 
-- **Tests:** 70 passing (`python -m pytest tests/ -q`)
-- **Commits:** 18 on `main`, clean tree
+- **Tests:** 76 passing (`python -m pytest tests/ -q`)
+- **Commits:** 19 on `main`, clean tree
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -90,6 +90,7 @@ $env:PYTHONPATH="C:\Users\Nathan stevens\OneDrive\Projects\nano-infer"
 | `-m bench.kernel_swiglu` | Fused SwiGLU vs PyTorch + bandwidth utilization |
 | `-m bench.kernel_rope` | Fused RoPE vs PyTorch + bandwidth utilization |
 | `-m bench.kernel_attention` | Decode attention; fusion win and gather win separated |
+| `-m bench.phase3_end_to_end` | **The Phase 3 acceptance number**: tokens/sec, kernels off vs on |
 
 Toolchain is installed and working: nvcc 12.4 (conda-forge), MSVC 14.44, ninja.
 Full build notes in `HARDWARE.md`. Kernels JIT-compile on first use (~40 s), then cache.
@@ -233,6 +234,31 @@ These were all expensive to discover. Read before debugging anything.
     ≤ the fp16 reference's. That bar cannot be satisfied by being wrong in the
     same direction as PyTorch, which a plain "close to the reference" test would
     allow.
+
+18. **Check what else is using the GPU BEFORE trusting any benchmark on this
+    machine.** The desktop (Wallpaper Engine, Edge, Steam) routinely holds
+    36–53% GPU utilization and ~5.8 of 8 GB. Under that load, three runs of the
+    same A/B disagreed by up to 30%, and `bench/phase2_cache.py` — which
+    produced this repo's recorded 831/665 tok/s — **timed out after 10 minutes**.
+    Nothing in the code changed. `bench/phase3_end_to_end.py` now queries
+    `nvidia-smi` and stamps the contention into `results/*.md` itself, because a
+    warning printed only to stdout does not survive being pasted into a README.
+    **Close the GPU-using desktop apps before any run whose number you intend to
+    publish.**
+
+19. **Only TWO of the four kernels are bit-identical.** SwiGLU and RoPE are
+    0 ULP / 100% exact (elementwise, no reduction, no reordering). **RMSNorm is
+    not and cannot be** — warp-tree reduction order vs PyTorch's, bar ≤ 2 ULP
+    (Gotcha #3) — and over 24 layers that compounds to a **4.10e-02** logit
+    shift. Decode attention is not bit-identical either (Gotcha #16). A test
+    that assumes "kernels 1–3 are exact" will fail; the first draft of
+    `tests/test_end_to_end_kernels.py` did exactly that.
+
+20. **Attribute a divergence, do not merely bound it.** Keeping the kernel flag
+    ON while reverting *only* RMSNorm to the reference dropped that 4.10e-02 to
+    **exactly zero** — proving in one experiment that RMSNorm was the whole
+    cause, that SwiGLU/RoPE contribute nothing, and that prefill never reaches
+    the decode kernel. Cheaper and far more convincing than a tolerance.
 
 17. **Byte counting predicts a ceiling only for a kernel that is actually
     bandwidth-bound.** Kernels 1–3 landed within 1% of their predictions; decode
@@ -384,37 +410,28 @@ is 0.48–1.00× the reference's on every shape.
 
 ## Next actions
 
-### ▶ IMMEDIATE: Phase 3 wrap-up — wire the kernels in and measure end to end
+### ▶ IMMEDIATE: one clean end-to-end run, then Phase 3 is done
 
-All four kernels are written, correct, and individually benchmarked. **None of
-that is the phase's acceptance criterion**, which is end-to-end tokens/sec vs
-Phase 2. Expect the end-to-end number to be much smaller than the kernel
-speedups, and be ready to say so honestly:
+Everything else in Phase 3 is finished: four kernels, correct, benchmarked,
+wired into `model.py` behind `model.using_kernels()`, and verified end to end
+(batch 1 identical; batch 4's only divergence a 0.0000 logit tie).
 
-- kernels 1–3 are **launch-bound at decode sizes** (RoPE's q at batch 32 is
-  57 KB), so their microbenchmark ratios will not transfer;
-- kernel 4 is the only one touching a big tensor, and it is at 11.1% of peak.
+The single outstanding item is that **the acceptance number is contended**.
+Three runs gave 1.85–3.29× with 16–40% run-to-run spread against this project's
+3% bar, because the desktop was using 36–53% of the GPU (Gotcha #18).
 
-Steps:
-
-1. Add a `use_kernels: bool` flag (config or an argument threaded through
-   `forward_cached` / `forward_paged`). **Keep the PyTorch paths intact** — they
-   are the comparison and the correctness reference, and `model.py`'s layering
-   rule says never optimize the Phase 1 functions in place.
-2. Swap in, one at a time, measuring after each: `rms_norm` → `kernels.rmsnorm`,
-   the `silu(gate)*up` in `mlp` → `kernels.swiglu`, `apply_rope` /
-   `apply_rope_positions` → `kernels.rope`, and the decode branch of
-   `attention_paged` → `kernels.decode_attention_forward`.
-   Swapping all four at once makes a regression impossible to attribute.
-3. **Kernel 4 only applies when `n == 1`** (decode). Prefill still needs the
-   masked multi-query path; do not route prefill through it.
-4. Re-run `tests/test_cache.py` and `tests/test_continuous.py`. Output must not
-   change beyond the documented near-tie (Gotcha #2). Kernel 4 is not
-   bit-identical, so expect the near-tie count to move — **report the new number,
-   do not adjust the bar** (Gotcha #16 replaced the bar for a reason).
-5. New `bench/phase3_end_to_end.py`: Phase 2 vs Phase 3 tokens/sec at batch
-   1/4/16/32, same methodology as `bench/phase2_cache.py`.
-6. Commit, update this file + PROGRESS.md + SUMMARY.md.
+1. **Close the GPU-using desktop apps** — Wallpaper Engine is the main one, plus
+   Edge and Steam. Confirm with `nvidia-smi`: utilization should be ~0% and
+   memory under ~500 MiB before starting.
+2. `python -m bench.phase3_end_to_end --repeats 5`. It prints the contention it
+   sees and refuses to call the result clean if spread exceeds 3%.
+3. **Also re-run `python -m bench.phase2_cache`** and check it reproduces the
+   recorded 831/665 tok/s. It currently times out, so the Phase 2 numbers in
+   SUMMARY.md are unconfirmed on the machine's present state — if they do not
+   reproduce on an idle GPU, that is a real finding and the table needs a note.
+4. Update the Phase 3 row in SUMMARY.md, PROGRESS.md and this file with the
+   clean figures, and drop the "provisional" caveat from
+   `results/phase3_end_to_end.md`.
 
 ### Then: optional — close the gap on kernel 4
 
