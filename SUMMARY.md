@@ -804,10 +804,176 @@ first and fails the second, so both are tested. Also verified on non-contiguous
 input — `attention()` produces q/k by transposing a view, so that is the normal
 case — and on real q/k from layers 0, 12, 23.
 
+### Kernel 4 — Fused decode attention with online softmax ✅
+
+Kernels 1–3 were fusions: same arithmetic, fewer round trips, ceiling predictable
+by counting bytes, and all three landed within 1% of that prediction. **This one
+changes the algorithm, and it is the one that missed its prediction badly — which
+made it the most informative kernel in the phase.**
+
+The reference materializes a `[batch, heads, 1, L]` score matrix, softmaxes it,
+then multiplies by V. Online softmax never materializes it, streaming keys in
+tiles while carrying three running values per (sequence, query head):
+
+```
+m   running max of scores       l   running sum of exp(s-m)     acc  running sum of exp(s-m)*v
+
+per tile:  m_new = max(m, max(s_tile));   corr = exp(m - m_new)
+           l   = l   * corr + sum(exp(s_tile - m_new))
+           acc = acc * corr + sum_j exp(s_j - m_new) * v_j
+out = acc / l
+```
+
+`corr` is the whole trick: a softmax needs the max of the entire row, a streaming
+kernel does not have it yet, so when a later tile raises the max everything
+already accumulated is retroactively rescaled. **The recurrence was prototyped in
+Python before any CUDA was written** — which also measured what dropping `corr`
+costs (2.881 absolute error on a late max jump), giving the regression test a
+signature to look for rather than a guess.
+
+#### The prediction, and the miss
+
+Byte count per sequence per layer, L cached positions, GQA 14 q / 2 kv heads:
+
+| | traffic |
+|---|---|
+| `cache.gather` | 1024L |
+| `repeat_kv` — materializes a 7× copy of K and V | **4096L** |
+| `q @ kᵀ` | 3612L |
+| float / mask / softmax / cast round trips | 392L |
+| `probs @ v` | 3612L |
+| **PyTorch total** | **~12736L** |
+| **Ours** — read K once, read V once | **512L** |
+
+Predicted ceiling ~24×. **Measured 2.48×.** Every previous kernel landed within
+1% of its byte count; this one came in at a tenth of it. Byte counting predicts
+the ceiling only when the kernel is actually bandwidth-bound — and this one is not.
+
+#### Profiling the miss: it is latency-bound, not bandwidth-bound
+
+The obvious suspect was duplicated reads: one block per (sequence, query head)
+means the 7 query heads sharing a KV head each stream that KV independently. The
+decisive experiment holds the KV pool fixed (batch 32, L 1024, 2 KV heads) and
+varies only how many query heads share it, so compulsory traffic is constant:
+
+| query heads | blocks | time | µs per query head |
+|---|---|---|---|
+| 2 | 64 | 281.8 µs | 140.9 |
+| 4 | 128 | 282.4 µs | 70.6 |
+| 8 | 256 | 292.0 µs | 36.5 |
+| 14 | 448 | 510.2 µs | 36.4 |
+
+**From 2 to 8 query heads the work quadruples and the wall time does not move.**
+That is not bandwidth saturation and it is not the duplicated reads — it is the
+signature of a dependency chain with nothing to overlap it. The online-softmax
+recurrence is inherently sequential across tiles, each tile costs several
+`__syncthreads()`, and at 128 threads per block there were only 4 warps per block
+to hide the memory latency between barriers. Kernel 2's lesson (barriers, not
+arithmetic, cost a memory-bound kernel its peak) returning with real teeth.
+
+#### The fix that followed from the diagnosis
+
+If latency is the problem, the lever is warps per SM and tiles per sequence — so
+block size, which is also the tile width. Sweeping it:
+
+| case | 64 | 128 | 256 | 512 | 1024 | best |
+|---|---|---|---|---|---|---|
+| b32 L512 | 264.0 | 268.3 | 217.1 | **199.1** | 232.9 | 512 |
+| b32 L2048 | 970.8 | 936.6 | 749.5 | **668.7** | 749.0 | 512 |
+| b1 L1024 | 278.0 | 185.7 | 129.6 | 93.1 | **51.6** | 1024 |
+
+Batch 1 wants the widest block available and gains **3.6×** from it, for the
+reason the diagnosis predicts: with 14 blocks total there is nothing else on the
+SM, so all the latency hiding has to come from inside the block. The shipped
+heuristic picks 512 when there are many blocks and 1024 when there are few, and
+reproduces the measured optimum on every case in the sweep. Overall: **7.9% →
+11.1% of peak, 2.25× → 2.48×.**
+
+#### Final results, with the two wins separated
+
+The kernel does two independent things, so reporting one number would hide which
+mattered. Three implementations are timed — the Phase 2 paged path, the same
+path handed pre-gathered KV, and ours:
+
+| Shape | Phase 2 paged | Pre-gathered | Ours | vs paged | vs pre-gathered | GB/s | % of peak |
+|---|---|---|---|---|---|---|---|
+| b1 L128 | 375.9 µs | 306.8 µs | 32.6 µs | **11.53×** | 9.41× | 2.0 | 0.4% |
+| b32 L128 | 379.4 µs | 321.7 µs | 62.2 µs | 6.10× | 5.17× | 33.7 | 7.5% |
+| b32 L512 | 513.2 µs | 418.1 µs | 200.5 µs | 2.56× | 2.09× | 41.8 | 9.3% |
+| b32 L1024 | 901.5 µs | 745.5 µs | 396.2 µs | 2.28× | 1.88× | 42.3 | 9.5% |
+| b32 L2048 | 1755.3 µs | 1364.6 µs | 677.0 µs | **2.59×** | 2.02× | **49.6** | **11.1%** |
+
+At batch 32 with context ≥ 512: **1.99× from the fusion** (online softmax plus
+never materializing `repeat_kv`'s 7× copy) and **1.24× from reading the paged
+block table in place** (removing the gather copy Phase 2 pays every step).
+
+#### What is still wrong, stated plainly
+
+**11.1% of peak is not a good number.** Phase 2's decode was at 5.9%, so this
+roughly doubles it, but the kernel is still latency-bound rather than
+bandwidth-bound and the diagnosis above says exactly why. Two optimizations are
+identified and not done:
+
+1. **Split-K (flash-decoding proper).** Partition L across several blocks, each
+   producing a partial `(m, l, acc)`, then combine. That adds the parallelism the
+   scaling experiment showed is missing, and it is what real flash-decoding does
+   for exactly this case — long context, few sequences.
+2. **Collapse the 7 query heads sharing a KV head into one block.** They stream
+   the same KV; one block could read it once and serve all seven.
+
+The GB/s column also counts each KV element once, though the kernel issues up to
+7 reads of it. It therefore measures *useful* bandwidth, not bus traffic, and is
+reported that way rather than as an efficiency claim.
+
+#### Correctness: the first kernel that cannot be bit-identical
+
+The reference rounds the QK product to fp16, softmaxes in fp32, then rounds the
+probabilities back to fp16 before accumulating. An online algorithm cannot do
+that last step at all — it does not know the normaliser until every key has been
+seen. So bit-identity is structurally impossible, and the ULP bar that governed
+kernels 1–3 had to be replaced rather than loosened:
+
+> **Against an fp64 ground truth, our error must be no larger than the fp16
+> reference's.**
+
+That is a harder test than "close to PyTorch", because it cannot be satisfied by
+being wrong in the same direction as the reference. Measured across all shapes,
+our error is **0.48–1.00×** the reference's — as accurate or better everywhere.
+
+**Third metric lesson.** The ULP counts against the reference look alarming (up
+to 2420) while the absolute difference is a flat 1.95e-03 — one fp16 ULP at
+magnitude 2. Attention output components pass through zero, and near zero fp16
+resolution becomes enormously fine, so ULP distance explodes where the absolute
+error is negligible. ULP was exactly the right metric for kernel 1 and is the
+wrong one here; absolute error was wrong for kernel 1 and is right here. **Neither
+metric is universal — the right one depends on whether the value distribution
+spans zero.**
+
+#### The debugging story: the oracle was the broken thing
+
+The ground-truth test was first written the obvious way — upcast the GPU tensors
+to float64 and reuse the reference. It reported our kernel and PyTorch as *equally
+wrong* by 0.18, on outputs of magnitude ~0.4. Two independent implementations
+agreeing closely with each other and not with the oracle indicts the oracle, so
+the oracle got tested:
+
+**`torch.softmax` in float64 on CUDA returns incorrect results on this machine
+for any tensor with more than one row.** Measured on torch 2.6.0+cu124 / RTX
+3070: at `[16, 513]` the elementwise error against CPU is 1.2e-02 and rows sum to
+**0.68 instead of 1.0**, while `[1, 513]` is exact to 1.7e-18. fp32 and fp16 are
+unaffected, and a uniform input is unaffected at any size.
+
+The ground truth now runs on the CPU, and `test_fp64_softmax_on_cuda_is_unreliable`
+pins the bug so nobody "simplifies" it back onto the GPU — it fails if torch ever
+fixes it. The reusable lesson: **when a new implementation disagrees with a
+trusted reference, the possible culprits include the instrument you are measuring
+with.** Two implementations agreeing with each other and not with the oracle is
+the tell.
+
 ### Remaining in Phase 3
 
-- Kernel 4 — decode fused attention with online softmax (flash-decoding in miniature)
-- End-to-end tokens/sec improvement over Phase 2
+- End-to-end tokens/sec improvement over Phase 2 (wire the four kernels
+  into `model.py` behind a flag and measure)
 
 ---
 
@@ -877,6 +1043,22 @@ case — and on real q/k from layers 0, 12, 23.
     Assert the convention directly (cos=0, sin=1 collapses the transform to
     `rotate_half`) and add a reference-independent property test (a rotation
     preserves vector norm) rather than trusting an end-to-end check to notice.
+19. **Byte counting predicts a ceiling only for a kernel that is actually
+    bandwidth-bound.** Kernels 1–3 landed within 1% of their byte-counted
+    predictions. Decode attention predicted ~24× and delivered 2.48×, because it
+    is latency-bound: holding KV volume fixed and quadrupling the block count
+    left wall time flat. The prediction failing is what located the bottleneck.
+20. **When a new implementation disagrees with a trusted reference, the
+    instrument is a suspect too.** An fp64 "ground truth" said this kernel and
+    PyTorch were equally wrong by 0.18. Two independent implementations agreeing
+    with each other and not with the oracle indicts the oracle: `torch.softmax`
+    in float64 on CUDA is wrong on this machine for any multi-row tensor (rows
+    summing to 0.68 instead of 1.0).
+21. **No error metric is universal.** ULP distance was exactly right for RMSNorm
+    and is badly wrong for attention, where outputs pass through zero and fp16
+    resolution becomes enormously fine — 2420 ULP at a flat 1.95e-03 absolute
+    difference. Absolute error was wrong for RMSNorm and right here. Choose the
+    metric from the value distribution, not from habit.
 
 ---
 
@@ -887,7 +1069,7 @@ case — and on real q/k from layers 0, 12, 23.
 | 0 — Ground truth | ✅ Complete | Hardware spec, benchmark harness, reference fixture, HF baseline |
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
 | 2 — KV cache & batching | ✅ Complete | Contiguous cache + prefill/decode split (15.6× at batch 32), paged cache (3.8× memory), continuous batching (1.55× on a request stream) |
-| 3 — Custom CUDA kernels | ◐ In progress | ✅ Fused RMSNorm (7.7×, 75.5% of peak). ✅ Fused SwiGLU (1.65× vs 1.67× predicted, 89.5% of peak). ✅ Fused RoPE (5.03× vs 5.00× predicted, 87.6% of peak). Remaining: decode attention with online softmax |
+| 3 — Custom CUDA kernels | ◐ All 4 kernels done | RMSNorm 7.7× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention 2.48× @ 11.1% (latency-bound — diagnosed, not hidden). Remaining: end-to-end wiring |
 | 4 — Quantization | Planned | INT8 weight-only, then INT4 group-wise (g=128) + fused dequant-matmul. Perplexity cost measured on WikiText-2 |
 | 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |
 
@@ -928,6 +1110,7 @@ pip install transformers safetensors tokenizers huggingface_hub datasets acceler
 | `python -m bench.kernel_rmsnorm` | Fused RMSNorm vs PyTorch, with bandwidth utilization |
 | `python -m bench.kernel_swiglu` | Fused SwiGLU vs PyTorch, with bandwidth utilization |
 | `python -m bench.kernel_rope` | Fused RoPE vs PyTorch, with bandwidth utilization |
+| `python -m bench.kernel_attention` | Fused decode attention; the two wins measured separately |
 
 ### Repository layout
 

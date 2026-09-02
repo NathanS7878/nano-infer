@@ -42,19 +42,19 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-01, after Phase 3 kernel 3._
+_Last updated: 2026-09-02, after Phase 3 kernel 4 (all four kernels done)._
 
 | Phase | Status | Headline |
 |---|---|---|
 | 0 — Ground truth | ✅ Complete | Harness (<3% variance), HF baseline, reference fixture |
 | 1 — Correct but slow | ✅ Complete | From-scratch forward pass, token-for-token vs HF |
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
-| 3 — Custom CUDA kernels | ◐ **3 of 4 kernels** | RMSNorm 7.66× @ 75.5%; SwiGLU 1.65× @ 89.5% (predicted 1.67×); RoPE **5.03×** @ **87.6%** (predicted 5.00×) |
+| 3 — Custom CUDA kernels | ◐ **4 of 4 kernels**, wrap-up left | RMSNorm 7.66× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention **2.48×** @ 11.1% — **latency-bound, diagnosed** |
 | 4 — Quantization | ⬜ Not started | INT8 → INT4 group-wise + fused dequant-matmul |
 | 5 — Make it legible | ⬜ Not started | README table, diagram, WRITEUP.md, limitations |
 
-- **Tests:** 59 passing (`python -m pytest tests/ -q`)
-- **Commits:** 17 on `main`, clean tree
+- **Tests:** 70 passing (`python -m pytest tests/ -q`)
+- **Commits:** 18 on `main`, clean tree
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -89,6 +89,7 @@ $env:PYTHONPATH="C:\Users\Nathan stevens\OneDrive\Projects\nano-infer"
 | `-m bench.kernel_rmsnorm` | Fused RMSNorm vs PyTorch + bandwidth utilization |
 | `-m bench.kernel_swiglu` | Fused SwiGLU vs PyTorch + bandwidth utilization |
 | `-m bench.kernel_rope` | Fused RoPE vs PyTorch + bandwidth utilization |
+| `-m bench.kernel_attention` | Decode attention; fusion win and gather win separated |
 
 Toolchain is installed and working: nvcc 12.4 (conda-forge), MSVC 14.44, ninja.
 Full build notes in `HARDWARE.md`. Kernels JIT-compile on first use (~40 s), then cache.
@@ -111,6 +112,9 @@ nano_infer/
     rmsnorm.cu   kernel 1: fused RMSNorm (scalar + float4 vectorized paths)
     swiglu.cu    kernel 2: fused SwiGLU (scalar + float4, grid-stride)
     rope.cu      kernel 3: fused RoPE (both shared- and per-sequence positions)
+    attention_decode.cu
+                 kernel 4: online-softmax decode attention, walks the paged
+                 slot table in place. Block size is a tuned knob (see #17)
 bench/           harness.py + one benchmark per phase/kernel
 tests/           parity + component + cache + paged + continuous + kernel tests
 results/         committed JSON + markdown benchmark outputs
@@ -210,6 +214,36 @@ These were all expensive to discover. Read before debugging anything.
     tensors PyTorch's chain falls to 81.1% of peak while ours holds 87.6%. Byte
     counting predicts the *floor* of a fusion win, not a bound on it. Always
     score both sides against their own actual traffic before believing a ratio.
+
+15. **`torch.softmax` in float64 on CUDA is WRONG on this machine** for any
+    tensor with more than one row. torch 2.6.0+cu124 / RTX 3070: at `[16, 513]`
+    the elementwise error vs CPU is 1.2e-02 and **rows sum to 0.68 instead of
+    1.0**; `[1, 513]` is exact; fp32/fp16 unaffected. Any fp64 "ground truth"
+    must be computed **on the CPU**. Pinned by
+    `tests/test_kernels.py::test_fp64_softmax_on_cuda_is_unreliable`, which fails
+    if torch ever fixes it. This cost real time: it made a correct kernel look
+    wrong by 0.18. **Two independent implementations agreeing with each other and
+    disagreeing with the oracle indicts the oracle.**
+
+16. **No error metric is universal — pick it from the value distribution.** ULP
+    distance was exactly right for RMSNorm (Gotcha #3) and is badly wrong for
+    attention: outputs pass through zero, fp16 resolution near zero is enormously
+    fine, so a flat 1.95e-03 absolute difference reads as 2420 ULP. Attention
+    parity is stated against an **fp64 ground truth** instead: our error must be
+    ≤ the fp16 reference's. That bar cannot be satisfied by being wrong in the
+    same direction as PyTorch, which a plain "close to the reference" test would
+    allow.
+
+17. **Byte counting predicts a ceiling only for a kernel that is actually
+    bandwidth-bound.** Kernels 1–3 landed within 1% of their predictions; decode
+    attention predicted ~24× and delivered 2.48×. The decisive experiment: hold
+    the KV pool fixed and vary only how many query heads share it — 2→8 query
+    heads quadruples the blocks and leaves wall time **flat** (281.8 → 292.0 µs).
+    Not bandwidth-bound, not duplicated-read-bound: **latency-bound**, because the
+    online-softmax recurrence is sequential across tiles and each tile costs
+    several `__syncthreads()`. The fix that followed (block size 128 → 512/1024)
+    gave 7.9% → 11.1% of peak, and **3.6× at batch 1**, where there are only 14
+    blocks so all latency hiding must come from inside the block.
 
 ---
 
@@ -324,56 +358,72 @@ overshoot is explained in Gotcha #14. Parity 0 ULP on all 7 shapes, both positio
 paths, non-contiguous input, and real q/k from layers 0/12/23; pairing asserted
 directly (Gotcha #12) plus a reference-independent norm-preservation test.
 
+**Kernel 4 — fused decode attention with online softmax ✅.** Streams keys in
+tiles carrying `(m, l, acc)`; never materializes the score matrix, never
+materializes `repeat_kv`'s 7× copy, and walks the **paged slot table in place**
+so the gather copy disappears. Recurrence prototyped in Python first (which also
+measured what dropping the `exp(m_old-m_new)` correction costs: 2.881 — now a
+regression test).
+
+| Shape | Phase 2 paged | Pre-gathered | Ours | vs paged | GB/s | % peak |
+|---|---|---|---|---|---|---|
+| b1 L128 | 375.9 µs | 306.8 µs | 32.6 µs | **11.53×** | 2.0 | 0.4% |
+| b32 L512 | 513.2 µs | 418.1 µs | 200.5 µs | 2.56× | 41.8 | 9.3% |
+| b32 L2048 | 1755.3 µs | 1364.6 µs | 677.0 µs | **2.59×** | **49.6** | **11.1%** |
+
+At batch 32, context ≥ 512: **1.99× from the fusion, 1.24× from removing the
+gather** — measured separately on purpose. **Predicted ~24×, got 2.48×**; the
+miss is the finding, see Gotcha #17. **11.1% of peak is not good** (Phase 2
+decode was 5.9%, so this roughly doubles it) and the two identified, un-done
+optimizations are split-K/flash-decoding and collapsing the 7 query heads that
+share a KV head into one block. First kernel that cannot be bit-identical —
+correctness argued against an fp64 CPU ground truth (Gotchas #15, #16); our error
+is 0.48–1.00× the reference's on every shape.
+
 ---
 
 ## Next actions
 
-### ▶ IMMEDIATE: Phase 3, kernel 4 — decode fused attention (the hard one)
+### ▶ IMMEDIATE: Phase 3 wrap-up — wire the kernels in and measure end to end
 
-Single query token against the whole cached KV, **online softmax** so the full
-attention matrix is never materialized. Flash-decoding in miniature — write it
-from scratch, do not copy FlashAttention. This is the kernel that targets the
-**5.9%-of-peak decode** number directly, and it is the one that will actually
-move end-to-end tokens/sec: kernels 1–3 all operate on tensors that are tiny at
-decode time, while this one streams the entire KV cache.
+All four kernels are written, correct, and individually benchmarked. **None of
+that is the phase's acceptance criterion**, which is end-to-end tokens/sec vs
+Phase 2. Expect the end-to-end number to be much smaller than the kernel
+speedups, and be ready to say so honestly:
 
-**This kernel differs from 1–3 in kind, not just difficulty.** Those were
-fusions — the win was byte-counted in advance and the reference was a few
-elementwise ops. This one changes the *algorithm*: PyTorch materializes a
-`[heads, 1, seq]` score matrix, softmaxes it, then multiplies by V. Online
-softmax never materializes it, keeping a running max and running sum and
-rescaling the accumulator as it goes. So:
+- kernels 1–3 are **launch-bound at decode sizes** (RoPE's q at batch 32 is
+  57 KB), so their microbenchmark ratios will not transfer;
+- kernel 4 is the only one touching a big tensor, and it is at 11.1% of peak.
 
-1. **Ask Nathan to predict** the byte count again — but note it is harder here,
-   because the score matrix is small at decode (one float per position per head)
-   while the KV cache is large. Work out which term dominates. Also ask for the
-   arithmetic intensity: this is the one kernel in the set with a real matmul in
-   it, so it is the first where compute-bound is even a candidate answer.
-2. **Get the online-softmax recurrence right on paper before writing CUDA.**
-   Running max `m`, running sum `l`, rescale the accumulator by
-   `exp(m_old - m_new)` at each block. Prototype the recurrence in Python against
-   a plain softmax first — debugging it inside a kernel costs far more.
-3. **Read the paged block table in place.** Paging currently pays a gather copy
-   to build a contiguous KV view; this kernel should index blocks directly and
-   remove it. That is a second, independent win — measure it separately from the
-   softmax fusion rather than blurring both into one number.
-4. Numerics: softmax needs the max subtraction for stability and the reference
-   accumulates in fp32. Mirror the reference's cast points as with kernels 1–3,
-   but **expect this to be the first kernel that is NOT 0 ULP** — the reduction
-   order genuinely differs, exactly as it did for RMSNorm. Measure the ULP
-   spread and report it; do not assume it, and do not loosen the bar (Gotcha #3).
-5. Add `attention_decode.cu`; declare + `def()` in `bindings.cpp`; add to
-   `sources` in `kernels/__init__.py`.
-6. Parity in `tests/test_kernels.py`; microbenchmark `bench/kernel_attention.py`.
-7. Commit, update this file + PROGRESS.md + SUMMARY.md.
+Steps:
 
-### Then: Phase 3 wrap-up
+1. Add a `use_kernels: bool` flag (config or an argument threaded through
+   `forward_cached` / `forward_paged`). **Keep the PyTorch paths intact** — they
+   are the comparison and the correctness reference, and `model.py`'s layering
+   rule says never optimize the Phase 1 functions in place.
+2. Swap in, one at a time, measuring after each: `rms_norm` → `kernels.rmsnorm`,
+   the `silu(gate)*up` in `mlp` → `kernels.swiglu`, `apply_rope` /
+   `apply_rope_positions` → `kernels.rope`, and the decode branch of
+   `attention_paged` → `kernels.decode_attention_forward`.
+   Swapping all four at once makes a regression impossible to attribute.
+3. **Kernel 4 only applies when `n == 1`** (decode). Prefill still needs the
+   masked multi-query path; do not route prefill through it.
+4. Re-run `tests/test_cache.py` and `tests/test_continuous.py`. Output must not
+   change beyond the documented near-tie (Gotcha #2). Kernel 4 is not
+   bit-identical, so expect the near-tie count to move — **report the new number,
+   do not adjust the bar** (Gotcha #16 replaced the bar for a reason).
+5. New `bench/phase3_end_to_end.py`: Phase 2 vs Phase 3 tokens/sec at batch
+   1/4/16/32, same methodology as `bench/phase2_cache.py`.
+6. Commit, update this file + PROGRESS.md + SUMMARY.md.
 
-- Wire kernels into `model.py` behind a flag (keep PyTorch paths for comparison).
-- **End-to-end tokens/sec vs Phase 2** — the acceptance criterion. Individual
-  kernel speedups do not automatically move the end-to-end number; measure it.
-- Re-run `tests/test_cache.py` and `test_continuous.py` to confirm kernels did not
-  change output beyond the documented near-tie.
+### Then: optional — close the gap on kernel 4
+
+Only if time allows before Phase 4. 11.1% of peak is the weakest number in the
+phase and the diagnosis (Gotcha #17) points at two specific fixes: **split-K**
+(partition L across blocks, each producing a partial `(m, l, acc)`, then combine
+— this is what real flash-decoding does for long context with few sequences) and
+**one block per KV head** instead of per query head, so the 7 heads sharing a KV
+head read it once between them.
 
 ### Phase 4 — Quantization
 

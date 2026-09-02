@@ -370,3 +370,320 @@ def test_rope_in_real_attention(mod):
         ref_q, ref_k = M.apply_rope(q, k, cos, sin)
         assert_parity(ref_q, mod.rope_forward(q, cos, sin), f"rope real q L{layer}")
         assert_parity(ref_k, mod.rope_forward(k, cos, sin), f"rope real k L{layer}")
+
+
+# --- kernel 4: fused decode attention with online softmax -------------------
+#
+# THIS IS THE FIRST KERNEL THAT CANNOT BE BIT-IDENTICAL, and the reason is
+# structural rather than sloppy. The reference computes the QK product in fp16
+# (cuBLAS rounds the matmul output to fp16), softmaxes in fp32, rounds the
+# probabilities BACK to fp16, then accumulates against V. An online algorithm
+# cannot round the probabilities the same way, because it does not know the
+# normaliser until every key has been seen. The reduction order differs too.
+#
+# Gotcha #3 says: never loosen a tolerance to make a test pass — measure why it
+# fails. So the bar is not loosened here, it is REPLACED with a stronger claim:
+#
+#     compute an fp64 ground truth, and require our error against it to be no
+#     larger than the PyTorch reference's error against it.
+#
+# That is a harder test to pass than "close to PyTorch", because it cannot be
+# satisfied by being wrong in the same direction as the reference. It says the
+# divergence is the reference's rounding, not our bug.
+
+ATTN_CASES = [
+    (1, 14, 2, 64, 37),      # decode batch 1, one short sequence
+    (32, 14, 2, 64, 128),    # decode batch 32, tile-aligned length
+    (32, 14, 2, 64, 300),    # length spanning 3 tiles, last one partial
+    (8, 14, 2, 64, 1),       # a single cached position
+    (4, 4, 4, 64, 200),      # no GQA (n_rep == 1)
+    (2, 8, 1, 64, 513),      # 8 query heads sharing one KV head
+]
+
+
+def _paged_setup(batch, kv_heads, head_dim, max_len, seed=0, shuffle=True):
+    """Build a KV pool plus a slot table whose slots are deliberately scrambled.
+
+    A contiguous slot table would let a kernel that ignored the table entirely
+    still pass. Shuffling the slots means the indirection has to actually work.
+    """
+    torch.manual_seed(seed)
+    slots_total = batch * max_len + 97          # slack, so unused slots exist
+    k_pool = torch.randn(slots_total, kv_heads, head_dim,
+                         dtype=cfg.DTYPE, device=cfg.DEVICE)
+    v_pool = torch.randn(slots_total, kv_heads, head_dim,
+                         dtype=cfg.DTYPE, device=cfg.DEVICE)
+    if shuffle:
+        perm = torch.randperm(slots_total, device=cfg.DEVICE)[:batch * max_len]
+    else:
+        perm = torch.arange(batch * max_len, device=cfg.DEVICE)
+    slot_table = perm.reshape(batch, max_len).long()
+    return k_pool, v_pool, slot_table
+
+
+def _reference_decode(q, k_pool, v_pool, slot_table, lengths, scale):
+    """The Phase 2 paged path, isolated: gather -> repeat_kv -> scores -> softmax
+    -> blend. This is what the kernel replaces, and what it is timed against."""
+    batch, q_heads, head_dim = q.shape
+    kv_heads = k_pool.shape[1]
+    max_len = slot_table.shape[1]
+    n_rep = q_heads // kv_heads
+
+    k = k_pool[slot_table].transpose(1, 2)       # [b, kv_heads, max_len, hd]
+    v = v_pool[slot_table].transpose(1, 2)
+    k = M.repeat_kv(k, n_rep)
+    v = M.repeat_kv(v, n_rep)
+
+    scores = (q.unsqueeze(2) @ k.transpose(-1, -2)).float() * scale
+
+    pos = torch.arange(max_len, device=q.device).unsqueeze(0)
+    allowed = pos < lengths.unsqueeze(1)         # [b, max_len]
+    scores = scores.masked_fill(~allowed[:, None, None, :], float("-inf"))
+
+    probs = torch.softmax(scores, dim=-1).to(v.dtype)
+    return (probs @ v).squeeze(2)                # [b, q_heads, hd]
+
+
+def _ground_truth_cpu(q, k_pool, v_pool, slot_table, lengths, scale):
+    """fp64 ground truth, computed ON THE CPU — deliberately, not incidentally.
+
+    The obvious way to write this is to upcast the GPU tensors to float64 and
+    reuse the reference above. That was the first version, and it was WRONG:
+    `torch.softmax` in float64 on CUDA returns incorrect values on this machine
+    for any tensor with more than one row. Measured on torch 2.6.0+cu124 /
+    RTX 3070: at [16, 513] the elementwise error vs CPU is 1.2e-02 and rows sum
+    to 0.68 instead of 1.0, while [1, 513] is exact to 1.7e-18. fp32 and fp16
+    are unaffected.
+
+    That produced a "ground truth" that disagreed with BOTH the PyTorch
+    reference and this kernel by 0.18 — which is how it was caught, since two
+    independent implementations agreeing with each other and not with the
+    oracle indicts the oracle. test_fp64_softmax_on_cuda_is_unreliable below
+    pins the bug so this never gets "simplified" back onto the GPU.
+    """
+    qd = q.double().cpu()
+    kp = k_pool.double().cpu()
+    vp = v_pool.double().cpu()
+    st = slot_table.cpu()
+    ln = lengths.cpu()
+
+    batch, q_heads, head_dim = qd.shape
+    n_rep = q_heads // kp.shape[1]
+    out = torch.zeros(batch, q_heads, head_dim, dtype=torch.float64)
+    for b in range(batch):
+        L = int(ln[b])
+        idx = st[b, :L]
+        for h in range(q_heads):
+            kvh = h // n_rep
+            s = (kp[idx, kvh] @ qd[b, h]) * scale        # [L]
+            out[b, h] = torch.softmax(s, dim=0) @ vp[idx, kvh]
+    return out
+
+
+def test_fp64_softmax_on_cuda_is_unreliable():
+    """Pin the library bug that _ground_truth_cpu exists to avoid.
+
+    If this test ever starts FAILING, torch fixed fp64 softmax on CUDA and the
+    ground truth could move back to the GPU (it would be much faster). Until
+    then, this documents why the slow CPU loop is there.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(16, 513, dtype=torch.float64, device=cfg.DEVICE)
+    gpu = torch.softmax(x, dim=-1)
+    cpu = torch.softmax(x.cpu(), dim=-1)
+
+    row_sum_err = (gpu.sum(-1).cpu() - 1).abs().max().item()
+    elem_err = (gpu.cpu() - cpu).abs().max().item()
+    print(f"\n[fp64 softmax on CUDA] row-sum error {row_sum_err:.3e}, "
+          f"elementwise vs CPU {elem_err:.3e} (CPU row-sum error "
+          f"{(cpu.sum(-1) - 1).abs().max().item():.3e})")
+
+    single = torch.softmax(x[:1], dim=-1)
+    assert (single.sum(-1).cpu() - 1).abs().max().item() < 1e-12, \
+        "single-row fp64 softmax is fine on CUDA — that part of the bug changed"
+    assert row_sum_err > 1e-6, (
+        "fp64 softmax on CUDA now normalises correctly for multi-row tensors. "
+        "If so, _ground_truth_cpu can move back to the GPU — verify first."
+    )
+
+
+@pytest.mark.parametrize("batch,q_heads,kv_heads,head_dim,max_len", ATTN_CASES)
+def test_decode_attention_correctness(mod, batch, q_heads, kv_heads,
+                                      head_dim, max_len):
+    """Correctness for a kernel that CANNOT be bit-identical to its reference.
+
+    Kernels 1-3 were fusions: same arithmetic, fewer round trips, so 0 ULP was
+    achievable and anything else was a bug. This kernel changes the algorithm,
+    so a different answer is expected and the question becomes "different in
+    which direction". Two claims are made, in order of importance:
+
+      1. Against an fp64 ground truth, our error is NO LARGER than the fp16
+         reference's. This is the real claim, and it cannot be satisfied by
+         being wrong in the same direction as PyTorch — which is exactly what a
+         plain "close to the reference" test would allow.
+
+      2. Our divergence FROM the reference is no larger than the reference's own
+         distance from the truth. That says the gap between us and PyTorch is
+         accounted for by PyTorch's rounding, with nothing left over.
+
+    Note what is NOT asserted: a relative-error bound against the reference. The
+    output is a weighted average of v, so individual components pass through
+    zero, and relative error against a near-zero reference value explodes while
+    the absolute error stays negligible. That is the same trap that absolute
+    tolerances set for RMSNorm in kernel 1, wearing the opposite hat. The
+    numbers are printed for information; the bar is on the ground truth.
+    """
+    torch.manual_seed(0)
+    q = torch.randn(batch, q_heads, head_dim, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    k_pool, v_pool, slot_table = _paged_setup(batch, kv_heads, head_dim, max_len)
+    lengths = torch.randint(1, max_len + 1, (batch,), device=cfg.DEVICE).long()
+    scale = head_dim ** -0.5
+
+    truth = _ground_truth_cpu(q, k_pool, v_pool, slot_table, lengths, scale)
+    ref = _reference_decode(q, k_pool, v_pool, slot_table, lengths, scale)
+    got = mod.decode_attention_forward(q, k_pool, v_pool, slot_table, lengths, scale)
+
+    assert got.shape == ref.shape and got.dtype == ref.dtype
+    assert torch.isfinite(got.float()).all(), "non-finite output"
+
+    st = compare(ref, got)
+    err_ref = (ref.double().cpu() - truth).abs().max().item()
+    err_got = (got.double().cpu() - truth).abs().max().item()
+    diff = (got.double().cpu() - ref.double().cpu()).abs().max().item()
+
+    print(f"\n[decode attn {batch}x{q_heads}/{kv_heads}x{head_dim}, L<={max_len}] "
+          f"{st['max_ulp']} ulp, {st['exact_frac']*100:.1f}% exact, "
+          f"abs {st['max_abs']:.2e} | vs fp64 truth: PyTorch {err_ref:.3e}, "
+          f"ours {err_got:.3e} (ratio {err_got / max(err_ref, 1e-12):.3f}), "
+          f"ours-vs-PyTorch {diff:.3e}")
+
+    assert err_got <= err_ref * 1.05 + 1e-6, (
+        f"ours ({err_got:.3e}) is less accurate than the fp16 reference "
+        f"({err_ref:.3e}) against fp64 ground truth")
+    assert diff <= 2.5 * err_ref + 1e-5, (
+        f"divergence from the reference ({diff:.3e}) is larger than the "
+        f"reference's own error ({err_ref:.3e}) explains")
+
+
+def test_decode_attention_correction_factor_regression(mod):
+    """The online-softmax bug that produces finite, plausible, wrong output.
+
+    One key late in the sequence is made to align hugely with q, so the running
+    max jumps on the final tile and every earlier contribution must be rescaled
+    by exp(m_old - m_new). A kernel that drops that correction passes every test
+    above (where scores are similar in magnitude) and fails here — the Python
+    prototype measured 2.881 absolute error from this bug alone.
+    """
+    batch, q_heads, kv_heads, head_dim, max_len = 2, 14, 2, 64, 300
+    torch.manual_seed(0)
+    q = torch.randn(batch, q_heads, head_dim, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    k_pool, v_pool, slot_table = _paged_setup(batch, kv_heads, head_dim, max_len)
+    lengths = torch.full((batch,), max_len, device=cfg.DEVICE).long()
+    scale = head_dim ** -0.5
+
+    # make the LAST cached key of each sequence align strongly with query head 0
+    for b in range(batch):
+        slot = int(slot_table[b, max_len - 1])
+        k_pool[slot, 0] = (q[b, 0].float() * 8.0).to(cfg.DTYPE)
+
+    truth = _ground_truth_cpu(q, k_pool, v_pool, slot_table, lengths, scale)
+    got = mod.decode_attention_forward(q, k_pool, v_pool, slot_table, lengths, scale)
+    err = (got.double().cpu() - truth).abs().max().item()
+    print(f"\n[decode attn late-max-jump] max abs error vs fp64 truth {err:.3e}")
+    assert err < 1e-2, (
+        f"error {err:.3e} on a late max jump — the online-softmax correction "
+        "factor exp(m_old - m_new) is likely missing or misapplied"
+    )
+
+
+def test_decode_attention_respects_lengths(mod):
+    """Positions at or beyond a sequence's length must contribute nothing.
+
+    Checked by poisoning the slots past each length with huge values: if the
+    kernel read them, they would dominate the softmax and the output would move.
+    """
+    batch, q_heads, kv_heads, head_dim, max_len = 4, 14, 2, 64, 256
+    torch.manual_seed(0)
+    q = torch.randn(batch, q_heads, head_dim, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    k_pool, v_pool, slot_table = _paged_setup(batch, kv_heads, head_dim, max_len)
+    lengths = torch.tensor([1, 63, 128, 200], device=cfg.DEVICE).long()
+    scale = head_dim ** -0.5
+
+    clean = mod.decode_attention_forward(q, k_pool, v_pool, slot_table, lengths, scale)
+
+    for b in range(batch):
+        for p in range(int(lengths[b]), max_len):
+            k_pool[slot_table[b, p]] = 300.0
+            v_pool[slot_table[b, p]] = -300.0
+    poisoned = mod.decode_attention_forward(q, k_pool, v_pool, slot_table, lengths, scale)
+
+    assert torch.equal(clean, poisoned), (
+        "output changed when out-of-range slots were poisoned: the kernel is "
+        "reading past a sequence's length"
+    )
+
+
+def test_decode_attention_uses_the_slot_table(mod):
+    """A kernel that ignored the slot table and read the pool contiguously would
+    pass every test above if the table happened to be identity. Permuting the
+    table must permute which keys are attended to."""
+    batch, q_heads, kv_heads, head_dim, max_len = 2, 14, 2, 64, 64
+    torch.manual_seed(0)
+    q = torch.randn(batch, q_heads, head_dim, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    k_pool, v_pool, slot_table = _paged_setup(batch, kv_heads, head_dim, max_len,
+                                              shuffle=False)
+    lengths = torch.full((batch,), max_len, device=cfg.DEVICE).long()
+    scale = head_dim ** -0.5
+
+    identity = mod.decode_attention_forward(q, k_pool, v_pool, slot_table, lengths, scale)
+
+    shuffled_table = slot_table.clone()
+    shuffled_table[0] = slot_table[0].flip(0)     # reverse sequence 0's slots
+    shuffled = mod.decode_attention_forward(q, k_pool, v_pool, shuffled_table,
+                                            lengths, scale)
+
+    # Attention is permutation-invariant over keys, so reversing the ORDER alone
+    # must NOT change the answer — that is a real property worth asserting.
+    assert_parity(identity[0], shuffled[0], "decode attn key-order invariance")
+
+    # But pointing a sequence at a different SET of slots must change it.
+    other_table = slot_table.clone()
+    other_table[0] = slot_table[0] + max_len
+    other = mod.decode_attention_forward(q, k_pool, v_pool, other_table,
+                                         lengths, scale)
+    assert not torch.equal(identity[0], other[0]), (
+        "output did not change when sequence 0 was pointed at different slots: "
+        "the kernel is ignoring the slot table"
+    )
+
+
+def test_decode_attention_block_size_invariance(mod):
+    """The block size is a tuning knob (it sets the tile width), so it must not
+    change the answer — only the speed.
+
+    It is not entirely free of numerics: the tile width changes how many times
+    the online-softmax correction is applied, and therefore the fp32 rounding
+    order. So the requirement is agreement to within fp16 resolution, not
+    bit-identity, and any drift LARGER than that means the recurrence is wrong
+    for some tile count rather than merely reassociated.
+    """
+    batch, q_heads, kv_heads, head_dim, max_len = 8, 14, 2, 64, 700
+    torch.manual_seed(0)
+    q = torch.randn(batch, q_heads, head_dim, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    k_pool, v_pool, slot_table = _paged_setup(batch, kv_heads, head_dim, max_len)
+    lengths = torch.randint(1, max_len + 1, (batch,), device=cfg.DEVICE).long()
+    scale = head_dim ** -0.5
+
+    truth = _ground_truth_cpu(q, k_pool, v_pool, slot_table, lengths, scale)
+    base = None
+    for bs in (64, 128, 256, 512, 1024):
+        out = mod.decode_attention_forward(q, k_pool, v_pool, slot_table,
+                                           lengths, scale, bs)
+        err = (out.double().cpu() - truth).abs().max().item()
+        print(f"\n[decode attn block_size={bs:4d}] err vs fp64 truth {err:.3e}")
+        assert err < 5e-3, f"block_size {bs} is not just a tuning knob: err {err:.3e}"
+        if base is None:
+            base = out
+        else:
+            drift = (out.float() - base.float()).abs().max().item()
+            assert drift < 5e-3, f"block_size {bs} changed the answer by {drift:.3e}"

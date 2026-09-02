@@ -129,6 +129,7 @@ def load(verbose: bool = False):
             str(_KERNEL_DIR / "rmsnorm.cu"),
             str(_KERNEL_DIR / "swiglu.cu"),
             str(_KERNEL_DIR / "rope.cu"),
+            str(_KERNEL_DIR / "attention_decode.cu"),
         ],
         extra_cflags=_CXX_FLAGS,
         extra_cuda_cflags=_NVCC_FLAGS,
