@@ -1,5 +1,10 @@
 # nano-infer — build spec
 
+> **Picking this project up?** Read **[ROADMAP.md](ROADMAP.md)** first — it holds
+> the current state, how to run everything, the gotchas that will bite you, and
+> the next concrete action. Keep it updated as you work. This file (the spec)
+> does not change; the roadmap does.
+
 ## What this is
 
 A single-GPU LLM inference engine written from scratch, with custom CUDA kernels and

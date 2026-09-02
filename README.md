@@ -10,8 +10,9 @@ a distributed KV-cache-aware inference router. MiniDynamo decides *which worker*
 runs a request; nano-infer is what that worker actually does on the GPU.
 
 > **Status:** Phases 0–2 complete (KV cache, paged cache, continuous batching)
-> **Full project write-up: [SUMMARY.md](SUMMARY.md)** — what was
-> built, what was measured, and what went wrong. Running log: [PROGRESS.md](PROGRESS.md).
+> **Full project write-up: [SUMMARY.md](SUMMARY.md)** — what was built, what was
+> measured, and what went wrong. Current state and next steps:
+> **[ROADMAP.md](ROADMAP.md)**. Dated log: [PROGRESS.md](PROGRESS.md).
 
 ## Hardware
 
