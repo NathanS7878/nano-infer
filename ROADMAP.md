@@ -42,19 +42,19 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-01, after Phase 3 kernel 2._
+_Last updated: 2026-09-01, after Phase 3 kernel 3._
 
 | Phase | Status | Headline |
 |---|---|---|
 | 0 — Ground truth | ✅ Complete | Harness (<3% variance), HF baseline, reference fixture |
 | 1 — Correct but slow | ✅ Complete | From-scratch forward pass, token-for-token vs HF |
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
-| 3 — Custom CUDA kernels | ◐ **2 of 4 kernels** | RMSNorm 7.66× @ 75.5% of peak; SwiGLU 1.65× @ **89.5% of peak** (predicted 1.67×) |
+| 3 — Custom CUDA kernels | ◐ **3 of 4 kernels** | RMSNorm 7.66× @ 75.5%; SwiGLU 1.65× @ 89.5% (predicted 1.67×); RoPE **5.03×** @ **87.6%** (predicted 5.00×) |
 | 4 — Quantization | ⬜ Not started | INT8 → INT4 group-wise + fused dequant-matmul |
 | 5 — Make it legible | ⬜ Not started | README table, diagram, WRITEUP.md, limitations |
 
-- **Tests:** 41 passing (`python -m pytest tests/ -q`)
-- **Commits:** 16 on `main`, clean tree
+- **Tests:** 59 passing (`python -m pytest tests/ -q`)
+- **Commits:** 17 on `main`, clean tree
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -88,6 +88,7 @@ $env:PYTHONPATH="C:\Users\Nathan stevens\OneDrive\Projects\nano-infer"
 | `-m bench.phase2_continuous` | Static vs continuous batching on a request stream |
 | `-m bench.kernel_rmsnorm` | Fused RMSNorm vs PyTorch + bandwidth utilization |
 | `-m bench.kernel_swiglu` | Fused SwiGLU vs PyTorch + bandwidth utilization |
+| `-m bench.kernel_rope` | Fused RoPE vs PyTorch + bandwidth utilization |
 
 Toolchain is installed and working: nvcc 12.4 (conda-forge), MSVC 14.44, ninja.
 Full build notes in `HARDWARE.md`. Kernels JIT-compile on first use (~40 s), then cache.
@@ -109,6 +110,7 @@ nano_infer/
                  there are two — add new kernels here)
     rmsnorm.cu   kernel 1: fused RMSNorm (scalar + float4 vectorized paths)
     swiglu.cu    kernel 2: fused SwiGLU (scalar + float4, grid-stride)
+    rope.cu      kernel 3: fused RoPE (both shared- and per-sequence positions)
 bench/           harness.py + one benchmark per phase/kernel
 tests/           parity + component + cache + paged + continuous + kernel tests
 results/         committed JSON + markdown benchmark outputs
@@ -186,6 +188,28 @@ These were all expensive to discover. Read before debugging anything.
     translation unit may define it. Adding a kernel = new `.cu` + a declaration
     and a `def()` line in `bindings.cpp` + an entry in `sources` in
     `kernels/__init__.py`.
+
+12. **RoPE pairs dim `i` with `i + head_dim/2`, NOT adjacent dims.** The
+    adjacent-pair convention (from the original RoPE paper's diagram) produces a
+    finite, plausible tensor and a model that emits fluent text while being
+    quietly wrong about position. Nothing raises. `build_rope_cache` duplicates
+    frequencies as `cat(freqs, freqs)` precisely because of this. Asserted
+    directly in `test_rope_pairing_is_halves_not_adjacent` (cos=0, sin=1 collapses
+    the transform to exactly `rotate_half`). **Anything touching RoPE — kernel 4
+    included — must keep that test green.**
+
+13. **RoPE has TWO position paths and a kernel can pass one while failing the
+    other.** `apply_rope` takes `cos/sin` as `[n, head_dim]` (one shared range);
+    `apply_rope_positions` takes `[batch, n, head_dim]` (per-sequence, which
+    continuous batching requires). A kernel indexing by flat row rather than by
+    `(batch, position)` passes the first and fails the second. Both are tested.
+
+14. **A measurement that beats its predicted ceiling means the model is wrong,
+    not that the kernel is heroic.** RoPE hit 5.40× against a 5.00× byte-counted
+    ceiling. Decomposing: 5.00× traffic reduction × 1.08× because at 117 MB
+    tensors PyTorch's chain falls to 81.1% of peak while ours holds 87.6%. Byte
+    counting predicts the *floor* of a fusion win, not a bound on it. Always
+    score both sides against their own actual traffic before believing a ratio.
 
 ---
 
@@ -279,44 +303,69 @@ Parity **0 ULP, 100% exact** on every shape (elementwise ⇒ no reduction ⇒ no
 reordering), including `gate = ±60000` saturation and real layer-0/12/23 MLP
 activations. Two findings recorded as Gotchas #9 and #10.
 
+**Kernel 3 — fused RoPE ✅.** One thread owns a rotation *pair* `(j, j+half)`, so
+each element is read once and the rotation costs an index offset rather than a
+tensor. Handles both position paths. **Predicted ceiling 5.00×** (PyTorch 20 B/elem
+across five kernels vs 4 B/elem compulsory); **measured 5.03×** at the first
+bandwidth-bound size.
+
+| Shape | Elements | PyTorch | Ours | Speedup | GB/s | % peak |
+|---|---|---|---|---|---|---|
+| 32×14×1×64 (decode b32) | 28,672 | 285.7 µs | 59.7 µs | 4.78× | 1.9 | 0.4% |
+| 32×14×34×64 (prefill b32) | 974,848 | 148.3 µs | 30.1 µs | 4.94× | 130 | 29.0% |
+| 32×14×512×64 | 14.7 M | 835.8 µs | 166.1 µs | 5.03× | 354 | 78.9% |
+| 32×14×2048×64 | 58.7 M | 3231.5 µs | 598.3 µs | **5.40×** | **393** | **87.6%** |
+
+**6E of PyTorch's 20E is `rotate_half`, which computes nothing** — the win is
+mostly deleted plumbing, not deleted math. **At the sizes the engine actually
+runs this is launch-bound, not bandwidth-bound**: decode b32 q is 57 KB, and the
+4.78× there is five launches becoming one (0.4% of peak says so). The 5.40×
+overshoot is explained in Gotcha #14. Parity 0 ULP on all 7 shapes, both position
+paths, non-contiguous input, and real q/k from layers 0/12/23; pairing asserted
+directly (Gotcha #12) plus a reference-independent norm-preservation test.
+
 ---
 
 ## Next actions
 
-### ▶ IMMEDIATE: Phase 3, kernel 3 — fused RoPE
-
-Applied to the QKV projection output. Teaches indexing and layout — there is no
-reduction and no fusion-of-round-trips story here, so the interesting part is
-getting the memory access pattern right on a 4-D `[batch, heads, seq, head_dim]`
-view.
-
-1. **Ask Nathan to predict** memory- vs compute-bound, and the byte-counted
-   ceiling, *before* writing it — that worked well on kernel 2. Setup: reads q
-   (or k), reads `cos`/`sin`, writes the rotated result. PyTorch runs this as
-   several elementwise kernels plus a `torch.cat` for `rotate_half`, and that
-   `cat` materializes a full extra tensor — count what it costs.
-2. Must match `rotate_half`'s pairing: dim `i` with `i + head_dim/2` (**not**
-   adjacent pairs — this is the single most common way to get RoPE wrong).
-3. Must support the **per-sequence position path** added in Phase 2 step 3
-   (`apply_rope_positions`), not just a contiguous 0..seq range. Continuous
-   batching depends on it.
-4. Add `rope.cu`; declare + `def()` in `kernels/bindings.cpp`; add to `sources`
-   in `kernels/__init__.py`.
-5. Parity test in `tests/test_kernels.py` with the existing `assert_parity`.
-   Expect 0 ULP as with SwiGLU *if* the cast order is mirrored exactly —
-   `cos`/`sin` are fp32 in the reference, so check where the cast back to fp16
-   happens.
-6. Microbenchmark `bench/kernel_rope.py` mirroring `kernel_swiglu.py`, reporting
-   GB/s and % of 448 peak, plus the predicted-vs-measured ceiling.
-7. Commit, update this file + PROGRESS.md + SUMMARY.md.
-
-### Then: kernel 4 — decode fused attention (the hard one)
+### ▶ IMMEDIATE: Phase 3, kernel 4 — decode fused attention (the hard one)
 
 Single query token against the whole cached KV, **online softmax** so the full
 attention matrix is never materialized. Flash-decoding in miniature — write it
 from scratch, do not copy FlashAttention. This is the kernel that targets the
-5.9%-of-peak decode number directly, and it should read the **paged** block table
-in place (removing the gather copy that paging currently pays).
+**5.9%-of-peak decode** number directly, and it is the one that will actually
+move end-to-end tokens/sec: kernels 1–3 all operate on tensors that are tiny at
+decode time, while this one streams the entire KV cache.
+
+**This kernel differs from 1–3 in kind, not just difficulty.** Those were
+fusions — the win was byte-counted in advance and the reference was a few
+elementwise ops. This one changes the *algorithm*: PyTorch materializes a
+`[heads, 1, seq]` score matrix, softmaxes it, then multiplies by V. Online
+softmax never materializes it, keeping a running max and running sum and
+rescaling the accumulator as it goes. So:
+
+1. **Ask Nathan to predict** the byte count again — but note it is harder here,
+   because the score matrix is small at decode (one float per position per head)
+   while the KV cache is large. Work out which term dominates. Also ask for the
+   arithmetic intensity: this is the one kernel in the set with a real matmul in
+   it, so it is the first where compute-bound is even a candidate answer.
+2. **Get the online-softmax recurrence right on paper before writing CUDA.**
+   Running max `m`, running sum `l`, rescale the accumulator by
+   `exp(m_old - m_new)` at each block. Prototype the recurrence in Python against
+   a plain softmax first — debugging it inside a kernel costs far more.
+3. **Read the paged block table in place.** Paging currently pays a gather copy
+   to build a contiguous KV view; this kernel should index blocks directly and
+   remove it. That is a second, independent win — measure it separately from the
+   softmax fusion rather than blurring both into one number.
+4. Numerics: softmax needs the max subtraction for stability and the reference
+   accumulates in fp32. Mirror the reference's cast points as with kernels 1–3,
+   but **expect this to be the first kernel that is NOT 0 ULP** — the reduction
+   order genuinely differs, exactly as it did for RMSNorm. Measure the ULP
+   spread and report it; do not assume it, and do not loosen the bar (Gotcha #3).
+5. Add `attention_decode.cu`; declare + `def()` in `bindings.cpp`; add to
+   `sources` in `kernels/__init__.py`.
+6. Parity in `tests/test_kernels.py`; microbenchmark `bench/kernel_attention.py`.
+7. Commit, update this file + PROGRESS.md + SUMMARY.md.
 
 ### Then: Phase 3 wrap-up
 

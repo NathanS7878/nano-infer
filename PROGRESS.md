@@ -410,7 +410,75 @@ the GPU. Our flat ~58 us at both 1x4864 and 32x4864 is Python + pybind +
 `kernels/bindings.cpp`. One `.cu` file could own the module; two cannot. Kernels
 3 and 4 now add a declaration and a `def()` line there.
 
+### Kernel 3 — fused RoPE (2026-09-01)
+
+`x_rot = x * cos + rotate_half(x) * sin`, where `rotate_half([x1,x2]) = [-x2,x1]`
+pairs dim i with i + head_dim/2.
+
+**Byte count first, again.** PyTorch runs five kernels; per element of x (E
+elements at 2 bytes, cos/sin small enough to stay in L2): `-x2` = 2E, the `cat`
+= 4E, `x*cos` = 4E, `rotated*sin` = 4E, the add = 6E. **Total 20E.** Ours reads x
+once and writes once: **4E**. Predicted ceiling **5.00x**.
+
+Three times SwiGLU's ceiling, and the reason is the lesson: **6E of PyTorch's 20E
+go to `rotate_half`, an op that computes nothing.** It is pure plumbing — it
+exists only to get the operand into a layout the next elementwise kernel can
+consume, and a fused kernel does that with an index offset. The most profitable
+thing to fuse is usually not the expensive math, it is the data movement wrapped
+around it.
+
+**Measured** (`bench/kernel_rope.py`, fp16, peak 448 GB/s):
+
+| Shape | Elements | PyTorch | Ours | Speedup | GB/s | % of peak |
+|---|---|---|---|---|---|---|
+| 32x14x1x64 (decode b32, q) | 28,672 | 285.7 us | 59.7 us | 4.78x | 1.9 | 0.4% |
+| 32x14x34x64 (prefill b32) | 974,848 | 148.3 us | 30.1 us | 4.94x | 130 | 29.0% |
+| 32x14x512x64 | 14,680,064 | 835.8 us | 166.1 us | 5.03x | 354 | 78.9% |
+| 32x14x2048x64 | 58,720,256 | 3231.5 us | 598.3 us | **5.40x** | **393** | **87.6%** |
+
+**5.03x at the first genuinely bandwidth-bound size vs a 5.00x prediction.**
+
+**The 5.40x beat the ceiling, so it got checked instead of celebrated.** Scoring
+each side against the traffic it actually moves:
+
+| Shape | ours % peak | PyTorch % peak | efficiency ratio | speedup |
+|---|---|---|---|---|
+| 32x14x34x64 | 29.0% | 29.3% | 0.99 | 4.94x |
+| 32x14x512x64 | 78.9% | 78.4% | 1.01 | 5.03x |
+| 32x14x2048x64 | 87.6% | 81.1% | **1.08** | 5.40x |
+
+At every size but the largest both implementations are equally efficient per byte
+and the speedup is the traffic ratio exactly. At 117 MB tensors PyTorch's chain
+falls to 81.1% of peak while ours holds 87.6%: **5.00 x 1.08 = 5.40**. That is
+not our kernel beating physics, it is PyTorch's chain doing worse than its own
+earlier self — plausibly broadcast index arithmetic plus allocator pressure from
+five 117 MB temporaries (effect measured, cause not proven). **Byte counting
+predicts the floor of a fusion win, not a bound on it.**
+
+**At the sizes the engine actually runs, the win is not bandwidth.** q is
+[b,14,n,64] and at decode n=1, so batch 32 is 28,672 elements = **57 KB**, far too
+little to fill 46 SMs. The 4.78x there is five launches becoming one, and the
+0.4%-of-peak column says so. Both regimes are in the table deliberately.
+
+**Correctness: the failure mode that does not announce itself.** RoPE can be
+wrong in a way that still runs. HF/Llama pairs dim i with i+head_dim/2; the
+original paper's diagram pairs adjacent dims. Both give finite, plausible
+tensors, and a model built on the wrong one emits fluent text while being quietly
+wrong about position. Nothing raises. So the pairing is asserted directly: with
+cos=0, sin=1 the transform collapses to exactly `rotate_half`, which separates
+the conventions unambiguously, and the test also asserts the adjacent-pair answer
+is NOT produced. A second, reference-independent property test checks that RoPE
+preserves each head vector's norm (it is a rotation) — that would catch a kernel
+matching PyTorch because both were wrong. Max relative norm drift 1.87e-04.
+
+**Parity: 0 ULP, 100.000% exact** on all 7 shapes across BOTH position paths —
+shared positions (Phase 1) and per-sequence positions (Phase 2 step 3). A kernel
+indexing cos/sin by row rather than by (batch, position) passes the first and
+fails the second, so both are tested. Also verified non-contiguous (attention()
+makes q/k by transposing a view, so that is the normal case) and on real q/k from
+layers 0, 12, 23.
+
 - [x] Kernel 2 — fused SwiGLU
-- [ ] Kernel 3 — RoPE
+- [x] Kernel 3 — RoPE
 - [ ] Kernel 4 — decode fused attention (online softmax)
 - [ ] End-to-end tokens/sec improvement over Phase 2

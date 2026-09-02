@@ -710,9 +710,102 @@ tolerance loose enough to be called "close enough."
 the GPU. Our flat ~58 µs at 1×4864 and 32×4864 is Python + pybind + `empty_like`
 cost, not memory bandwidth; the kernel itself is idle-fast at those sizes.
 
+### Kernel 3 — Fused RoPE ✅
+
+Rotary position embedding rotates each query/key vector by its position:
+
+```
+x_rot = x * cos + rotate_half(x) * sin        rotate_half([x1, x2]) = [-x2, x1]
+```
+
+Byte count first, before writing anything. PyTorch runs this as **five** kernels,
+per element of `x` (E elements at 2 bytes; `cos`/`sin` are small and stay in L2):
+
+| step | traffic |
+|---|---|
+| `-x2` — read E/2, write E/2 | 2E |
+| `cat((-x2, x1))` — read E, write E | 4E |
+| `x * cos` — read E, write E | 4E |
+| `rotated * sin` — read E, write E | 4E |
+| `t1 + t2` — read 2E, write E | 6E |
+| **PyTorch total** | **20E** |
+| **Ours** — read x once, write once | **4E** |
+
+**Predicted ceiling: 5.00×.** Three times better than SwiGLU's, and the reason is
+the interesting part: **6E of PyTorch's 20E bytes go to `rotate_half`, which
+computes nothing.** It is pure plumbing — its only job is to present the operand
+in a layout the next elementwise kernel can consume. A fused kernel replaces it
+with an index offset. *The most profitable thing to fuse is usually not the
+expensive math; it is the data movement wrapped around it.*
+
+**Measured** (`bench/kernel_rope.py`, fp16, peak 448 GB/s):
+
+| Shape | Elements | PyTorch | Ours | Speedup | GB/s | % of peak |
+|---|---|---|---|---|---|---|
+| 32×14×1×64 (decode b32, q) | 28,672 | 285.7 µs | 59.7 µs | 4.78× | 1.9 | 0.4% |
+| 32×14×34×64 (prefill b32) | 974,848 | 148.3 µs | 30.1 µs | 4.94× | 130 | 29.0% |
+| 32×14×512×64 | 14,680,064 | 835.8 µs | 166.1 µs | 5.03× | 354 | 78.9% |
+| 32×14×2048×64 | 58,720,256 | 3231.5 µs | 598.3 µs | **5.40×** | **393** | **87.6%** |
+
+**5.03× at the first genuinely bandwidth-bound size, against a 5.00× prediction.**
+
+#### The 5.40× is above the ceiling, and that needed explaining
+
+A measurement that beats its own ceiling means the model is wrong somewhere, so
+it got checked rather than celebrated. Scoring each implementation against the
+traffic it actually moves:
+
+| Shape | ours, % of peak | PyTorch, % of peak | efficiency ratio | speedup |
+|---|---|---|---|---|
+| 32×14×34×64 | 29.0% | 29.3% | 0.99 | 4.94× |
+| 32×14×512×64 | 78.9% | 78.4% | 1.01 | 5.03× |
+| 32×14×2048×64 | 87.6% | 81.1% | **1.08** | 5.40× |
+
+At every size but the largest the two implementations are equally efficient per
+byte, and the speedup is the traffic ratio and nothing else — exactly as
+predicted. At 32×14×2048×64 PyTorch's chain drops to 81.1% of peak while ours
+holds 87.6%, and **5.00 × 1.08 = 5.40**. The excess is not our kernel doing
+better than physics; it is PyTorch's chain doing worse than its own earlier self.
+Most likely cause (measured effect, unproven cause): broadcast index arithmetic
+in the two multiplies, plus allocator pressure from five 117 MB temporaries. The
+honest summary is that the byte-counting model predicts the *floor* of the win,
+not a bound on it.
+
+#### The win at the sizes the engine actually runs is not bandwidth
+
+RoPE operates on `q [b, 14, n, 64]` and `k [b, 2, n, 64]`. At decode `n = 1`, so
+batch 32 is 28,672 elements — **57 KB**, nowhere near enough to fill 46 SMs. The
+4.78× measured there is **five kernel launches becoming one**, not memory
+efficiency, and the 0.4%-of-peak column says so plainly. Both regimes are in the
+table on purpose; reporting only the 87.6% row would be the kind of flattering
+benchmark this project exists to avoid.
+
+#### Correctness: the failure mode that does not announce itself
+
+RoPE can be wrong in a way that still runs. HF/Llama pairs dim `i` with
+`i + head_dim/2`; the original RoPE paper's diagram pairs adjacent dims
+`(0,1), (2,3), …`. Both produce finite, plausible tensors. A model built on the
+wrong one still emits fluent text and is quietly wrong about position — nothing
+raises, no tolerance catches it, and `build_rope_cache` duplicating frequencies
+as `cat(freqs, freqs)` only makes sense under the halves convention.
+
+So the pairing is asserted *directly*: with `cos = 0, sin = 1` the transform
+collapses to exactly `rotate_half`, which distinguishes the two conventions
+unambiguously. The test also asserts the adjacent-pair result is *not* produced.
+A second, reference-independent property test checks that RoPE preserves each
+head vector's norm — it is a rotation — which would catch a kernel that matched
+PyTorch because both were wrong (max relative norm drift 1.87e-04, fp16 rounding).
+
+**Parity: 0 ULP, 100.000% exact** on all 7 shapes, across **both** position
+paths: shared positions (Phase 1) and per-sequence positions (Phase 2 step 3,
+where one sequence sits at position 60 while its neighbour is at 3). A kernel
+that indexed `cos`/`sin` by row instead of by `(batch, position)` passes the
+first and fails the second, so both are tested. Also verified on non-contiguous
+input — `attention()` produces q/k by transposing a view, so that is the normal
+case — and on real q/k from layers 0, 12, 23.
+
 ### Remaining in Phase 3
 
-- Kernel 3 — RoPE, fused into the QKV projection output
 - Kernel 4 — decode fused attention with online softmax (flash-decoding in miniature)
 - End-to-end tokens/sec improvement over Phase 2
 
@@ -769,6 +862,21 @@ cost, not memory bandwidth; the kernel itself is idle-fast at those sizes.
     SwiGLU reaches 89.5% of peak with a barrier-free grid-stride loop; RMSNorm's
     block-wide reduction, with two `__syncthreads()` over a 1792-byte row, stalls
     at 75.5% despite doing less work per byte.
+16. **The most profitable thing to fuse is the plumbing, not the math.** 6 of the
+    20 bytes/element PyTorch spends on RoPE go to `rotate_half`, an op that
+    computes nothing and exists only to rearrange an operand. Replacing it with
+    an index offset is most of the 5× win.
+17. **A result that beats its own predicted ceiling means the model is wrong, not
+    that the kernel is heroic.** RoPE measured 5.40× against a 5.00× prediction;
+    decomposing it showed 5.00× of traffic reduction times a 1.08× efficiency
+    gap: at 117 MB tensors PyTorch's chain drops to 81.1% of peak while ours
+    holds 87.6%. The byte count predicts the floor of a fusion win, not a bound
+    on it.
+18. **Some correctness failures do not announce themselves.** RoPE's two pairing
+    conventions both produce finite, fluent-looking output; only one is right.
+    Assert the convention directly (cos=0, sin=1 collapses the transform to
+    `rotate_half`) and add a reference-independent property test (a rotation
+    preserves vector norm) rather than trusting an end-to-end check to notice.
 
 ---
 
@@ -779,7 +887,7 @@ cost, not memory bandwidth; the kernel itself is idle-fast at those sizes.
 | 0 — Ground truth | ✅ Complete | Hardware spec, benchmark harness, reference fixture, HF baseline |
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
 | 2 — KV cache & batching | ✅ Complete | Contiguous cache + prefill/decode split (15.6× at batch 32), paged cache (3.8× memory), continuous batching (1.55× on a request stream) |
-| 3 — Custom CUDA kernels | ◐ In progress | ✅ Fused RMSNorm (7.7×, 75.5% of peak). ✅ Fused SwiGLU (1.65× vs a 1.67× predicted ceiling, 89.5% of peak). Remaining: RoPE, decode attention with online softmax |
+| 3 — Custom CUDA kernels | ◐ In progress | ✅ Fused RMSNorm (7.7×, 75.5% of peak). ✅ Fused SwiGLU (1.65× vs 1.67× predicted, 89.5% of peak). ✅ Fused RoPE (5.03× vs 5.00× predicted, 87.6% of peak). Remaining: decode attention with online softmax |
 | 4 — Quantization | Planned | INT8 weight-only, then INT4 group-wise (g=128) + fused dequant-matmul. Perplexity cost measured on WikiText-2 |
 | 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |
 
@@ -819,6 +927,7 @@ pip install transformers safetensors tokenizers huggingface_hub datasets acceler
 | `python -m bench.phase2_continuous` | Static vs continuous batching on a request stream |
 | `python -m bench.kernel_rmsnorm` | Fused RMSNorm vs PyTorch, with bandwidth utilization |
 | `python -m bench.kernel_swiglu` | Fused SwiGLU vs PyTorch, with bandwidth utilization |
+| `python -m bench.kernel_rope` | Fused RoPE vs PyTorch, with bandwidth utilization |
 
 ### Repository layout
 

@@ -128,6 +128,7 @@ def load(verbose: bool = False):
             str(_KERNEL_DIR / "bindings.cpp"),
             str(_KERNEL_DIR / "rmsnorm.cu"),
             str(_KERNEL_DIR / "swiglu.cu"),
+            str(_KERNEL_DIR / "rope.cu"),
         ],
         extra_cflags=_CXX_FLAGS,
         extra_cuda_cflags=_NVCC_FLAGS,
@@ -145,3 +146,13 @@ def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """Fused SwiGLU. Drop-in replacement for `F.silu(gate) * up`."""
     return load().swiglu_forward(gate, up)
+
+
+def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Fused RoPE. Drop-in for `x * cos + rotate_half(x) * sin`.
+
+    x        : [batch, heads, n, head_dim]
+    cos, sin : [n, head_dim] (shared positions) or [batch, n, head_dim]
+               (per-sequence positions, as continuous batching needs)
+    """
+    return load().rope_forward(x, cos, sin)
