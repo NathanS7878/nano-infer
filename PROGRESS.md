@@ -357,7 +357,60 @@ Two honest caveats:
 - **75.5% is good, not maxed.** The remaining gap is a genuine target, not
   rounding.
 
-- [ ] Kernel 2 — fused SwiGLU
+### Kernel 2 — fused SwiGLU ✅ (2026-09-01)
+
+`silu(gate) * up`, elementwise over `[rows, 4864]` fp16 tensors.
+
+**The prediction came first, from byte-counting, before any code was written.**
+PyTorch runs this as two kernels: `F.silu(gate)` (read gate 2B, write tmp 2B)
+then `tmp * up` (read tmp 2B, read up 2B, write out 2B) = **10 B/elem**. The
+compulsory minimum is read gate + read up + write out = **6 B/elem**. Ceiling:
+**10/6 = 1.67x**. Kernel 1 got 7.66x because it collapsed *five* round trips;
+this collapses two. The number is smaller for a reason that is fully known in
+advance.
+
+**Measured** (`bench/kernel_swiglu.py`, fp16, peak 448 GB/s, width 4864):
+
+| Shape | PyTorch | Ours | Speedup | GB/s | % of peak | PyTorch @ actual traffic |
+|---|---|---|---|---|---|---|
+| 1x4864 | 107.0 us | 58.4 us | 1.83x | 0.5 | 0.1% | 0.1% |
+| 34x4864 | 105.4 us | 58.5 us | 1.80x | 17 | 3.8% | 3.5% |
+| 1088x4864 | 158.0 us | 100.5 us | 1.57x | 316 | 70.6% | 74.8% |
+| 4096x4864 | 518.0 us | 312.5 us | 1.66x | 383 | 85.4% | 85.9% |
+| 16384x4864 | 1965.6 us | 1192.8 us | **1.65x** | **401** | **89.5%** | 90.5% |
+
+**1.65x measured vs 1.67x predicted — within 1%.** The byte-counting model of the
+machine is correct.
+
+**Finding: PyTorch's kernels are not inefficient, they just run twice.** Re-scored
+against the 10 B/elem it actually moves, PyTorch reaches **90.5% of peak** — the
+same as ours at 89.5%. Both saturate the memory system. The whole 1.65x is one
+deleted round trip.
+
+**Finding: this simpler kernel beats kernel 1's bandwidth utilization (89.5% vs
+75.5%).** SwiGLU is a barrier-free grid-stride loop; RMSNorm needs a block-wide
+reduction with two `__syncthreads()` per row, over only 1792 bytes of work per
+block. Synchronization, not arithmetic, is what costs a memory-bound kernel its
+last stretch of peak.
+
+**Parity: 0 ULP, 100.000% exact on every shape** — including saturating inputs
+(`gate = +/-60000`, where `exp(-z)` overflows to `inf` and the result must reach
+zero by division, not `NaN`) and real MLP activations from layers 0, 12, 23.
+Elementwise means no reduction, so no reordering: mirroring ATen's cast sequence
+(promote to fp32, divide, cast back to half, *then* multiply by `up` in half)
+reproduces it bit-for-bit. This also proves the accurate `expf` is in use — a
+stray `__expf` or `--use_fast_math` would have surfaced here while still passing
+any absolute tolerance loose enough to be called "close enough."
+
+**Honest caveat:** below ~1000 rows the numbers measure dispatch overhead, not
+the GPU. Our flat ~58 us at both 1x4864 and 32x4864 is Python + pybind +
+`empty_like` cost; 32x more data at identical time is the proof.
+
+**Refactor:** `PYBIND11_MODULE` moved out of `rmsnorm.cu` into a new
+`kernels/bindings.cpp`. One `.cu` file could own the module; two cannot. Kernels
+3 and 4 now add a declaration and a `def()` line there.
+
+- [x] Kernel 2 — fused SwiGLU
 - [ ] Kernel 3 — RoPE
 - [ ] Kernel 4 — decode fused attention (online softmax)
 - [ ] End-to-end tokens/sec improvement over Phase 2

@@ -42,19 +42,19 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-08-20, after Phase 3 kernel 1._
+_Last updated: 2026-09-01, after Phase 3 kernel 2._
 
 | Phase | Status | Headline |
 |---|---|---|
 | 0 — Ground truth | ✅ Complete | Harness (<3% variance), HF baseline, reference fixture |
 | 1 — Correct but slow | ✅ Complete | From-scratch forward pass, token-for-token vs HF |
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
-| 3 — Custom CUDA kernels | ◐ **1 of 4 kernels** | Fused RMSNorm: 7.66×, **75.5% of peak bandwidth** |
+| 3 — Custom CUDA kernels | ◐ **2 of 4 kernels** | RMSNorm 7.66× @ 75.5% of peak; SwiGLU 1.65× @ **89.5% of peak** (predicted 1.67×) |
 | 4 — Quantization | ⬜ Not started | INT8 → INT4 group-wise + fused dequant-matmul |
 | 5 — Make it legible | ⬜ Not started | README table, diagram, WRITEUP.md, limitations |
 
-- **Tests:** 32 passing (`python -m pytest tests/ -q`)
-- **Commits:** 15 on `main`, clean tree
+- **Tests:** 41 passing (`python -m pytest tests/ -q`)
+- **Commits:** 16 on `main`, clean tree
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -87,6 +87,7 @@ $env:PYTHONPATH="C:\Users\Nathan stevens\OneDrive\Projects\nano-infer"
 | `-m bench.phase2_cache` | Prefill/decode split; Phase 1 vs contiguous vs paged vs HF |
 | `-m bench.phase2_continuous` | Static vs continuous batching on a request stream |
 | `-m bench.kernel_rmsnorm` | Fused RMSNorm vs PyTorch + bandwidth utilization |
+| `-m bench.kernel_swiglu` | Fused SwiGLU vs PyTorch + bandwidth utilization |
 
 Toolchain is installed and working: nvcc 12.4 (conda-forge), MSVC 14.44, ninja.
 Full build notes in `HARDWARE.md`. Kernels JIT-compile on first use (~40 s), then cache.
@@ -104,7 +105,10 @@ nano_infer/
   engine.py      Request, RunStats, ContinuousBatchingEngine (static + continuous)
   kernels/
     __init__.py  JIT loader — handles ninja/MSVC/CUDA-libpath quirks
+    bindings.cpp PYBIND11_MODULE for all kernels (one .cu cannot own it once
+                 there are two — add new kernels here)
     rmsnorm.cu   kernel 1: fused RMSNorm (scalar + float4 vectorized paths)
+    swiglu.cu    kernel 2: fused SwiGLU (scalar + float4, grid-stride)
 bench/           harness.py + one benchmark per phase/kernel
 tests/           parity + component + cache + paged + continuous + kernel tests
 results/         committed JSON + markdown benchmark outputs
@@ -163,6 +167,25 @@ These were all expensive to discover. Read before debugging anything.
 8. **fp16 is deterministic.** Mirroring a reference op-for-op gives bit-identical
    results. A nonzero diff means the *structure* diverged — that is information,
    not noise.
+
+9. **Predict a fusion's speedup by counting bytes before writing it.** SwiGLU:
+   PyTorch moves 10 B/elem (two kernels, one temporary), compulsory minimum is
+   6 B/elem, so the ceiling is 1.67×. Measured 1.65×. If a kernel lands far from
+   its byte-counted prediction, something else is happening — chase it. Corollary:
+   at PyTorch's *actual* traffic it hits 90.5% of peak, so it is not inefficient,
+   it just runs twice. Never claim a fusion "beats PyTorch" without naming the
+   bytes removed.
+
+10. **Barriers cost more than arithmetic in a memory-bound kernel.** Simpler
+    SwiGLU (grid-stride, no `__syncthreads()`) reaches 89.5% of peak; RMSNorm's
+    block-wide reduction over a 1792-byte row stalls at 75.5%. When kernel 1's
+    remaining 25% gets revisited, the block/row mapping is the suspect, not the
+    math.
+
+11. **`PYBIND11_MODULE` lives in `kernels/bindings.cpp`, not in a `.cu`.** Only one
+    translation unit may define it. Adding a kernel = new `.cu` + a declaration
+    and a `def()` line in `bindings.cpp` + an entry in `sources` in
+    `kernels/__init__.py`.
 
 ---
 
@@ -241,32 +264,51 @@ PyTorch reaches at most 9.9% of peak on the same compulsory-traffic ideal.
 Caveats stated: at small shapes the win is launch overhead, not bandwidth; 75.5%
 is good but not maxed.
 
+**Kernel 2 — fused SwiGLU ✅.** Grid-stride loop, `float4` vectorized from the
+start, no barriers. **Ceiling predicted at 1.67× from byte-counting before any
+code was written** (PyTorch 10 B/elem via a temporary vs 6 B/elem compulsory);
+**measured 1.65×.**
+
+| Shape | PyTorch | Ours | Speedup | GB/s | % peak | PyTorch @ actual traffic |
+|---|---|---|---|---|---|---|
+| 1088×4864 | 158.0 µs | 100.5 µs | 1.57× | 316 | 70.6% | 74.8% |
+| 4096×4864 | 518.0 µs | 312.5 µs | 1.66× | 383 | 85.4% | 85.9% |
+| 16384×4864 | 1965.6 µs | 1192.8 µs | **1.65×** | **401** | **89.5%** | 90.5% |
+
+Parity **0 ULP, 100% exact** on every shape (elementwise ⇒ no reduction ⇒ no
+reordering), including `gate = ±60000` saturation and real layer-0/12/23 MLP
+activations. Two findings recorded as Gotchas #9 and #10.
+
 ---
 
 ## Next actions
 
-### ▶ IMMEDIATE: Phase 3, kernel 2 — fused SwiGLU
+### ▶ IMMEDIATE: Phase 3, kernel 3 — fused RoPE
 
-`silu(gate) * up` then the down-projection. Currently in `model.py::mlp`, three
-`F.linear` calls plus `F.silu(gate) * up`. The fusable part is the elementwise
-`silu(gate) * up`, which PyTorch runs as ~3 kernels over `[rows, 4864]` tensors.
+Applied to the QKV projection output. Teaches indexing and layout — there is no
+reduction and no fusion-of-round-trips story here, so the interesting part is
+getting the memory access pattern right on a 4-D `[batch, heads, seq, head_dim]`
+view.
 
-1. **Ask Nathan to predict** memory- vs compute-bound first. (Setup: reads two
-   `[rows,4864]` fp16 tensors, writes one; ~4 FLOPs per element vs 6 bytes moved.)
-2. Add `swiglu.cu`; add it to `sources` in `kernels/__init__.py`.
-3. Parity test in `tests/test_kernels.py` using the existing `assert_parity`
-   helper (ULP-based). Note `silu` uses `exp`, so expect slightly larger ULP
-   spread than RMSNorm — measure it, don't assume.
-4. Microbenchmark in `bench/kernel_swiglu.py`, mirroring `kernel_rmsnorm.py`.
-   Report GB/s and % of 448 peak.
-5. Consider `float4` vectorization from the start (4864 % 8 == 0).
-6. Commit, update this file + PROGRESS.md.
-
-### Then: kernel 3 — RoPE
-
-Fused into the QKV projection output. Teaches indexing/layout. Must match the
-`rotate_half` pairing (dim `i` with `i + head_dim/2`) and the per-sequence
-position path added in Phase 2 step 3.
+1. **Ask Nathan to predict** memory- vs compute-bound, and the byte-counted
+   ceiling, *before* writing it — that worked well on kernel 2. Setup: reads q
+   (or k), reads `cos`/`sin`, writes the rotated result. PyTorch runs this as
+   several elementwise kernels plus a `torch.cat` for `rotate_half`, and that
+   `cat` materializes a full extra tensor — count what it costs.
+2. Must match `rotate_half`'s pairing: dim `i` with `i + head_dim/2` (**not**
+   adjacent pairs — this is the single most common way to get RoPE wrong).
+3. Must support the **per-sequence position path** added in Phase 2 step 3
+   (`apply_rope_positions`), not just a contiguous 0..seq range. Continuous
+   batching depends on it.
+4. Add `rope.cu`; declare + `def()` in `kernels/bindings.cpp`; add to `sources`
+   in `kernels/__init__.py`.
+5. Parity test in `tests/test_kernels.py` with the existing `assert_parity`.
+   Expect 0 ULP as with SwiGLU *if* the cast order is mirrored exactly —
+   `cos`/`sin` are fp32 in the reference, so check where the cast back to fp16
+   happens.
+6. Microbenchmark `bench/kernel_rope.py` mirroring `kernel_swiglu.py`, reporting
+   GB/s and % of 448 peak, plus the predicted-vs-measured ceiling.
+7. Commit, update this file + PROGRESS.md + SUMMARY.md.
 
 ### Then: kernel 4 — decode fused attention (the hard one)
 

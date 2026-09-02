@@ -227,9 +227,3 @@ torch::Tensor rmsnorm_forward(torch::Tensor x, torch::Tensor weight, double eps)
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("rmsnorm_forward", &rmsnorm_forward,
-          "Fused RMSNorm (CUDA)",
-          pybind11::arg("x"), pybind11::arg("weight"), pybind11::arg("eps"));
-}

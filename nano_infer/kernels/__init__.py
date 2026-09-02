@@ -124,7 +124,11 @@ def load(verbose: bool = False):
 
     _module = _load(
         name="nano_infer_kernels",
-        sources=[str(_KERNEL_DIR / "rmsnorm.cu")],
+        sources=[
+            str(_KERNEL_DIR / "bindings.cpp"),
+            str(_KERNEL_DIR / "rmsnorm.cu"),
+            str(_KERNEL_DIR / "swiglu.cu"),
+        ],
         extra_cflags=_CXX_FLAGS,
         extra_cuda_cflags=_NVCC_FLAGS,
         extra_ldflags=_cuda_link_flags(),
@@ -136,3 +140,8 @@ def load(verbose: bool = False):
 def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Fused RMSNorm. Drop-in replacement for nano_infer.model.rms_norm."""
     return load().rmsnorm_forward(x, weight, float(eps))
+
+
+def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """Fused SwiGLU. Drop-in replacement for `F.silu(gate) * up`."""
+    return load().swiglu_forward(gate, up)

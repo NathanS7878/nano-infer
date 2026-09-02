@@ -641,9 +641,77 @@ bandwidth: a 1×896 row is 3.6 KB, far too little to fill 46 SMs, and the 6.5×
 there comes from making one call instead of seven. And **75.5% is good, not
 maxed** — the remaining quarter is a real target, not rounding error.
 
+### Kernel 2 — Fused SwiGLU ✅
+
+Kernel 1 got **7.66×**, and the tempting conclusion is "hand-written CUDA is ~7×
+faster than PyTorch." Kernel 2 is the control that shows that conclusion is
+wrong. The win is never "CUDA"; the win is exactly the memory traffic removed,
+and it can be predicted to within a few percent *before writing any code*.
+
+The op is the gated valve in the middle of the MLP:
+
+```
+hidden = silu(gate) * up            silu(z) = z / (1 + e^-z)
+```
+
+Counting bytes per output element, PyTorch runs two kernels:
+
+| | traffic |
+|---|---|
+| `F.silu(gate)` — read gate, write tmp | 4 B/elem |
+| `tmp * up` — read tmp, read up, write out | 6 B/elem |
+| **PyTorch total** | **10 B/elem** |
+| **Compulsory minimum** — read gate, read up, write out | **6 B/elem** |
+
+So the prediction, made before the kernel existed: **10/6 = 1.67×**. Not 7×.
+RMSNorm was five round trips collapsed into one; this is two collapsed into one,
+and the ratio of removed bytes is the whole story.
+
+**Measured** (`bench/kernel_swiglu.py`, fp16, peak 448 GB/s, width 4864):
+
+| Shape | PyTorch | Ours | Speedup | GB/s | % of peak | PyTorch, actual traffic |
+|---|---|---|---|---|---|---|
+| 1×4864 | 107.0 µs | 58.4 µs | 1.83× | 0.5 | 0.1% | 0.1% |
+| 34×4864 | 105.4 µs | 58.5 µs | 1.80× | 17 | 3.8% | 3.5% |
+| 1088×4864 | 158.0 µs | 100.5 µs | 1.57× | 316 | 70.6% | 74.8% |
+| 4096×4864 | 518.0 µs | 312.5 µs | 1.66× | 383 | 85.4% | 85.9% |
+| 16384×4864 | 1965.6 µs | 1192.8 µs | **1.65×** | **401** | **89.5%** | 90.5% |
+
+**1.65× against a 1.67× prediction — within 1%.** The byte-counting model of the
+machine is correct, which is a more valuable result than a bigger number would
+have been.
+
+Two things fall out of this that are worth more than the speedup:
+
+**PyTorch's kernels are not inefficient — they just run twice.** Re-scored
+against the 10 bytes it actually moves, PyTorch hits **90.5% of peak**, the same
+as ours at 89.5%. Both implementations saturate the memory system. The entire
+1.65× comes from deleting a round trip, not from out-coding anyone. Any claim
+that a fused kernel "beats PyTorch" that cannot name the bytes it removed is a
+claim about launch overhead.
+
+**This kernel beats kernel 1's bandwidth utilization (89.5% vs 75.5%) while
+being far simpler.** SwiGLU is embarrassingly parallel: a grid-stride loop, no
+barriers, every SM independent. RMSNorm needs a block-wide reduction with two
+`__syncthreads()` per row, so every thread waits on the slowest in its block,
+and a 896-wide fp16 row is only 1792 bytes of work per block. **Synchronization,
+not arithmetic, is what costs a memory-bound kernel its last 15% of peak.**
+
+**Parity: 0 ULP, 100.000% exact, on every shape** — including saturating inputs
+(`gate = ±60000`, where `exp(-z)` overflows to `inf` and the result must reach
+zero by division rather than `NaN`) and real MLP activations from layers 0, 12,
+and 23. This is Gotcha #8 again: elementwise means no reduction, no reordering,
+so mirroring ATen's cast sequence op-for-op reproduces it bit-for-bit. It also
+proves the build is using the accurate `expf` — a stray `--use_fast_math` or
+`__expf` would have shown up instantly here, while still passing any absolute
+tolerance loose enough to be called "close enough."
+
+**Honest caveat:** below ~1000 rows the numbers measure dispatch overhead, not
+the GPU. Our flat ~58 µs at 1×4864 and 32×4864 is Python + pybind + `empty_like`
+cost, not memory bandwidth; the kernel itself is idle-fast at those sizes.
+
 ### Remaining in Phase 3
 
-- Kernel 2 — fused SwiGLU (`silu(gate) * up`, elementwise)
 - Kernel 3 — RoPE, fused into the QKV projection output
 - Kernel 4 — decode fused attention with online softmax (flash-decoding in miniature)
 - End-to-end tokens/sec improvement over Phase 2
@@ -691,6 +759,16 @@ maxed** — the remaining quarter is a real target, not rounding error.
 13. **For a memory-bound kernel, percentage of peak bandwidth is the honest
     metric.** "7.66× faster than PyTorch" flatters us; "75.5% of 448 GB/s" says
     how much room is actually left.
+14. **A fusion's speedup is the bytes it removes, and it is predictable in
+    advance.** SwiGLU was predicted at 1.67× by counting round trips before any
+    code existed, and measured 1.65×. Re-scored against the traffic it really
+    moves, PyTorch hits 90.5% of peak — as efficient as ours. It just runs twice.
+    Any "beats PyTorch" claim that cannot name the removed bytes is a claim about
+    launch overhead.
+15. **Synchronization, not arithmetic, costs a memory-bound kernel its last 15%.**
+    SwiGLU reaches 89.5% of peak with a barrier-free grid-stride loop; RMSNorm's
+    block-wide reduction, with two `__syncthreads()` over a 1792-byte row, stalls
+    at 75.5% despite doing less work per byte.
 
 ---
 
@@ -701,7 +779,7 @@ maxed** — the remaining quarter is a real target, not rounding error.
 | 0 — Ground truth | ✅ Complete | Hardware spec, benchmark harness, reference fixture, HF baseline |
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
 | 2 — KV cache & batching | ✅ Complete | Contiguous cache + prefill/decode split (15.6× at batch 32), paged cache (3.8× memory), continuous batching (1.55× on a request stream) |
-| 3 — Custom CUDA kernels | ◐ In progress | ✅ Fused RMSNorm (7.7×, 75.5% of peak bandwidth). Remaining: SwiGLU, RoPE, decode attention with online softmax |
+| 3 — Custom CUDA kernels | ◐ In progress | ✅ Fused RMSNorm (7.7×, 75.5% of peak). ✅ Fused SwiGLU (1.65× vs a 1.67× predicted ceiling, 89.5% of peak). Remaining: RoPE, decode attention with online softmax |
 | 4 — Quantization | Planned | INT8 weight-only, then INT4 group-wise (g=128) + fused dequant-matmul. Perplexity cost measured on WikiText-2 |
 | 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |
 
@@ -740,6 +818,7 @@ pip install transformers safetensors tokenizers huggingface_hub datasets acceler
 | `python -m bench.phase2_cache` | Prefill/decode split + Phase 1 vs Phase 2 vs HF |
 | `python -m bench.phase2_continuous` | Static vs continuous batching on a request stream |
 | `python -m bench.kernel_rmsnorm` | Fused RMSNorm vs PyTorch, with bandwidth utilization |
+| `python -m bench.kernel_swiglu` | Fused SwiGLU vs PyTorch, with bandwidth utilization |
 
 ### Repository layout
 
