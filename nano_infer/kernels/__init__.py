@@ -130,6 +130,7 @@ def load(verbose: bool = False):
             str(_KERNEL_DIR / "swiglu.cu"),
             str(_KERNEL_DIR / "rope.cu"),
             str(_KERNEL_DIR / "attention_decode.cu"),
+            str(_KERNEL_DIR / "quant_matmul.cu"),
         ],
         extra_cflags=_CXX_FLAGS,
         extra_cuda_cflags=_NVCC_FLAGS,
@@ -157,3 +158,13 @@ def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
                (per-sequence positions, as continuous batching needs)
     """
     return load().rope_forward(x, cos, sin)
+
+
+def int4_matmul(x, packed, scale, zero, in_features, group):
+    """Fused INT4 dequant-matmul. Drop-in for `F.linear(x, dequantized_weight)`."""
+    return load().int4_matmul(x, packed, scale, zero, int(in_features), int(group))
+
+
+def int8_matmul(x, q, scale):
+    """Fused INT8 dequant-matmul. Drop-in for `F.linear(x, dequantized_weight)`."""
+    return load().int8_matmul(x, q, scale)

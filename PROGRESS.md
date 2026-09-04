@@ -879,5 +879,111 @@ in fp16.
 - [x] INT8 per-channel symmetric + INT4 group-wise asymmetric, with tests
 - [x] Perplexity harness on WikiText-2, with standard errors
 - [x] Quality measured: INT8 lossless within error, INT4 +14-21%
-- [ ] Fused dequant-matmul kernel (unpack in registers, never materialize)
-- [ ] Acceptance table: model size, tokens/sec, perplexity, peak VRAM
+### Step 2: the fused dequant-matmul kernel, and the two ceilings it did not reach
+
+The kernel does what the spec demands: unpacks INT4 in registers between the
+load and the multiply, so **no fp16 copy of a weight ever crosses the memory
+bus**. A test measures that rather than asserting it by inspection — a
+dequantize-then-cuBLAS implementation would allocate `out × in × 2` bytes, and
+would move *more* bytes than plain fp16, defeating the entire purpose.
+
+Design: one **warp per output row**, batch accumulators held in registers with
+the tile size a compile-time constant. The obvious alternative — one block per
+(batch row, output row) — re-reads the whole weight matrix once per batch row,
+which at batch 32 would be 32× the compulsory traffic and would destroy the
+saving before it started.
+
+#### The prediction was right about the mechanism and wrong about the crossover
+
+Predicted: quantization is a *decode* optimization; at *prefill* the weight is
+reused across many rows, intensity climbs, and it should stop paying. Prefill
+did behave exactly that way (0.04–0.09×, catastrophic — cuBLAS on tensor cores).
+
+But the crossover is not decode-versus-prefill. **It is around batch 4–8, well
+inside decode:**
+
+| batch | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| ours (INT4, 4864×896) | 34.4 | 41.1 | 54.6 | 83.6 | 146.1 | 269.3 µs |
+| fp16 (cuBLAS) | 60.1 | 61.6 | 60.1 | 60.3 | 61.6 | 63.0 µs |
+
+Our time scales with batch. **cuBLAS's is flat.** That flatness is the entire
+explanation: cuBLAS is still weight-streaming-bound at batch 32, so extra rows
+of x ride along nearly free on tensor cores (HMMA). Our kernel does BT × 8
+scalar fp32 FFMAs per 4-byte weight load, so once there is enough batch to leave
+the memory-bound regime, we are competing against tensor cores with scalar math
+and lose by roughly their throughput ratio.
+
+**That was checked, not assumed.** Splitting batch 32 into four BT=8 tiles gives
+0.97× — no better — so register pressure and unrolling are not the cause. A
+kernel that won here would have to dequantize into fp16 fragments and issue HMMA
+itself, which is a different and much larger kernel.
+
+| shape | INT8 wins up to | INT4 wins up to | best (batch 1) |
+|---|---|---|---|
+| q_proj / o_proj 896×896 | batch 16 | batch 16 | 1.75× / 1.73× |
+| gate/up 4864×896 | batch 4 | batch 4 | 1.79× / 1.75× |
+| down_proj 896×4864 | batch 4 | batch 4 | 1.84× / 1.77× |
+
+#### The second ceiling that was not reached, and how it announced itself
+
+**INT8 and INT4 measure the same speed** — 1.79× vs 1.75×, 1.84× vs 1.77×.
+INT4 moves *half* the bytes of INT8. If either were bandwidth-bound, INT4 would
+be roughly twice as fast. They are indistinguishable, which is the tell.
+
+Scoring against peak bandwidth confirms it:
+
+| shape | INT8 | INT4 |
+|---|---|---|
+| q_proj 896×896 | 5.4% of peak | 2.7% |
+| gate 4864×896 | 28.9% | 14.1% |
+| down 896×4864 | 29.8% | 14.3% |
+
+And the giveaway: **~33 µs is a floor that appears at every shape**, including
+one 8× smaller than another. That is launch and dispatch overhead, exactly the
+same floor kernels 1–3 hit (~58 µs there). So the batch-1 win is real but it is
+**not** the memory-traffic win the byte count predicted — it is one custom
+kernel launch beating cuBLAS's overhead at small shapes. The 2× and 4× ceilings
+were never approached, and quoting them as achieved would be wrong.
+
+This is Gotcha #17 for the third time: **a byte-counted ceiling only binds when
+the kernel is actually bandwidth-bound.** Kernels 1–3 hit their predictions
+because they were. Decode attention missed by 10× because it was latency-bound.
+This one misses because it is launch-bound at small batch and tensor-core-bound
+at large.
+
+#### What this actually means for the engine
+
+Weight-only quantization on this GPU buys **VRAM always** (2.15× smaller model),
+**latency for single-stream decode** (1.8× at batch 1), and **costs throughput
+for batched decode** (0.23× at batch 32). Those are different products.
+
+There is a real trade-off to state plainly: the VRAM saving only materialises if
+the fp16 weights are *not* also resident. Falling back to fp16 above the
+crossover means keeping both copies, which gives up the memory win to keep the
+speed. A batch-1 latency-oriented deployment would take the quantized path
+throughout; a throughput-oriented one would not use INT4 on this hardware at
+all — INT8 at least stays lossless.
+
+Combined with the quality result from step 1 — INT8 lossless within measurement
+error, INT4 +21% perplexity — **INT8 is the configuration worth shipping at this
+model size**, and INT4 is the one that demonstrates the technique.
+
+#### A bug the kernel tests found in the step-1 quantizer
+
+A test built a deliberately *constant* group (all 128 weights equal) to check
+that per-group scales were being used. It failed with the kernel returning
+exactly zero — and so did the reference, which located the bug upstream: a
+constant group has `hi == lo`, so `scale = 0`, and the obvious guard
+(substitute 1.0) maps every element to code 0 and reconstructs the whole group
+as **zero**, silently destroying it.
+
+Fixed by widening the range so the constant lands on a grid point: `lo > 0` →
+range `[lo, 2lo]` reconstructs via code 15; `lo < 0` → `[lo, 0]` via code 0 and
+zero-point 15; `lo == 0` → zero, correctly. Constant groups now reconstruct
+**exactly** (0.00e+00 error) at every magnitude tested. Degenerate cases are
+where guards get written carelessly, which is why the test used one.
+
+- [x] Fused dequant-matmul kernel (unpack in registers, never materialize)
+- [x] Speed measured, crossover found at batch 4-8
+- [ ] Wire into model.py + acceptance table (size, tokens/sec, perplexity, VRAM)

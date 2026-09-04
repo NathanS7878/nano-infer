@@ -1197,6 +1197,111 @@ The final bound in the test is `half_step + |reconstruction| × 2⁻¹¹`, both 
 derived: round-to-nearest gives s/2, and the dequantized value is itself stored
 in fp16.
 
+### Step 2: the fused dequant-matmul kernel, and the two ceilings it did not reach
+
+The kernel does what the spec demands: unpacks INT4 in registers between the
+load and the multiply, so **no fp16 copy of a weight ever crosses the memory
+bus**. A test measures that rather than asserting it by inspection — a
+dequantize-then-cuBLAS implementation would allocate `out × in × 2` bytes, and
+would move *more* bytes than plain fp16, defeating the entire purpose.
+
+Design: one **warp per output row**, batch accumulators held in registers with
+the tile size a compile-time constant. The obvious alternative — one block per
+(batch row, output row) — re-reads the whole weight matrix once per batch row,
+which at batch 32 would be 32× the compulsory traffic and would destroy the
+saving before it started.
+
+#### The prediction was right about the mechanism and wrong about the crossover
+
+Predicted: quantization is a *decode* optimization; at *prefill* the weight is
+reused across many rows, intensity climbs, and it should stop paying. Prefill
+did behave exactly that way (0.04–0.09×, catastrophic — cuBLAS on tensor cores).
+
+But the crossover is not decode-versus-prefill. **It is around batch 4–8, well
+inside decode:**
+
+| batch | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| ours (INT4, 4864×896) | 34.4 | 41.1 | 54.6 | 83.6 | 146.1 | 269.3 µs |
+| fp16 (cuBLAS) | 60.1 | 61.6 | 60.1 | 60.3 | 61.6 | 63.0 µs |
+
+Our time scales with batch. **cuBLAS's is flat.** That flatness is the entire
+explanation: cuBLAS is still weight-streaming-bound at batch 32, so extra rows
+of x ride along nearly free on tensor cores (HMMA). Our kernel does BT × 8
+scalar fp32 FFMAs per 4-byte weight load, so once there is enough batch to leave
+the memory-bound regime, we are competing against tensor cores with scalar math
+and lose by roughly their throughput ratio.
+
+**That was checked, not assumed.** Splitting batch 32 into four BT=8 tiles gives
+0.97× — no better — so register pressure and unrolling are not the cause. A
+kernel that won here would have to dequantize into fp16 fragments and issue HMMA
+itself, which is a different and much larger kernel.
+
+| shape | INT8 wins up to | INT4 wins up to | best (batch 1) |
+|---|---|---|---|
+| q_proj / o_proj 896×896 | batch 16 | batch 16 | 1.75× / 1.73× |
+| gate/up 4864×896 | batch 4 | batch 4 | 1.79× / 1.75× |
+| down_proj 896×4864 | batch 4 | batch 4 | 1.84× / 1.77× |
+
+#### The second ceiling that was not reached, and how it announced itself
+
+**INT8 and INT4 measure the same speed** — 1.79× vs 1.75×, 1.84× vs 1.77×.
+INT4 moves *half* the bytes of INT8. If either were bandwidth-bound, INT4 would
+be roughly twice as fast. They are indistinguishable, which is the tell.
+
+Scoring against peak bandwidth confirms it:
+
+| shape | INT8 | INT4 |
+|---|---|---|
+| q_proj 896×896 | 5.4% of peak | 2.7% |
+| gate 4864×896 | 28.9% | 14.1% |
+| down 896×4864 | 29.8% | 14.3% |
+
+And the giveaway: **~33 µs is a floor that appears at every shape**, including
+one 8× smaller than another. That is launch and dispatch overhead, exactly the
+same floor kernels 1–3 hit (~58 µs there). So the batch-1 win is real but it is
+**not** the memory-traffic win the byte count predicted — it is one custom
+kernel launch beating cuBLAS's overhead at small shapes. The 2× and 4× ceilings
+were never approached, and quoting them as achieved would be wrong.
+
+This is Gotcha #17 for the third time: **a byte-counted ceiling only binds when
+the kernel is actually bandwidth-bound.** Kernels 1–3 hit their predictions
+because they were. Decode attention missed by 10× because it was latency-bound.
+This one misses because it is launch-bound at small batch and tensor-core-bound
+at large.
+
+#### What this actually means for the engine
+
+Weight-only quantization on this GPU buys **VRAM always** (2.15× smaller model),
+**latency for single-stream decode** (1.8× at batch 1), and **costs throughput
+for batched decode** (0.23× at batch 32). Those are different products.
+
+There is a real trade-off to state plainly: the VRAM saving only materialises if
+the fp16 weights are *not* also resident. Falling back to fp16 above the
+crossover means keeping both copies, which gives up the memory win to keep the
+speed. A batch-1 latency-oriented deployment would take the quantized path
+throughout; a throughput-oriented one would not use INT4 on this hardware at
+all — INT8 at least stays lossless.
+
+Combined with the quality result from step 1 — INT8 lossless within measurement
+error, INT4 +21% perplexity — **INT8 is the configuration worth shipping at this
+model size**, and INT4 is the one that demonstrates the technique.
+
+#### A bug the kernel tests found in the step-1 quantizer
+
+A test built a deliberately *constant* group (all 128 weights equal) to check
+that per-group scales were being used. It failed with the kernel returning
+exactly zero — and so did the reference, which located the bug upstream: a
+constant group has `hi == lo`, so `scale = 0`, and the obvious guard
+(substitute 1.0) maps every element to code 0 and reconstructs the whole group
+as **zero**, silently destroying it.
+
+Fixed by widening the range so the constant lands on a grid point: `lo > 0` →
+range `[lo, 2lo]` reconstructs via code 15; `lo < 0` → `[lo, 0]` via code 0 and
+zero-point 15; `lo == 0` → zero, correctly. Constant groups now reconstruct
+**exactly** (0.00e+00 error) at every magnitude tested. Degenerate cases are
+where guards get written carelessly, which is why the test used one.
+
 ---
 
 ## 8. What was learned
@@ -1309,6 +1414,16 @@ in fp16.
     improvement. The standard error of the estimate is ±3.45%, so the honest
     claim is "lossless within measurement precision" and nothing more. The same
     error bar is what makes INT4's +21% a real finding rather than a guess.
+28. **Two schemes measuring the SAME speed is evidence, not a coincidence.**
+    INT4 moves half the bytes of INT8 and ran at the same 1.8×. If either were
+    bandwidth-bound, INT4 would be ~2× faster. Identical timings, plus a ~33 µs
+    floor at every matrix size, said both were launch-bound — so the byte-counted
+    2×/4× ceilings were never in play and quoting them as achieved would be wrong.
+29. **A degenerate-case test is worth writing precisely because guards get
+    written carelessly.** A constant quantization group (hi == lo) made scale
+    zero; the obvious guard substituted 1.0 and reconstructed the entire group
+    as zero, destroying it silently. The test that caught it existed to check
+    something else.
 27. **Quote the compression you actually got, not the one the format implies.**
     "INT4" suggests 4×. The tensors touched shrink 3.82× once group metadata is
     counted (4.19 bits/weight, not 4.0), and the whole model shrinks 2.15×
@@ -1325,7 +1440,7 @@ in fp16.
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
 | 2 — KV cache & batching | ✅ Complete | Contiguous cache + prefill/decode split (15.6× at batch 32), paged cache (3.8× memory), continuous batching (1.55× on a request stream) |
 | 3 — Custom CUDA kernels | ✅ Complete | RMSNorm 7.7× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention 2.48× @ 11.1%. **End-to-end 2.33× (2.4× vs HF) at batch 32** |
-| 4 — Quantization | ◐ Quality measured | INT8 **lossless within measurement error**; INT4 g128 +21.1% perplexity, 2.15× smaller. Fused dequant-matmul kernel next |
+| 4 — Quantization | ◐ Kernel done | INT8 lossless / INT4 +21.1% ppl, 2.15× smaller. Kernel: **1.8× at batch 1, 0.23× at batch 32** — crossover measured. End-to-end wiring left |
 | 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |
 
 ### Phase 2 specifics
@@ -1368,6 +1483,7 @@ pip install transformers safetensors tokenizers huggingface_hub datasets acceler
 | `python -m bench.kernel_attention` | Fused decode attention; the two wins measured separately |
 | `python -m bench.phase3_end_to_end` | End-to-end tokens/sec, kernels off vs on |
 | `python -m bench.perplexity` | Quality cost of INT8/INT4 on WikiText-2, with error bars |
+| `python -m bench.quant_speed` | Dequant-matmul speed and the batch-size crossover |
 
 ### Repository layout
 

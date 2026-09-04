@@ -201,3 +201,141 @@ def test_whole_model_compression_is_what_we_claim(mode, lo, hi):
     assert lo < s["compression"] < hi, (
         f"{mode} whole-model compression {s['compression']:.2f}x outside the "
         f"expected {lo}-{hi}x — the set of quantized tensors changed")
+
+
+# --- the fused dequant-matmul kernels ---------------------------------------
+#
+# These are validated against `Int4Tensor.dequantize() @ x` — the step-1
+# reference — and NOT against fp16. That distinction is the whole point:
+# quantization error is expected and was measured in bench/perplexity.py, while
+# KERNEL error is not expected at all. Comparing against fp16 would fold the two
+# together and let a genuine kernel bug hide inside the quantization loss.
+
+kernels = pytest.importorskip("nano_infer.kernels")
+
+# Only the accumulation order differs from the reference (fp32 in the kernel vs
+# cuBLAS's own order), so the bar is tight.
+MATMUL_REL = 5e-3
+
+
+@pytest.fixture(scope="module")
+def kmod():
+    return kernels.load()
+
+
+QUANT_MATMUL_SHAPES = [
+    (896, 896),        # q_proj / o_proj
+    (4864, 896),       # gate_proj / up_proj
+    (896, 4864),       # down_proj
+    (128, 896),        # k_proj / v_proj (GQA: only 2 KV heads)
+]
+
+
+@pytest.mark.parametrize("out_f,in_f", QUANT_MATMUL_SHAPES)
+@pytest.mark.parametrize("batch", [1, 4, 32])
+def test_int4_matmul_matches_the_dequantized_reference(kmod, out_f, in_f, batch):
+    torch.manual_seed(0)
+    w = torch.randn(out_f, in_f, dtype=cfg.DTYPE, device=cfg.DEVICE) * 0.05
+    x = torch.randn(batch, in_f, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    t = Q.quantize_int4(w, Q.INT4_GROUP)
+
+    ref = torch.nn.functional.linear(x, t.dequantize())
+    got = kmod.int4_matmul(x, t.packed, t.scale, t.zero, in_f, Q.INT4_GROUP)
+
+    assert got.shape == ref.shape and got.dtype == ref.dtype
+    rel = ((ref.float() - got.float()).abs().max()
+           / ref.float().abs().max().clamp(min=1e-6)).item()
+    print(f"\n[int4 matmul {out_f}x{in_f} b{batch}] rel {rel:.2e}")
+    assert rel < MATMUL_REL, f"kernel disagrees with its own reference by {rel:.2e}"
+
+
+@pytest.mark.parametrize("out_f,in_f", QUANT_MATMUL_SHAPES)
+@pytest.mark.parametrize("batch", [1, 4, 32])
+def test_int8_matmul_matches_the_dequantized_reference(kmod, out_f, in_f, batch):
+    torch.manual_seed(0)
+    w = torch.randn(out_f, in_f, dtype=cfg.DTYPE, device=cfg.DEVICE) * 0.05
+    x = torch.randn(batch, in_f, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    t = Q.quantize_int8(w)
+
+    ref = torch.nn.functional.linear(x, t.dequantize())
+    got = kmod.int8_matmul(x, t.q, t.scale)
+
+    assert got.shape == ref.shape and got.dtype == ref.dtype
+    rel = ((ref.float() - got.float()).abs().max()
+           / ref.float().abs().max().clamp(min=1e-6)).item()
+    print(f"\n[int8 matmul {out_f}x{in_f} b{batch}] rel {rel:.2e}")
+    assert rel < MATMUL_REL, f"kernel disagrees with its own reference by {rel:.2e}"
+
+
+def test_int4_kernel_reads_the_nibbles_in_the_packing_order(kmod):
+    """A swapped nibble order still produces finite, plausible output — it just
+    silently pairs every weight with the wrong input. Pinned with a weight whose
+    even and odd columns are deliberately different, against a one-hot input."""
+    in_f, out_f = 128, 8
+    w = torch.zeros(out_f, in_f, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    w[:, 0::2] = 1.0                      # even columns
+    w[:, 1::2] = -1.0                     # odd columns
+    t = Q.quantize_int4(w, group=128)
+
+    # one-hot on column 0 (an even column) must select the +1 weights
+    x = torch.zeros(1, in_f, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    x[0, 0] = 1.0
+    got = kmod.int4_matmul(x, t.packed, t.scale, t.zero, in_f, 128)
+    ref = torch.nn.functional.linear(x, t.dequantize())
+    assert torch.allclose(got.float(), ref.float(), atol=1e-2), (
+        f"even-column selection wrong: got {got[0,0].item()}, "
+        f"reference {ref[0,0].item()} — nibble order is likely swapped")
+
+    # and column 1 (odd) must select the -1 weights
+    x.zero_()
+    x[0, 1] = 1.0
+    got = kmod.int4_matmul(x, t.packed, t.scale, t.zero, in_f, 128)
+    ref = torch.nn.functional.linear(x, t.dequantize())
+    assert torch.allclose(got.float(), ref.float(), atol=1e-2), \
+        "odd-column selection wrong — nibble order is swapped"
+
+
+def test_int4_kernel_uses_per_group_scales(kmod):
+    """Same trap as the reference test: a kernel that used one scale per row
+    would crush a small group to zero. Here group 0 is huge and group 1 tiny."""
+    in_f, out_f = 256, 4
+    w = torch.zeros(out_f, in_f, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    w[:, :128] = 50.0
+    w[:, 128:] = 0.01
+    t = Q.quantize_int4(w, group=128)
+
+    x = torch.zeros(1, in_f, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    x[0, 200] = 1.0                        # lands in the small second group
+    got = kmod.int4_matmul(x, t.packed, t.scale, t.zero, in_f, 128).float()
+    assert got.abs().max() > 1e-3, (
+        "the small group produced ~0: the kernel is using a single row-wide "
+        "scale instead of per-group scales")
+    ref = torch.nn.functional.linear(x, t.dequantize()).float()
+    assert torch.allclose(got, ref, atol=1e-3)
+
+
+def test_quantized_matmul_never_materializes_the_weight(kmod):
+    """The defining constraint: unpacking happens in registers, so no fp16 copy
+    of W is ever allocated. Measured, not asserted by inspection — a
+    dequantize-then-linear implementation would allocate out*in*2 bytes here.
+    """
+    out_f, in_f = 4864, 896
+    torch.manual_seed(0)
+    w = torch.randn(out_f, in_f, dtype=cfg.DTYPE, device=cfg.DEVICE) * 0.05
+    t = Q.quantize_int4(w, Q.INT4_GROUP)
+    x = torch.randn(1, in_f, dtype=cfg.DTYPE, device=cfg.DEVICE)
+
+    kmod.int4_matmul(x, t.packed, t.scale, t.zero, in_f, Q.INT4_GROUP)  # warm
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    kmod.int4_matmul(x, t.packed, t.scale, t.zero, in_f, Q.INT4_GROUP)
+    torch.cuda.synchronize()
+    peak_extra = torch.cuda.max_memory_allocated() - before
+
+    dequantized_bytes = out_f * in_f * 2
+    print(f"\n[no-materialize] peak extra allocation {peak_extra} B; a "
+          f"dequantized copy would be {dequantized_bytes} B")
+    assert peak_extra < dequantized_bytes // 4, (
+        f"allocated {peak_extra} B — that looks like a dequantized weight copy, "
+        "which would move more bytes than fp16 and defeat the whole point")

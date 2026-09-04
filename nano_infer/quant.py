@@ -177,6 +177,22 @@ def quantize_int4(w: torch.Tensor, group: int = INT4_GROUP) -> Int4Tensor:
 
     lo = wf.amin(dim=2, keepdim=True)
     hi = wf.amax(dim=2, keepdim=True)
+
+    # A CONSTANT group has hi == lo, so the range is zero. Substituting a unit
+    # scale (the obvious guard) maps every element to code 0 and reconstructs
+    # the whole group as ZERO -- silently destroying it. Instead, widen the
+    # range so the constant itself lands on a grid point:
+    #
+    #   lo > 0:  range [lo, 2lo]  -> zero=0,  code 15, (15-0)*lo/15  = lo
+    #   lo < 0:  range [lo, 0]    -> zero=15, code 0,  (0-15)*|lo|/15 = lo
+    #   lo == 0: range [0, 1]     -> zero=0,  code 0,               = 0
+    #
+    # Found by test_int4_kernel_uses_per_group_scales, which used a constant
+    # group precisely because it is the degenerate case a guard tends to botch.
+    degenerate = (hi == lo)
+    widened = lo + torch.where(lo.abs() > 0, lo.abs(), torch.ones_like(lo))
+    hi = torch.where(degenerate, widened, hi)
+
     scale = (hi - lo) / 15.0
     scale = torch.where(scale == 0, torch.ones_like(scale), scale)
     # Same rule as INT8: round the scale to its stored fp16 precision BEFORE

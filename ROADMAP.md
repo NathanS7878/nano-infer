@@ -42,7 +42,7 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-04, Phase 4 step 1 (quantization quality measured)._
+_Last updated: 2026-09-04, Phase 4 step 2 (dequant-matmul kernel measured)._
 
 | Phase | Status | Headline |
 |---|---|---|
@@ -50,11 +50,11 @@ _Last updated: 2026-09-04, Phase 4 step 1 (quantization quality measured)._
 | 1 — Correct but slow | ✅ Complete | From-scratch forward pass, token-for-token vs HF |
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
 | 3 — Custom CUDA kernels | ✅ Complete | 4/4 kernels, wired in, output verified. **End-to-end 2.33× at batch 32 (1739 tok/s), 2.4× vs HuggingFace** |
-| 4 — Quantization | ◐ **Quality measured** | INT8 lossless within error; INT4 g128 **+21.1%** ppl, 2.15× smaller. Kernel next |
+| 4 — Quantization | ◐ **Kernel measured** | INT8 lossless / INT4 +21.1% ppl, 2.15× smaller. Kernel **1.8× @ batch 1, 0.23× @ batch 32** (crossover ~batch 4-8). Wiring left |
 | 5 — Make it legible | ⬜ Not started | README table, diagram, WRITEUP.md, limitations |
 
-- **Tests:** 87 passing (`python -m pytest tests/ -q`)
-- **Commits:** 21 on `main`, clean tree
+- **Tests:** 114 passing (`python -m pytest tests/ -q`)
+- **Commits:** 22 on `main`, clean tree
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -92,6 +92,7 @@ $env:PYTHONPATH="C:\Users\Nathan stevens\OneDrive\Projects\nano-infer"
 | `-m bench.kernel_attention` | Decode attention; fusion win and gather win separated |
 | `-m bench.phase3_end_to_end` | **The Phase 3 acceptance number**: tokens/sec, kernels off vs on |
 | `-m bench.perplexity` | Quality cost of INT8/INT4 on WikiText-2, with error bars |
+| `-m bench.quant_speed` | Dequant-matmul speed; **the batch-size crossover** |
 
 Toolchain is installed and working: nvcc 12.4 (conda-forge), MSVC 14.44, ninja.
 Full build notes in `HARDWARE.md`. Kernels JIT-compile on first use (~40 s), then cache.
@@ -116,6 +117,8 @@ nano_infer/
     swiglu.cu    kernel 2: fused SwiGLU (scalar + float4, grid-stride)
     rope.cu      kernel 3: fused RoPE (both shared- and per-sequence positions)
     attention_decode.cu
+    quant_matmul.cu
+                 Phase 4: fused INT8/INT4 dequant-matmul, unpacked in registers
                  kernel 4: online-softmax decode attention, walks the paged
                  slot table in place. Block size is a tuned knob (see #17)
 bench/           harness.py + one benchmark per phase/kernel
@@ -300,6 +303,21 @@ These were all expensive to discover. Read before debugging anything.
     a table header crashes `write_text`. Pass `encoding="utf-8"` on every
     artifact write.
 
+25. **A quantized matmul beats cuBLAS only at batch 1-4 on this GPU.** Measured
+    crossover: INT8/INT4 win up to batch 4 on the 4864x896 and 896x4864
+    projections (batch 16 on 896x896), and lose hard above it — 0.23x at batch
+    32, 0.04-0.09x at prefill. cuBLAS is FLAT across batch 1-32 because it is
+    still weight-bound there and rides tensor cores; a scalar-fp32 dequant
+    kernel cannot follow. Verified not to be register pressure: splitting batch
+    32 into four BT=8 tiles gives 0.97x.
+
+26. **INT8 and INT4 measure the SAME speed here, which proves neither is
+    bandwidth-bound.** ~1.8x both, at 2.7-29.8% of peak, with an identical
+    ~33 us floor at every matrix size (launch/dispatch overhead, the same floor
+    kernels 1-3 hit at ~58 us). INT4 moves half of INT8's bytes; if bandwidth
+    bound it would be ~2x faster. The byte-counted 2x/4x ceilings were never
+    approached -- do not quote them as achieved.
+
 ## Progress detail
 
 ### Phase 0 — Ground truth ✅
@@ -437,41 +455,37 @@ is 0.48–1.00× the reference's on every shape.
 
 ## Next actions
 
-### ▶ IMMEDIATE: Phase 4 step 2 — the fused dequant-matmul kernel
+### ▶ IMMEDIATE: Phase 4 step 3 — wire it in and build the acceptance table
 
-Step 1 is done: both schemes implemented, tested, and their **quality** cost
-measured (`bench/perplexity.py`). INT8 is lossless within measurement error;
-INT4 g128 costs +21.1% perplexity, g32 costs +14.5%. What is NOT yet measured is
-the speed and VRAM half of the acceptance table, because nothing is packed yet —
-`quantize_dequantize` hands back fp16, which is correct for quality and useless
-for speed.
+Steps 1 and 2 are done: both schemes implemented and tested, quality measured
+(INT8 lossless within error, INT4 g128 +21.1% perplexity), and the kernel
+measured (1.8x at batch 1, 0.23x at batch 32, crossover ~batch 4-8, Gotchas #25
+and #26). What is missing is the tokens/sec and peak-VRAM columns of the
+acceptance table, which need the engine actually running on packed weights.
 
-The kernel, per CLAUDE.md: **unpack INT4 in registers, multiply in fp16, and
-never materialize the dequantized weight matrix in global memory** — doing so
-would move exactly as many bytes as fp16 and defeat the entire point.
+1. **Store packed weights, not round-tripped fp16.** `quantize_weights` today
+   returns dequantized fp16 (correct for quality, useless for VRAM). Add a path
+   that keeps `Int4Tensor`/`Int8Tensor` and routes `F.linear` through the
+   kernel. **The VRAM win only exists if the fp16 copy is NOT also resident** —
+   that is the entire memory claim, so assert it with
+   `torch.cuda.max_memory_allocated()`.
+2. **Decide the routing and state it.** The kernel loses above batch ~4. Options,
+   both defensible, but pick one and say why: (a) always quantized — best VRAM,
+   worse batched throughput; (b) quantized under the crossover, fp16 above —
+   best speed, no VRAM win because both copies must exist. Do not silently
+   fall back and then quote the memory saving.
+3. Acceptance table per CLAUDE.md: **model size GB, tokens/sec, perplexity,
+   peak VRAM** at fp16 / INT8 / INT4. Report tokens/sec at batch 1 AND batch 32
+   — one number would hide the crossover.
+4. Idle GPU (Gotcha #18), quote run counts with variance (Gotcha #21).
 
-1. **Ask Nathan to predict** memory- vs compute-bound, and the byte-counted
-   ceiling, before writing it. Setup: at decode this is a tall-skinny GEMM
-   (batch × 896 against 896 × 4864), dominated by streaming the weight matrix.
-   fp16 arithmetic intensity is ~1 FLOP/byte; INT4 raises it to ~4. Both are far
-   below the 364 FLOP/byte ridge. **Then ask whether that answer changes at
-   prefill batch 32** — it does, and that is the interesting half.
-2. Expect the ceiling to be ~4× on the quantized layers *at decode only*, and
-   for prefill to gain little or nothing. Phase 3's Gotcha #17 applies: verify
-   which bound you are actually against before trusting the ceiling.
-3. Store the packed form: `nano_infer/quant.py` already produces
-   `Int4Tensor(packed, scale, zero)`. The kernel needs a layout decision —
-   walking K contiguously matters more than walking N.
-4. Validate against `Int4Tensor.dequantize() @ x` (the step-1 reference), not
-   against fp16. Quantization error is expected; kernel error is not, so this
-   comparison must be tight.
-5. Wire behind the existing `model.using_kernels()`-style flag, decode path
-   first. Then `bench/quant_speed.py` and the **full acceptance table: model
-   size GB, tokens/sec, perplexity, peak VRAM** at fp16 / INT8 / INT4.
-6. Measure peak VRAM with `torch.cuda.max_memory_allocated()` around a
-   generation, reset between configurations.
-7. Benchmark on an **idle GPU** (Gotcha #18); quote run counts with any variance
-   (Gotcha #21).
+### Then: Phase 5 — make it legible
+
+The README table, the architecture diagram, and `WRITEUP.md`. Note there are now
+several strong candidates for the writeup beyond the original Gotcha #4 pick:
+the fp64-softmax-on-CUDA bug that made a correct kernel look wrong (#15), the
+decode-attention ceiling miss that turned out to be latency (#17), and the
+"variance metric got worse when I measured harder" finding (#21).
 
 ### Then: optional — close the gap on kernel 4
 

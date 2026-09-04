@@ -11,6 +11,10 @@
 torch::Tensor rmsnorm_forward(torch::Tensor x, torch::Tensor weight, double eps);
 torch::Tensor swiglu_forward(torch::Tensor gate, torch::Tensor up);
 torch::Tensor rope_forward(torch::Tensor x, torch::Tensor cos, torch::Tensor sin);
+torch::Tensor int4_matmul(torch::Tensor x, torch::Tensor packed,
+                          torch::Tensor scale, torch::Tensor zero,
+                          int64_t in_features, int64_t group);
+torch::Tensor int8_matmul(torch::Tensor x, torch::Tensor q, torch::Tensor scale);
 torch::Tensor decode_attention_forward(torch::Tensor q, torch::Tensor k_pool,
                                        torch::Tensor v_pool, torch::Tensor slot_table,
                                        torch::Tensor lengths, double scale,
@@ -31,4 +35,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("q"), pybind11::arg("k_pool"), pybind11::arg("v_pool"),
           pybind11::arg("slot_table"), pybind11::arg("lengths"), pybind11::arg("scale"),
           pybind11::arg("block_size") = 0);
+    m.def("int4_matmul", &int4_matmul,
+          "Fused INT4 group-wise dequantize-and-matmul (CUDA)",
+          pybind11::arg("x"), pybind11::arg("packed"), pybind11::arg("scale"),
+          pybind11::arg("zero"), pybind11::arg("in_features"),
+          pybind11::arg("group"));
+    m.def("int8_matmul", &int8_matmul,
+          "Fused INT8 per-row dequantize-and-matmul (CUDA)",
+          pybind11::arg("x"), pybind11::arg("q"), pybind11::arg("scale"));
 }
