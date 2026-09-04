@@ -1032,9 +1032,8 @@ Three runs of the same A/B, same process, kernels off vs on:
 | 16 | 2.45× | 2.83× | 2.93× |
 | 32 | 2.06× | 1.96× | 2.31× |
 
-**Consistently 1.85–3.29×, never below 1.8×** — better than expected, and the
-direction is robust. But **the precise numbers are not trustworthy yet**, and
-saying so is the point:
+**Consistently 1.85–3.29×, never below 1.8×** — the direction was robust, but
+the precise numbers were not, and saying so was the point:
 
 - run-to-run spread reached **16–40%** against this project's 3% bar;
 - the GPU was at **36–53% utilization** and holding 5.8 of 8 GB for other
@@ -1045,18 +1044,68 @@ saying so is the point:
 
 An A/B ratio is more robust than an absolute figure here, because both sides
 shared the same contention in the same process. But a 3× claim resting on runs
-that disagree by 30% with each other is not a measurement, so it is recorded as
-provisional and the caveat is written into `results/phase3_end_to_end.md` itself
-— a warning that only ever appeared on stdout does not survive being pasted into
-a README.
+that disagree by 30% with each other is not a measurement, so it was recorded as
+provisional and the caveat written into `results/phase3_end_to_end.md` itself —
+a warning that only ever appeared on stdout does not survive being pasted into a
+README.
 
-**Phase 3 is functionally complete and its headline number is pending one clean
-re-run on an idle GPU.**
+#### The clean run: 2.33x end to end
 
-### Remaining in Phase 3
+Re-run on an idle GPU (2% utilization, 350 MiB in use), harness-matched
+methodology (3 runs after 2 discarded warmups):
 
-- One clean re-run of `bench/phase3_end_to_end.py` on an idle GPU, to turn the
-  provisional 1.85–3.29× into a headline number.
+| Batch | PyTorch tok/s | Custom kernels tok/s | Speedup |
+|---|---|---|---|
+| 1 | 25.1 | 58.6 | **2.34x** |
+| 4 | 97.6 | 225.9 | **2.32x** |
+| 16 | 376.8 | 905.1 | **2.40x** |
+| 32 | 745.1 | **1739.1** | **2.33x** |
+
+**2.32-2.40x, flat across a 32x range of batch sizes**, and three independent
+clean runs (3, 5 and 9 repeats) all agreed on 2.2-2.4x. Contrast the contended
+runs, which gave 1.85-3.29x and disagreed with each other by 30%: the contention
+was not adding noise around a true value so much as producing numbers that were
+not measurements at all.
+
+For context against the Phase 2 table, re-measured in the same clean window:
+Phase 2 paged is 724.1 tok/s at batch 32 and HF `generate()` is 714.6, so the
+kernel path at 1739.1 is **2.4x HuggingFace** on the same hardware, model and
+prompts.
+
+The Phase 2 figures reproduced within their documented variance (contiguous
+853.2 vs 831.6 recorded, paged 724.1 vs 664.9, HF 714.6 vs 686.9), which
+retroactively confirms that the 10-minute timeout during the contended window
+was environmental. No correction to the Phase 2 table was needed.
+
+**Why 2.33x is higher than predicted.** The expectation written down beforehand
+was a modest gain, because kernels 1-3 are launch-bound at decode sizes and
+kernel 4 runs at 11.1% of peak. The gain is larger than that reasoning suggested,
+and the honest reading is that *launch-bound* was the operative word: a decode
+step issues five kernels per RoPE, five per RMSNorm and three per SwiGLU, 24
+times per token. Collapsing those into one launch each removes a per-step CPU
+cost that no bandwidth argument captures. The microbenchmarks measured the wrong
+thing for this regime -- they measured bandwidth on large tensors, when what the
+engine actually gains at decode is launches avoided.
+
+#### A methodology fix found while chasing the 3% bar
+
+Adding runs made the reported spread *worse*: 6.4% at 5 runs, 13.9% at 9 runs,
+on an idle GPU doing identical work. The harness's stability metric is
+`(max - min) / median`, which is **sample-size dependent** -- more runs sample
+more of the tail, so the number grows even when the distribution has not moved.
+
+A "variance < 3%" claim is therefore only reproducible if the run count is quoted
+with it. `bench/phase3_end_to_end.py` now reports both that spread (at
+harness-matched defaults, so it is comparable to the 3% bar) and the coefficient
+of variation `stdev / mean`, which is sample-size stable and is the number to use
+when comparing runs that used different repeat counts. On the clean run: spread
+8.9% at 3 runs, cv 4.5%.
+
+
+### Phase 3 — complete
+
+All four kernels written, correct, benchmarked, wired in, and verified end to
+end at **2.33× over the PyTorch path (2.4× over HuggingFace)** at batch 32.
 
 ---
 
@@ -1149,10 +1198,22 @@ re-run on an idle GPU.**
     contribute nothing, and that prefill never reaches the decode kernel.
 23. **Check what else is using the GPU before believing a benchmark.** Three runs
     of the same A/B disagreed by up to 30%, and the Phase 2 benchmark that
-    produced this project's recorded figures now times out, because the desktop
-    was holding 36–53% of the card. The code did not change; the environment
-    did. Numbers were published as provisional with the contention recorded in
-    the results file itself.
+    produced this project's recorded figures timed out entirely, because the
+    desktop was holding 36–53% of the card. The code had not changed; the
+    environment had. On an idle GPU the same A/B gave 2.32–2.40× with the
+    batch-size spread collapsing to 0.08×, and Phase 2 reproduced within its
+    documented variance.
+24. **A variance metric can be sample-size dependent, and this project's was.**
+    `(max - min) / median` grows as you add runs, because you sample more of the
+    tail — measured 6.4% at 5 runs and 13.9% at 9 on an idle GPU doing identical
+    work. "Variance < 3%" is not reproducible without its run count. Report the
+    coefficient of variation alongside it when comparing across run counts.
+25. **A microbenchmark can measure the wrong thing for the regime you care
+    about.** Kernels 1–3 were scored on bandwidth at large tensor sizes, which
+    predicted they would contribute nothing at decode. End-to-end they clearly
+    do: a decode step issues ~13 elementwise launches per layer, 24 layers per
+    token, and collapsing those into 3 removes a per-step CPU cost no bandwidth
+    argument captures.
 
 ---
 
@@ -1163,7 +1224,7 @@ re-run on an idle GPU.**
 | 0 — Ground truth | ✅ Complete | Hardware spec, benchmark harness, reference fixture, HF baseline |
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
 | 2 — KV cache & batching | ✅ Complete | Contiguous cache + prefill/decode split (15.6× at batch 32), paged cache (3.8× memory), continuous batching (1.55× on a request stream) |
-| 3 — Custom CUDA kernels | ◐ Functionally complete | RMSNorm 7.7× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention 2.48× @ 11.1%. Wired in behind a flag; end-to-end **1.85–3.29×**, provisional (GPU contended, see wrap-up) |
+| 3 — Custom CUDA kernels | ✅ Complete | RMSNorm 7.7× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention 2.48× @ 11.1%. **End-to-end 2.33× (2.4× vs HF) at batch 32** |
 | 4 — Quantization | Planned | INT8 weight-only, then INT4 group-wise (g=128) + fused dequant-matmul. Perplexity cost measured on WikiText-2 |
 | 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |
 

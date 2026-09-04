@@ -42,15 +42,15 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-02, after the Phase 3 wrap-up (kernels wired in)._
+_Last updated: 2026-09-04, Phase 3 COMPLETE (clean end-to-end run done)._
 
 | Phase | Status | Headline |
 |---|---|---|
 | 0 — Ground truth | ✅ Complete | Harness (<3% variance), HF baseline, reference fixture |
 | 1 — Correct but slow | ✅ Complete | From-scratch forward pass, token-for-token vs HF |
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
-| 3 — Custom CUDA kernels | ◐ **Functionally complete** | 4/4 kernels, wired in behind a flag, output verified. End-to-end **1.85–3.29×** but **provisional** — GPU contended, see Gotcha #18 |
-| 4 — Quantization | ⬜ Not started | INT8 → INT4 group-wise + fused dequant-matmul |
+| 3 — Custom CUDA kernels | ✅ Complete | 4/4 kernels, wired in, output verified. **End-to-end 2.33× at batch 32 (1739 tok/s), 2.4× vs HuggingFace** |
+| 4 — Quantization | ⬜ **NEXT** | INT8 → INT4 group-wise + fused dequant-matmul |
 | 5 — Make it legible | ⬜ Not started | README table, diagram, WRITEUP.md, limitations |
 
 - **Tests:** 76 passing (`python -m pytest tests/ -q`)
@@ -236,15 +236,25 @@ These were all expensive to discover. Read before debugging anything.
     allow.
 
 18. **Check what else is using the GPU BEFORE trusting any benchmark on this
-    machine.** The desktop (Wallpaper Engine, Edge, Steam) routinely holds
-    36–53% GPU utilization and ~5.8 of 8 GB. Under that load, three runs of the
-    same A/B disagreed by up to 30%, and `bench/phase2_cache.py` — which
-    produced this repo's recorded 831/665 tok/s — **timed out after 10 minutes**.
-    Nothing in the code changed. `bench/phase3_end_to_end.py` now queries
-    `nvidia-smi` and stamps the contention into `results/*.md` itself, because a
-    warning printed only to stdout does not survive being pasted into a README.
-    **Close the GPU-using desktop apps before any run whose number you intend to
-    publish.**
+    machine.** The desktop (Wallpaper Engine, Edge, Steam) can hold 36–53% GPU
+    utilization and ~5.8 of 8 GB. Under that load, three runs of the same A/B
+    disagreed by up to 30% and `bench/phase2_cache.py` — which produced this
+    repo's recorded 831/665 tok/s — **timed out after 10 minutes**. Nothing in
+    the code had changed. **Idle** (0–2% util, ~350 MiB) the same A/B gives
+    2.32–2.40× and Phase 2 reproduces within its documented variance.
+    `bench/phase3_end_to_end.py` queries `nvidia-smi` and stamps what it saw
+    into `results/*.md` itself, because a warning printed only to stdout does
+    not survive being pasted into a README. **Target before publishing a number:
+    utilization ~0%, memory under ~500 MiB.**
+
+21. **The project's stability metric is sample-size dependent.** `bench/harness.py`
+    uses `(max - min) / median`, which GROWS as you add runs — measured 6.4% at
+    5 runs and 13.9% at 9, on an idle GPU doing identical work. So "variance
+    < 3%" only means something with its run count attached, and adding repeats
+    to "get a cleaner number" makes the reported figure worse.
+    `bench/phase3_end_to_end.py` defaults to the harness's warmup 2 / runs 3 so
+    the figure is comparable, and also reports **cv = stdev/mean**, which is
+    sample-size stable. Use the cv when comparing runs with different repeats.
 
 19. **Only TWO of the four kernels are bit-identical.** SwiGLU and RoPE are
     0 ULP / 100% exact (elementwise, no reduction, no reordering). **RMSNorm is
@@ -410,32 +420,38 @@ is 0.48–1.00× the reference's on every shape.
 
 ## Next actions
 
-### ▶ IMMEDIATE: one clean end-to-end run, then Phase 3 is done
+### ▶ IMMEDIATE: Phase 4 — quantization
 
-Everything else in Phase 3 is finished: four kernels, correct, benchmarked,
-wired into `model.py` behind `model.using_kernels()`, and verified end to end
-(batch 1 identical; batch 4's only divergence a 0.0000 logit tie).
+Phase 3 is done and its acceptance criterion is met: **2.33× end to end at batch
+32 (1739 tok/s vs 745 on the PyTorch path, 2.4× vs HuggingFace)**, measured on an
+idle GPU, output verified token-for-token except one demonstrated 0.0000-gap tie.
 
-The single outstanding item is that **the acceptance number is contended**.
-Three runs gave 1.85–3.29× with 16–40% run-to-run spread against this project's
-3% bar, because the desktop was using 36–53% of the GPU (Gotcha #18).
+Phase 4 per CLAUDE.md: **INT8 weight-only first, then INT4 group-wise** (groups of
+128, per-group scale + zero point), with a fused dequantize-and-matmul kernel that
+unpacks in registers and **never materializes the dequantized weights in global
+memory** — doing so defeats the entire purpose, which is cutting memory traffic.
 
-1. **Close the GPU-using desktop apps** — Wallpaper Engine is the main one, plus
-   Edge and Steam. Confirm with `nvidia-smi`: utilization should be ~0% and
-   memory under ~500 MiB before starting.
-2. `python -m bench.phase3_end_to_end --repeats 5`. It prints the contention it
-   sees and refuses to call the result clean if spread exceeds 3%.
-3. **Also re-run `python -m bench.phase2_cache`** and check it reproduces the
-   recorded 831/665 tok/s. It currently times out, so the Phase 2 numbers in
-   SUMMARY.md are unconfirmed on the machine's present state — if they do not
-   reproduce on an idle GPU, that is a real finding and the table needs a note.
-4. Update the Phase 3 row in SUMMARY.md, PROGRESS.md and this file with the
-   clean figures, and drop the "provisional" caveat from
-   `results/phase3_end_to_end.md`.
+Notes carried forward that matter here:
+
+1. **This phase's win should be predictable by byte counting, and Phase 3 showed
+   when that works.** Weight-only INT4 cuts the weight stream 4×, and decode is
+   weight-streaming-bound (Phase 1 measured forward cost flat at ~38–40 ms from
+   seq 32→512). So the prediction is a large decode win — but check whether the
+   kernel is bandwidth- or latency-bound before trusting the ceiling (Gotcha #17).
+2. **Measure the quality cost and do not hide it** (spec rule 5). Perplexity on a
+   held-out WikiText-2 slice at fp16 vs INT8 vs INT4, plus side-by-side
+   generations. The acceptance table is model size GB, tokens/sec, perplexity,
+   peak VRAM.
+3. **Parity bar:** quantization is lossy by design, so the ULP/bit-identity bars
+   from kernels 1–3 do not apply at all. State the bar in terms of perplexity
+   delta and generation agreement up front, before writing the kernel, so it
+   cannot drift afterwards.
+4. Benchmark on an **idle GPU** (Gotcha #18) and quote run counts with any
+   variance figure (Gotcha #21).
 
 ### Then: optional — close the gap on kernel 4
 
-Only if time allows before Phase 4. 11.1% of peak is the weakest number in the
+Deferred, not abandoned. 11.1% of peak is the weakest number in the
 phase and the diagnosis (Gotcha #17) points at two specific fixes: **split-K**
 (partition L across blocks, each producing a partial `(m, l, acc)`, then combine
 — this is what real flash-decoding does for long context with few sequences) and

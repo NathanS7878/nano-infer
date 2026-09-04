@@ -1,8 +1,8 @@
-> **Provisional — contended measurement.** The GPU was at 42% utilization from other processes when this ran, and run-to-run spread reached 31.1% against this project's 3% bar. The A/B ratio is more robust than the absolute tok/s, since both sides shared the same contention, but neither is a headline number until this is re-run on an idle GPU.
+> Measured on an idle GPU (2% utilization, 350 MiB in use). 3 runs after 2 discarded warmups; spread (max-min)/median 8.9%, cv (stdev/mean) 4.5%.
 
 | Batch | PyTorch tok/s | Custom kernels tok/s | Speedup |
 |---|---|---|---|
-| 1 | 6.1 | 15.2 | **2.48x** |
-| 4 | 22.5 | 60.6 | **2.69x** |
-| 16 | 88.0 | 257.6 | **2.93x** |
-| 32 | 180.4 | 417.2 | **2.31x** |
+| 1 | 25.1 | 58.6 | **2.34x** |
+| 4 | 97.6 | 225.9 | **2.32x** |
+| 16 | 376.8 | 905.1 | **2.40x** |
+| 32 | 745.1 | 1739.1 | **2.33x** |
