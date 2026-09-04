@@ -189,7 +189,7 @@ def main():
     table = ["| Precision | Model size | Compression | bits/wt | "
              + " | ".join(f"tok/s (batch {b})" for b in batches)
              + " | Peak VRAM | Perplexity | vs fp16 |",
-             "|---" * (6 + len(batches)) + "|"]
+             "|---" * (7 + len(batches)) + "|"]   # 7 fixed columns + one per batch
     for r in results:
         st = r["stats"]
         q = ppl.get(r["mode"], {})
