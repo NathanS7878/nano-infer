@@ -1,0 +1,98 @@
+{
+  "hardware": "NVIDIA GeForce RTX 3070 (see HARDWARE.md)",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "prompt_len": 32,
+  "new_tokens": 64,
+  "repeats": 3,
+  "gpu_before": {
+    "utilization_pct": 0,
+    "memory_used_mib": 349
+  },
+  "perplexity_source": "results/perplexity.json",
+  "results": [
+    {
+      "mode": "fp16",
+      "stats": {
+        "mode": "fp16",
+        "quantized_tensors": 0,
+        "bytes_original": 988065536,
+        "bytes_quantized": 988065536,
+        "compression": 1.0,
+        "bits_per_weight": 16.0
+      },
+      "batches": {
+        "1": {
+          "tok_s": 57.85770458050734,
+          "seconds": 1.1061621000008017,
+          "spread_pct": 4.040375275805847,
+          "cv_pct": 2.079410501319735,
+          "peak_vram_mib": 961.6494140625
+        },
+        "32": {
+          "tok_s": 1646.0454200839258,
+          "seconds": 1.2441940999997314,
+          "spread_pct": 5.764398014778779,
+          "cv_pct": 3.0379743295941095,
+          "peak_vram_mib": 1030.2626953125
+        }
+      },
+      "peak_vram_mib": 1030.2626953125
+    },
+    {
+      "mode": "int8",
+      "stats": {
+        "mode": "int8",
+        "quantized_tensors": 168,
+        "bytes_original": 988065536,
+        "bytes_quantized": 630847232,
+        "compression": 1.5662516785046303,
+        "bits_per_weight": 8.0135989010989
+      },
+      "batches": {
+        "1": {
+          "tok_s": 67.93771046101638,
+          "seconds": 0.9420393999989756,
+          "spread_pct": 8.82048033237878,
+          "cv_pct": 4.499238110658276,
+          "peak_vram_mib": 613.3046875
+        },
+        "32": {
+          "tok_s": 1274.9395259703474,
+          "seconds": 1.6063506999998935,
+          "spread_pct": 3.5987658236900844,
+          "cv_pct": 1.8055264418288117,
+          "peak_vram_mib": 681.7470703125
+        }
+      },
+      "peak_vram_mib": 681.7470703125
+    },
+    {
+      "mode": "int4",
+      "stats": {
+        "mode": "int4",
+        "quantized_tensors": 168,
+        "bytes_original": 988065536,
+        "bytes_quantized": 459712256,
+        "compression": 2.1493130172278896,
+        "bits_per_weight": 4.1875
+      },
+      "batches": {
+        "1": {
+          "tok_s": 67.12917268122935,
+          "seconds": 0.9533857999995234,
+          "spread_pct": 4.973726271038054,
+          "cv_pct": 2.737925303134929,
+          "peak_vram_mib": 450.1328125
+        },
+        "32": {
+          "tok_s": 829.1001522622807,
+          "seconds": 2.4701478999995743,
+          "spread_pct": 0.37249186568475057,
+          "cv_pct": 0.18761622836772354,
+          "peak_vram_mib": 518.5751953125
+        }
+      },
+      "peak_vram_mib": 518.5751953125
+    }
+  ]
+}

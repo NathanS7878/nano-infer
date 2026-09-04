@@ -42,7 +42,7 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-04, Phase 4 step 2 (dequant-matmul kernel measured)._
+_Last updated: 2026-09-04, Phase 4 COMPLETE (acceptance table done)._
 
 | Phase | Status | Headline |
 |---|---|---|
@@ -50,11 +50,11 @@ _Last updated: 2026-09-04, Phase 4 step 2 (dequant-matmul kernel measured)._
 | 1 — Correct but slow | ✅ Complete | From-scratch forward pass, token-for-token vs HF |
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
 | 3 — Custom CUDA kernels | ✅ Complete | 4/4 kernels, wired in, output verified. **End-to-end 2.33× at batch 32 (1739 tok/s), 2.4× vs HuggingFace** |
-| 4 — Quantization | ◐ **Kernel measured** | INT8 lossless / INT4 +21.1% ppl, 2.15× smaller. Kernel **1.8× @ batch 1, 0.23× @ batch 32** (crossover ~batch 4-8). Wiring left |
-| 5 — Make it legible | ⬜ Not started | README table, diagram, WRITEUP.md, limitations |
+| 4 — Quantization | ✅ Complete | **INT8 lossless, 1.57× smaller, 1.17× tok/s @ b1.** INT4 2.15× smaller, **1.99× less VRAM**, +21.1% ppl |
+| 5 — Make it legible | ⬜ **NEXT** | README table, diagram, WRITEUP.md, limitations |
 
-- **Tests:** 114 passing (`python -m pytest tests/ -q`)
-- **Commits:** 22 on `main`, clean tree
+- **Tests:** 118 passing (`python -m pytest tests/ -q`)
+- **Commits:** 23 on `main`, clean tree
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -93,6 +93,7 @@ $env:PYTHONPATH="C:\Users\Nathan stevens\OneDrive\Projects\nano-infer"
 | `-m bench.phase3_end_to_end` | **The Phase 3 acceptance number**: tokens/sec, kernels off vs on |
 | `-m bench.perplexity` | Quality cost of INT8/INT4 on WikiText-2, with error bars |
 | `-m bench.quant_speed` | Dequant-matmul speed; **the batch-size crossover** |
+| `-m bench.quant_acceptance` | **The Phase 4 acceptance table** |
 
 Toolchain is installed and working: nvcc 12.4 (conda-forge), MSVC 14.44, ninja.
 Full build notes in `HARDWARE.md`. Kernels JIT-compile on first use (~40 s), then cache.
@@ -455,29 +456,40 @@ is 0.48–1.00× the reference's on every shape.
 
 ## Next actions
 
-### ▶ IMMEDIATE: Phase 4 step 3 — wire it in and build the acceptance table
+### ▶ IMMEDIATE: Phase 5 — make it legible
 
-Steps 1 and 2 are done: both schemes implemented and tested, quality measured
-(INT8 lossless within error, INT4 g128 +21.1% perplexity), and the kernel
-measured (1.8x at batch 1, 0.23x at batch 32, crossover ~batch 4-8, Gotchas #25
-and #26). What is missing is the tokens/sec and peak-VRAM columns of the
-acceptance table, which need the engine actually running on packed weights.
+Phases 0-4 are complete. What is left decides whether any of it lands with a
+reader: per CLAUDE.md the repo "is worthless to a recruiter who cannot see the
+result in 30 seconds".
 
-1. **Store packed weights, not round-tripped fp16.** `quantize_weights` today
-   returns dequantized fp16 (correct for quality, useless for VRAM). Add a path
-   that keeps `Int4Tensor`/`Int8Tensor` and routes `F.linear` through the
-   kernel. **The VRAM win only exists if the fp16 copy is NOT also resident** —
-   that is the entire memory claim, so assert it with
-   `torch.cuda.max_memory_allocated()`.
-2. **Decide the routing and state it.** The kernel loses above batch ~4. Options,
-   both defensible, but pick one and say why: (a) always quantized — best VRAM,
-   worse batched throughput; (b) quantized under the crossover, fp16 above —
-   best speed, no VRAM win because both copies must exist. Do not silently
-   fall back and then quote the memory saving.
-3. Acceptance table per CLAUDE.md: **model size GB, tokens/sec, perplexity,
-   peak VRAM** at fp16 / INT8 / INT4. Report tokens/sec at batch 1 AND batch 32
-   — one number would hide the crossover.
-4. Idle GPU (Gotcha #18), quote run counts with variance (Gotcha #21).
+1. **README opening with the benchmark table.** nano-infer vs HuggingFace vs
+   vLLM, same hardware/model/prompts, methodology stated, link to the script.
+   The **vLLM row has never been run** and is a known open item - either run it
+   or say plainly that it is absent and why.
+2. **One architecture diagram**: request in, through the cache, through the
+   kernels, token out.
+3. **`WRITEUP.md`, 800-1200 words on ONE non-obvious lesson.** Five strong
+   candidates now, all with before/after numbers already in PROGRESS.md:
+   - **#4** paged cache: blamed memory traffic, was 97% Python, found by
+     profiling, 3.62x fix. (The original pick.)
+   - **#15** `torch.softmax` fp64 on CUDA returning wrong values, which made a
+     correct kernel look wrong by 0.18 - "two implementations agreeing with each
+     other and not with the oracle indicts the oracle".
+   - **#17** decode attention predicted ~24x, delivered 2.48x, with the scaling
+     experiment that showed latency-bound rather than bandwidth-bound.
+   - **#21** the variance metric that got WORSE when measured harder, because
+     (max-min)/median is sample-size dependent.
+   - **#26** INT8 and INT4 measuring identical speed, proving neither was
+     bandwidth-bound and the byte-counted ceilings never applied.
+   **#15 or #17 are the strongest** - both are "I was wrong, here is how I found
+   out", which is what the spec says interviewers remember.
+4. **Limitations section**, from what is already recorded: prefill is one
+   request at a time (`engine.py`); decode attention sits at 11.1% of peak with
+   split-K identified but not done; the quantized matmul loses above batch 4;
+   INT4 costs 21% perplexity with RTN and no calibration; benchmarks are
+   single-GPU on a machine that shares its card with a desktop.
+5. **Fix the MiniDynamo cross-link**, still a placeholder in README.md, and add
+   the reciprocal link from MiniDynamo.
 
 ### Then: Phase 5 — make it legible
 

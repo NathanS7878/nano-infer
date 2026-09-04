@@ -321,3 +321,70 @@ def quantize_weights(weights: dict, mode: str, group: int = INT4_GROUP) -> tuple
         "max_rel_err": max_rel,
         "mean_rel_err": rel_sum / n_quant if n_quant else 0.0,
     }
+
+
+# ---------------------------------------------------------------------------
+# The packed path: keep the quantized form, and ONLY the quantized form
+# ---------------------------------------------------------------------------
+
+def pack_weights(weights: dict, mode: str, group: int = INT4_GROUP) -> tuple:
+    """Return (weights dict holding PACKED tensors, stats).
+
+    Unlike `quantize_weights`, which round-trips back to fp16 to isolate the
+    quality question, this keeps `Int8Tensor` / `Int4Tensor` objects. Nothing
+    downstream ever sees a dequantized copy, which is the only configuration in
+    which the memory saving is real.
+
+    THE DESIGN DECISION THIS ENCODES. The fused kernel beats cuBLAS at batch 1-4
+    and loses above it (Gotcha #25). Two responses were available:
+
+      (a) always quantized  -> the VRAM saving is real; batched decode is slower
+      (b) quantized below the crossover, fp16 above -> best speed, but BOTH
+          copies must be resident, so the memory saving evaporates
+
+    This project takes (a), because the memory reduction is the claim INT4
+    actually delivers on this hardware, and (b) would keep the headline number
+    while quietly making it false. The throughput cost is reported in the
+    acceptance table rather than engineered around.
+    """
+    if mode == "fp16":
+        total = sum(v.numel() * v.element_size() for v in weights.values())
+        return dict(weights), {
+            "mode": "fp16", "quantized_tensors": 0,
+            "bytes_original": total, "bytes_quantized": total,
+            "compression": 1.0, "bits_per_weight": 16.0,
+        }
+
+    out = {}
+    n_quant = 0
+    total_orig = 0
+    total_new = 0
+    quant_params = 0
+    quant_new = 0
+
+    for name, w in weights.items():
+        nbytes = w.numel() * w.element_size()
+        total_orig += nbytes
+        if not is_quantizable(name, w):
+            out[name] = w
+            total_new += nbytes
+            continue
+        t = quantize_int8(w) if mode == "int8" else quantize_int4(w, group)
+        out[name] = t
+        n_quant += 1
+        total_new += t.nbytes()
+        quant_new += t.nbytes()
+        quant_params += w.numel()
+
+    return out, {
+        "mode": mode,
+        "quantized_tensors": n_quant,
+        "bytes_original": total_orig,
+        "bytes_quantized": total_new,
+        "compression": total_orig / total_new if total_new else 1.0,
+        "bits_per_weight": quant_new * 8 / quant_params if quant_params else 0.0,
+    }
+
+
+def is_packed(w) -> bool:
+    return isinstance(w, (Int8Tensor, Int4Tensor))

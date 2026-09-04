@@ -339,3 +339,59 @@ def test_quantized_matmul_never_materializes_the_weight(kmod):
     assert peak_extra < dequantized_bytes // 4, (
         f"allocated {peak_extra} B — that looks like a dequantized weight copy, "
         "which would move more bytes than fp16 and defeat the whole point")
+
+
+# --- the packed path (what the engine actually runs) ------------------------
+
+@pytest.mark.parametrize("mode", ["int8", "int4"])
+def test_packed_weights_generate_identically_to_the_round_trip(kmod, mode):
+    """The packed path and the round-tripped-fp16 path use the SAME quantization
+    grid, so they must produce the same tokens.
+
+    This is what lets the acceptance table carry the perplexity number measured
+    on the round-trip path: if the two agreed only approximately, the quality
+    column would be describing a different model than the speed column.
+    """
+    weights = M.load_weights()
+    cf = M.QwenConfig()
+    g = torch.Generator(device="cpu").manual_seed(0)
+    ids = torch.randint(1000, 5000, (2, 12), generator=g).to(cfg.DEVICE)
+
+    round_trip, _ = Q.quantize_weights(weights, mode)
+    packed, stats = Q.pack_weights(weights, mode)
+
+    with M.using_kernels(True):
+        a = M.generate_paged(ids, round_trip, cf, 20)
+        b = M.generate_paged(ids, packed, cf, 20)
+
+    agree = int((a == b).sum())
+    print(f"\n[packed {mode}] {agree}/{a.numel()} tokens match the round-trip "
+          f"reference; {stats['bytes_quantized']/1e6:.1f} MB, "
+          f"{stats['compression']:.2f}x")
+    assert agree == a.numel(), (
+        f"packed and round-trip paths disagree on {a.numel()-agree} tokens — "
+        "the acceptance table's perplexity column would not describe the model "
+        "its speed column measures")
+
+
+@pytest.mark.parametrize("mode", ["int8", "int4"])
+def test_packed_weights_hold_no_fp16_copy(mode):
+    """The memory claim, asserted rather than assumed.
+
+    Quantization only saves VRAM if the fp16 originals are gone. A packed dict
+    must contain NO float tensor for any quantizable projection — if one
+    survived, the model would be larger than fp16, not smaller.
+    """
+    weights = M.load_weights()
+    packed, stats = Q.pack_weights(weights, mode)
+
+    # match by NAME: is_quantizable() inspects a tensor's rank, and a packed
+    # entry is not a tensor at all
+    leaked = [n for n, w in packed.items()
+              if n.endswith(Q.QUANTIZABLE_SUFFIXES) and torch.is_tensor(w)]
+    assert not leaked, f"{len(leaked)} projections still hold fp16 tensors: {leaked[:3]}"
+
+    held = sum(w.nbytes() if Q.is_packed(w) else w.numel() * w.element_size()
+               for w in packed.values())
+    assert held == stats["bytes_quantized"], "reported size does not match what is held"
+    assert held < sum(w.numel() * w.element_size() for w in weights.values())

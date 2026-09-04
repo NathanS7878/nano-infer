@@ -1302,6 +1302,65 @@ zero-point 15; `lo == 0` → zero, correctly. Constant groups now reconstruct
 **exactly** (0.00e+00 error) at every magnitude tested. Degenerate cases are
 where guards get written carelessly, which is why the test used one.
 
+### Step 3: packed weights end to end, and the acceptance table
+
+The engine now runs on packed weights: `pack_weights` keeps `Int8Tensor` /
+`Int4Tensor` objects and `model._qlinear` routes them to the fused kernel, so
+**no fp16 copy of a projection is ever resident**. A test asserts that by name
+rather than trusting it, because the memory claim is false the moment one
+survives.
+
+**The routing decision, stated rather than hidden.** The kernel wins at batch
+1–4 and loses above it. Two responses were available:
+
+- **(a) always quantized** — the VRAM saving is real; batched decode is slower
+- **(b) quantized below the crossover, fp16 above** — best speed, but both
+  copies must be resident, so the memory saving evaporates
+
+This project takes **(a)**, because the memory reduction is the claim INT4
+actually delivers on this hardware, and (b) would keep the headline number while
+quietly making it untrue. The throughput cost appears in the table instead of
+being engineered around.
+
+#### The acceptance table
+
+Idle GPU (0% utilization, 349 MiB), prompt 32, 64 new tokens, median of 3 runs.
+All rows on packed weights.
+
+| Precision | Weights | Compression | bits/wt | tok/s (batch 1) | tok/s (batch 32) | Peak VRAM | Perplexity | vs fp16 |
+|---|---|---|---|---|---|---|---|---|
+| fp16 | 988 MB | 1.00× | 16.00 | 57.9 | **1646.0** | 1030 MiB | 22.42 | — |
+| **INT8** | 631 MB | 1.57× | 8.01 | **67.9** | 1274.9 | 682 MiB | 22.29 | −0.55% |
+| INT4 | 460 MB | 2.15× | 4.19 | 67.1 | 829.1 | **519 MiB** | 27.15 | +21.10% |
+
+Relative throughput: INT8 **1.17× at batch 1, 0.77× at batch 32**; INT4 **1.16×
+and 0.50×**. Peak VRAM 1030 → 519 MiB, a **1.99×** reduction.
+
+Two things worth reading off it.
+
+**The end-to-end batch-1 win (1.17×) is far smaller than the kernel's 1.8×.**
+Both numbers are correct. Only 72.4% of the weights are quantized — the tied
+embedding stays fp16 — and a decode step also spends time in attention, the KV
+cache, RMSNorm, RoPE and SwiGLU, none of which quantization touches. Amdahl,
+measured rather than assumed.
+
+**INT4 is not faster than INT8 anywhere**, at either batch size, despite holding
+half the bits. That is the launch-bound finding from step 2 surviving into the
+end-to-end number: neither scheme is bandwidth-bound at these shapes, so halving
+the bytes buys nothing in time. INT4's entire advantage over INT8 here is
+**VRAM**, and it pays 21% perplexity for it.
+
+#### The conclusion this phase actually supports
+
+**INT8 is the configuration worth shipping at this model size.** It is lossless
+within measurement error, 1.57× smaller, faster at batch 1, and costs 23%
+throughput at batch 32. INT4 doubles the memory saving and buys nothing in speed
+while costing 21% perplexity — on a 0.5B model with round-to-nearest and no
+calibration, that is the wrong trade unless VRAM is the binding constraint.
+
+That is a narrower claim than "we implemented INT4 and got 2.15× compression",
+and it is the one the measurements support.
+
 ---
 
 ## 8. What was learned
@@ -1419,6 +1478,10 @@ where guards get written carelessly, which is why the test used one.
     bandwidth-bound, INT4 would be ~2× faster. Identical timings, plus a ~33 µs
     floor at every matrix size, said both were launch-bound — so the byte-counted
     2×/4× ceilings were never in play and quoting them as achieved would be wrong.
+30. **Amdahl, measured.** The dequant-matmul is 1.8× in isolation and 1.17×
+    end-to-end, because only 72.4% of weights are quantized and a decode step
+    also spends time in attention, the cache, and four other kernels. Both
+    numbers are correct; only one of them is the product.
 29. **A degenerate-case test is worth writing precisely because guards get
     written carelessly.** A constant quantization group (hi == lo) made scale
     zero; the obvious guard substituted 1.0 and reconstructed the entire group
@@ -1440,7 +1503,7 @@ where guards get written carelessly, which is why the test used one.
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
 | 2 — KV cache & batching | ✅ Complete | Contiguous cache + prefill/decode split (15.6× at batch 32), paged cache (3.8× memory), continuous batching (1.55× on a request stream) |
 | 3 — Custom CUDA kernels | ✅ Complete | RMSNorm 7.7× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention 2.48× @ 11.1%. **End-to-end 2.33× (2.4× vs HF) at batch 32** |
-| 4 — Quantization | ◐ Kernel done | INT8 lossless / INT4 +21.1% ppl, 2.15× smaller. Kernel: **1.8× at batch 1, 0.23× at batch 32** — crossover measured. End-to-end wiring left |
+| 4 — Quantization | ✅ Complete | **INT8: lossless, 1.57× smaller, 1.17× tok/s at batch 1.** INT4: 2.15× smaller, 1.99× less VRAM, +21.1% ppl. Crossover reported |
 | 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |
 
 ### Phase 2 specifics
@@ -1484,6 +1547,7 @@ pip install transformers safetensors tokenizers huggingface_hub datasets acceler
 | `python -m bench.phase3_end_to_end` | End-to-end tokens/sec, kernels off vs on |
 | `python -m bench.perplexity` | Quality cost of INT8/INT4 on WikiText-2, with error bars |
 | `python -m bench.quant_speed` | Dequant-matmul speed and the batch-size crossover |
+| `python -m bench.quant_acceptance` | **The Phase 4 acceptance table**: size, tok/s, perplexity, VRAM |
 
 ### Repository layout
 

@@ -253,12 +253,12 @@ def mlp(x: torch.Tensor, weights: dict, layer: int,
     it opens. Fusing this elementwise step is the Phase 3 SwiGLU kernel.
     """
     p = f"model.layers.{layer}.mlp."
-    gate = F.linear(x, weights[p + "gate_proj.weight"])              # [b,seq,4864]
-    up = F.linear(x, weights[p + "up_proj.weight"])                 # [b,seq,4864]
+    gate = _qlinear(x, weights[p + "gate_proj.weight"])             # [b,seq,4864]
+    up = _qlinear(x, weights[p + "up_proj.weight"])                 # [b,seq,4864]
     # kernel 2 when opted in; the default keeps Phase 1 on the reference path.
     hidden = (_k().swiglu_forward(gate, up) if use_kernels
               else F.silu(gate) * up)
-    return F.linear(hidden, weights[p + "down_proj.weight"])         # [b,seq,896]
+    return _qlinear(hidden, weights[p + "down_proj.weight"])         # [b,seq,896]
 
 
 # --- assembly: block, full forward, greedy decode --------------------------
@@ -348,6 +348,28 @@ def greedy_decode(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
 _KERNELS_ENABLED = False
 
 
+def _qlinear(x: torch.Tensor, w, bias=None) -> torch.Tensor:
+    """Linear over a weight that may be an fp16 tensor OR a packed quantized one.
+
+    The packed branch routes to the fused dequant-matmul kernel, which unpacks
+    in registers — no fp16 copy of the weight is ever created, which is the only
+    way the memory saving is real. Plain tensors fall through to F.linear, so
+    every existing call site is unchanged when weights are not quantized.
+
+    Bias is applied after: the kernel computes x @ W^T only, and q/k/v carry a
+    bias in this model while o_proj and the MLP do not.
+    """
+    from . import quant as _q
+    if _q.is_packed(w):
+        if isinstance(w, _q.Int4Tensor):
+            y = _k().int4_matmul(x, w.packed, w.scale, w.zero, w.shape[1], w.group)
+        else:
+            y = _k().int8_matmul(x, w.q, w.scale)
+        return y if bias is None else y + bias
+    return F.linear(x, w, bias)
+
+
+
 def kernels_enabled() -> bool:
     return _KERNELS_ENABLED
 
@@ -419,9 +441,9 @@ def attention_cached(x: torch.Tensor, weights: dict, layer: int,
     b, n, _ = x.shape
     p = f"model.layers.{layer}.self_attn."
 
-    q = F.linear(x, weights[p + "q_proj.weight"], weights[p + "q_proj.bias"])
-    k = F.linear(x, weights[p + "k_proj.weight"], weights[p + "k_proj.bias"])
-    v = F.linear(x, weights[p + "v_proj.weight"], weights[p + "v_proj.bias"])
+    q = _qlinear(x, weights[p + "q_proj.weight"], weights[p + "q_proj.bias"])
+    k = _qlinear(x, weights[p + "k_proj.weight"], weights[p + "k_proj.bias"])
+    v = _qlinear(x, weights[p + "v_proj.weight"], weights[p + "v_proj.bias"])
 
     q = q.view(b, n, cf.num_q_heads, cf.head_dim).transpose(1, 2)     # [b,14,n,64]
     k = k.view(b, n, cf.num_kv_heads, cf.head_dim).transpose(1, 2)    # [b, 2,n,64]
@@ -452,7 +474,7 @@ def attention_cached(x: torch.Tensor, weights: dict, layer: int,
     probs = torch.softmax(scores, dim=-1).to(x.dtype)
     out = probs @ v_all                                               # [b,14,n,64]
     out = out.transpose(1, 2).reshape(b, n, cf.q_dim)
-    return F.linear(out, weights[p + "o_proj.weight"])
+    return _qlinear(out, weights[p + "o_proj.weight"])
 
 
 def decoder_block_cached(x: torch.Tensor, weights: dict, layer: int,
@@ -551,9 +573,9 @@ def attention_paged(x: torch.Tensor, weights: dict, layer: int,
     b, n, _ = x.shape
     p = f"model.layers.{layer}.self_attn."
 
-    q = F.linear(x, weights[p + "q_proj.weight"], weights[p + "q_proj.bias"])
-    k = F.linear(x, weights[p + "k_proj.weight"], weights[p + "k_proj.bias"])
-    v = F.linear(x, weights[p + "v_proj.weight"], weights[p + "v_proj.bias"])
+    q = _qlinear(x, weights[p + "q_proj.weight"], weights[p + "q_proj.bias"])
+    k = _qlinear(x, weights[p + "k_proj.weight"], weights[p + "k_proj.bias"])
+    v = _qlinear(x, weights[p + "v_proj.weight"], weights[p + "v_proj.bias"])
 
     q = q.view(b, n, cf.num_q_heads, cf.head_dim).transpose(1, 2)
     k = k.view(b, n, cf.num_kv_heads, cf.head_dim).transpose(1, 2)
@@ -573,7 +595,7 @@ def attention_paged(x: torch.Tensor, weights: dict, layer: int,
             cache.k[layer], cache.v[layer],  # the pool, walked in place
             plan.read, lengths, scale)       # no gather, no repeat_kv
         out = out.reshape(b, n, cf.q_dim)
-        return F.linear(out, weights[p + "o_proj.weight"])
+        return _qlinear(out, weights[p + "o_proj.weight"])
 
     k_all, v_all = cache.gather(layer, plan)                          # [b,kvh,L,hd]
 
@@ -586,7 +608,7 @@ def attention_paged(x: torch.Tensor, weights: dict, layer: int,
 
     probs = torch.softmax(scores, dim=-1).to(x.dtype)
     out = (probs @ v_all).transpose(1, 2).reshape(b, n, cf.q_dim)
-    return F.linear(out, weights[p + "o_proj.weight"])
+    return _qlinear(out, weights[p + "o_proj.weight"])
 
 
 def forward_paged(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",

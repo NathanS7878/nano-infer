@@ -986,4 +986,64 @@ where guards get written carelessly, which is why the test used one.
 
 - [x] Fused dequant-matmul kernel (unpack in registers, never materialize)
 - [x] Speed measured, crossover found at batch 4-8
-- [ ] Wire into model.py + acceptance table (size, tokens/sec, perplexity, VRAM)
+### Step 3: packed weights end to end, and the acceptance table
+
+The engine now runs on packed weights: `pack_weights` keeps `Int8Tensor` /
+`Int4Tensor` objects and `model._qlinear` routes them to the fused kernel, so
+**no fp16 copy of a projection is ever resident**. A test asserts that by name
+rather than trusting it, because the memory claim is false the moment one
+survives.
+
+**The routing decision, stated rather than hidden.** The kernel wins at batch
+1–4 and loses above it. Two responses were available:
+
+- **(a) always quantized** — the VRAM saving is real; batched decode is slower
+- **(b) quantized below the crossover, fp16 above** — best speed, but both
+  copies must be resident, so the memory saving evaporates
+
+This project takes **(a)**, because the memory reduction is the claim INT4
+actually delivers on this hardware, and (b) would keep the headline number while
+quietly making it untrue. The throughput cost appears in the table instead of
+being engineered around.
+
+#### The acceptance table
+
+Idle GPU (0% utilization, 349 MiB), prompt 32, 64 new tokens, median of 3 runs.
+All rows on packed weights.
+
+| Precision | Weights | Compression | bits/wt | tok/s (batch 1) | tok/s (batch 32) | Peak VRAM | Perplexity | vs fp16 |
+|---|---|---|---|---|---|---|---|---|
+| fp16 | 988 MB | 1.00× | 16.00 | 57.9 | **1646.0** | 1030 MiB | 22.42 | — |
+| **INT8** | 631 MB | 1.57× | 8.01 | **67.9** | 1274.9 | 682 MiB | 22.29 | −0.55% |
+| INT4 | 460 MB | 2.15× | 4.19 | 67.1 | 829.1 | **519 MiB** | 27.15 | +21.10% |
+
+Relative throughput: INT8 **1.17× at batch 1, 0.77× at batch 32**; INT4 **1.16×
+and 0.50×**. Peak VRAM 1030 → 519 MiB, a **1.99×** reduction.
+
+Two things worth reading off it.
+
+**The end-to-end batch-1 win (1.17×) is far smaller than the kernel's 1.8×.**
+Both numbers are correct. Only 72.4% of the weights are quantized — the tied
+embedding stays fp16 — and a decode step also spends time in attention, the KV
+cache, RMSNorm, RoPE and SwiGLU, none of which quantization touches. Amdahl,
+measured rather than assumed.
+
+**INT4 is not faster than INT8 anywhere**, at either batch size, despite holding
+half the bits. That is the launch-bound finding from step 2 surviving into the
+end-to-end number: neither scheme is bandwidth-bound at these shapes, so halving
+the bytes buys nothing in time. INT4's entire advantage over INT8 here is
+**VRAM**, and it pays 21% perplexity for it.
+
+#### The conclusion this phase actually supports
+
+**INT8 is the configuration worth shipping at this model size.** It is lossless
+within measurement error, 1.57× smaller, faster at batch 1, and costs 23%
+throughput at batch 32. INT4 doubles the memory saving and buys nothing in speed
+while costing 21% perplexity — on a 0.5B model with round-to-nearest and no
+calibration, that is the wrong trade unless VRAM is the binding constraint.
+
+That is a narrower claim than "we implemented INT4 and got 2.15× compression",
+and it is the one the measurements support.
+
+- [x] Wire into model.py + acceptance table (size, tokens/sec, perplexity, VRAM)
+- [x] **PHASE 4 COMPLETE**
