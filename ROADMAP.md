@@ -42,7 +42,7 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-04, Phase 3 COMPLETE (clean end-to-end run done)._
+_Last updated: 2026-09-04, Phase 4 step 1 (quantization quality measured)._
 
 | Phase | Status | Headline |
 |---|---|---|
@@ -50,11 +50,11 @@ _Last updated: 2026-09-04, Phase 3 COMPLETE (clean end-to-end run done)._
 | 1 — Correct but slow | ✅ Complete | From-scratch forward pass, token-for-token vs HF |
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
 | 3 — Custom CUDA kernels | ✅ Complete | 4/4 kernels, wired in, output verified. **End-to-end 2.33× at batch 32 (1739 tok/s), 2.4× vs HuggingFace** |
-| 4 — Quantization | ⬜ **NEXT** | INT8 → INT4 group-wise + fused dequant-matmul |
+| 4 — Quantization | ◐ **Quality measured** | INT8 lossless within error; INT4 g128 **+21.1%** ppl, 2.15× smaller. Kernel next |
 | 5 — Make it legible | ⬜ Not started | README table, diagram, WRITEUP.md, limitations |
 
-- **Tests:** 76 passing (`python -m pytest tests/ -q`)
-- **Commits:** 19 on `main`, clean tree
+- **Tests:** 87 passing (`python -m pytest tests/ -q`)
+- **Commits:** 21 on `main`, clean tree
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -91,6 +91,7 @@ $env:PYTHONPATH="C:\Users\Nathan stevens\OneDrive\Projects\nano-infer"
 | `-m bench.kernel_rope` | Fused RoPE vs PyTorch + bandwidth utilization |
 | `-m bench.kernel_attention` | Decode attention; fusion win and gather win separated |
 | `-m bench.phase3_end_to_end` | **The Phase 3 acceptance number**: tokens/sec, kernels off vs on |
+| `-m bench.perplexity` | Quality cost of INT8/INT4 on WikiText-2, with error bars |
 
 Toolchain is installed and working: nvcc 12.4 (conda-forge), MSVC 14.44, ninja.
 Full build notes in `HARDWARE.md`. Kernels JIT-compile on first use (~40 s), then cache.
@@ -106,6 +107,7 @@ nano_infer/
   model.py       the engine. Phase 1 reference + Phase 2 cached/paged paths
   cache.py       KVCache (contiguous), PagedKVCache, BlockAllocator, SlotPlan
   engine.py      Request, RunStats, ContinuousBatchingEngine (static + continuous)
+  quant.py       INT8 per-channel + INT4 group-wise; the quality reference
   kernels/
     __init__.py  JIT loader — handles ninja/MSVC/CUDA-libpath quirks
     bindings.cpp PYBIND11_MODULE for all kernels (one .cu cannot own it once
@@ -235,6 +237,19 @@ These were all expensive to discover. Read before debugging anything.
     same direction as PyTorch, which a plain "close to the reference" test would
     allow.
 
+17. **Byte counting predicts a ceiling only for a kernel that is actually
+    bandwidth-bound.** Kernels 1–3 landed within 1% of their predictions; decode
+    attention predicted ~24× and delivered 2.48×. The decisive experiment: hold
+    the KV pool fixed and vary only how many query heads share it — 2→8 query
+    heads quadruples the blocks and leaves wall time **flat** (281.8 → 292.0 µs).
+    Not bandwidth-bound, not duplicated-read-bound: **latency-bound**, because the
+    online-softmax recurrence is sequential across tiles and each tile costs
+    several `__syncthreads()`. The fix that followed (block size 128 → 512/1024)
+    gave 7.9% → 11.1% of peak, and **3.6× at batch 1**, where there are only 14
+    blocks so all latency hiding must come from inside the block.
+
+---
+
 18. **Check what else is using the GPU BEFORE trusting any benchmark on this
     machine.** The desktop (Wallpaper Engine, Edge, Steam) can hold 36–53% GPU
     utilization and ~5.8 of 8 GB. Under that load, three runs of the same A/B
@@ -246,15 +261,6 @@ These were all expensive to discover. Read before debugging anything.
     into `results/*.md` itself, because a warning printed only to stdout does
     not survive being pasted into a README. **Target before publishing a number:
     utilization ~0%, memory under ~500 MiB.**
-
-21. **The project's stability metric is sample-size dependent.** `bench/harness.py`
-    uses `(max - min) / median`, which GROWS as you add runs — measured 6.4% at
-    5 runs and 13.9% at 9, on an idle GPU doing identical work. So "variance
-    < 3%" only means something with its run count attached, and adding repeats
-    to "get a cleaner number" makes the reported figure worse.
-    `bench/phase3_end_to_end.py` defaults to the harness's warmup 2 / runs 3 so
-    the figure is comparable, and also reports **cv = stdev/mean**, which is
-    sample-size stable. Use the cv when comparing runs with different repeats.
 
 19. **Only TWO of the four kernels are bit-identical.** SwiGLU and RoPE are
     0 ULP / 100% exact (elementwise, no reduction, no reordering). **RMSNorm is
@@ -270,18 +276,29 @@ These were all expensive to discover. Read before debugging anything.
     cause, that SwiGLU/RoPE contribute nothing, and that prefill never reaches
     the decode kernel. Cheaper and far more convincing than a tolerance.
 
-17. **Byte counting predicts a ceiling only for a kernel that is actually
-    bandwidth-bound.** Kernels 1–3 landed within 1% of their predictions; decode
-    attention predicted ~24× and delivered 2.48×. The decisive experiment: hold
-    the KV pool fixed and vary only how many query heads share it — 2→8 query
-    heads quadruples the blocks and leaves wall time **flat** (281.8 → 292.0 µs).
-    Not bandwidth-bound, not duplicated-read-bound: **latency-bound**, because the
-    online-softmax recurrence is sequential across tiles and each tile costs
-    several `__syncthreads()`. The fix that followed (block size 128 → 512/1024)
-    gave 7.9% → 11.1% of peak, and **3.6× at batch 1**, where there are only 14
-    blocks so all latency hiding must come from inside the block.
+21. **The project's stability metric is sample-size dependent.** `bench/harness.py`
+    uses `(max - min) / median`, which GROWS as you add runs — measured 6.4% at
+    5 runs and 13.9% at 9, on an idle GPU doing identical work. So "variance
+    < 3%" only means something with its run count attached, and adding repeats
+    to "get a cleaner number" makes the reported figure worse.
+    `bench/phase3_end_to_end.py` defaults to the harness's warmup 2 / runs 3 so
+    the figure is comparable, and also reports **cv = stdev/mean**, which is
+    sample-size stable. Use the cv when comparing runs with different repeats.
 
----
+22. **WikiText-2 needs a namespaced dataset id now.** `load_dataset("wikitext",
+    ...)` raises `HfUriError` on huggingface_hub >= 1.0, which requires
+    `namespace/name`. Use `Salesforce/wikitext`, same data.
+
+23. **Round the quantization scale to its STORED precision before choosing
+    codes.** Computing a scale in fp32, picking codes against it, then storing
+    the scale in fp16 breaks the half-step error guarantee — measured 535
+    violations, because at q=127 an fp16 scale rounding shifts the
+    reconstruction by ~0.06 of a step. Quantize with exactly the value
+    dequantization will use. Free accuracy.
+
+24. **Windows writes `results/*.md` as cp1252 unless told otherwise.** A `Δ` in
+    a table header crashes `write_text`. Pass `encoding="utf-8"` on every
+    artifact write.
 
 ## Progress detail
 
@@ -420,34 +437,41 @@ is 0.48–1.00× the reference's on every shape.
 
 ## Next actions
 
-### ▶ IMMEDIATE: Phase 4 — quantization
+### ▶ IMMEDIATE: Phase 4 step 2 — the fused dequant-matmul kernel
 
-Phase 3 is done and its acceptance criterion is met: **2.33× end to end at batch
-32 (1739 tok/s vs 745 on the PyTorch path, 2.4× vs HuggingFace)**, measured on an
-idle GPU, output verified token-for-token except one demonstrated 0.0000-gap tie.
+Step 1 is done: both schemes implemented, tested, and their **quality** cost
+measured (`bench/perplexity.py`). INT8 is lossless within measurement error;
+INT4 g128 costs +21.1% perplexity, g32 costs +14.5%. What is NOT yet measured is
+the speed and VRAM half of the acceptance table, because nothing is packed yet —
+`quantize_dequantize` hands back fp16, which is correct for quality and useless
+for speed.
 
-Phase 4 per CLAUDE.md: **INT8 weight-only first, then INT4 group-wise** (groups of
-128, per-group scale + zero point), with a fused dequantize-and-matmul kernel that
-unpacks in registers and **never materializes the dequantized weights in global
-memory** — doing so defeats the entire purpose, which is cutting memory traffic.
+The kernel, per CLAUDE.md: **unpack INT4 in registers, multiply in fp16, and
+never materialize the dequantized weight matrix in global memory** — doing so
+would move exactly as many bytes as fp16 and defeat the entire point.
 
-Notes carried forward that matter here:
-
-1. **This phase's win should be predictable by byte counting, and Phase 3 showed
-   when that works.** Weight-only INT4 cuts the weight stream 4×, and decode is
-   weight-streaming-bound (Phase 1 measured forward cost flat at ~38–40 ms from
-   seq 32→512). So the prediction is a large decode win — but check whether the
-   kernel is bandwidth- or latency-bound before trusting the ceiling (Gotcha #17).
-2. **Measure the quality cost and do not hide it** (spec rule 5). Perplexity on a
-   held-out WikiText-2 slice at fp16 vs INT8 vs INT4, plus side-by-side
-   generations. The acceptance table is model size GB, tokens/sec, perplexity,
-   peak VRAM.
-3. **Parity bar:** quantization is lossy by design, so the ULP/bit-identity bars
-   from kernels 1–3 do not apply at all. State the bar in terms of perplexity
-   delta and generation agreement up front, before writing the kernel, so it
-   cannot drift afterwards.
-4. Benchmark on an **idle GPU** (Gotcha #18) and quote run counts with any
-   variance figure (Gotcha #21).
+1. **Ask Nathan to predict** memory- vs compute-bound, and the byte-counted
+   ceiling, before writing it. Setup: at decode this is a tall-skinny GEMM
+   (batch × 896 against 896 × 4864), dominated by streaming the weight matrix.
+   fp16 arithmetic intensity is ~1 FLOP/byte; INT4 raises it to ~4. Both are far
+   below the 364 FLOP/byte ridge. **Then ask whether that answer changes at
+   prefill batch 32** — it does, and that is the interesting half.
+2. Expect the ceiling to be ~4× on the quantized layers *at decode only*, and
+   for prefill to gain little or nothing. Phase 3's Gotcha #17 applies: verify
+   which bound you are actually against before trusting the ceiling.
+3. Store the packed form: `nano_infer/quant.py` already produces
+   `Int4Tensor(packed, scale, zero)`. The kernel needs a layout decision —
+   walking K contiguously matters more than walking N.
+4. Validate against `Int4Tensor.dequantize() @ x` (the step-1 reference), not
+   against fp16. Quantization error is expected; kernel error is not, so this
+   comparison must be tight.
+5. Wire behind the existing `model.using_kernels()`-style flag, decode path
+   first. Then `bench/quant_speed.py` and the **full acceptance table: model
+   size GB, tokens/sec, perplexity, peak VRAM** at fp16 / INT8 / INT4.
+6. Measure peak VRAM with `torch.cuda.max_memory_allocated()` around a
+   generation, reset between configurations.
+7. Benchmark on an **idle GPU** (Gotcha #18); quote run counts with any variance
+   (Gotcha #21).
 
 ### Then: optional — close the gap on kernel 4
 

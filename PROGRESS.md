@@ -785,3 +785,99 @@ when comparing runs that used different repeat counts. On the clean run: spread
 - [x] Kernels wired into `model.py` behind a flag; correctness verified end to end
 - [x] End-to-end tokens/sec: **2.33x** at batch 32 (2.4x vs HuggingFace), clean run
 - [x] **PHASE 3 COMPLETE**
+
+---
+
+## Phase 4 — Quantization
+
+### Step 1: schemes + quality measurement (2026-09-04)
+
+Phase 0's discipline applied again: build the measuring instrument first,
+validate it on a known-good configuration, and only then use it to judge
+anything. So this step is the quantization reference plus `bench/perplexity.py`,
+with no kernel at all — `quantize_dequantize` round-trips a weight through the
+quantized grid and hands back fp16, which is deliberately useless for speed and
+exactly right for isolating the **quality** cost.
+
+**What is quantized, and why the headline is not 4×.** Only the 2-D projection
+matrices (q/k/v/o/gate/up/down): 715.7 MB of 988.1 MB, **72.4%**. The embedding
+is *tied* to the output head in this model, so an error there is applied twice —
+once looking a token up and again producing logits — and it is the most
+quality-sensitive tensor in the network. Leaving it fp16 caps the win, and three
+different numbers get conflated in most write-ups, so all three are reported:
+
+| | INT8 | INT4 (g128) |
+|---|---|---|
+| quantized tensors alone | 2.00× | 3.82× |
+| **whole model** | **1.57×** | **2.15×** |
+| effective bits/weight | 8.01 | 4.19 |
+
+INT4 group-wise is **4.19 bits/weight, not 4.0**: each group of 128 weights
+carries an fp16 scale and a uint8 zero, so 64 packed bytes become 67. A test
+pins that figure rather than letting "4-bit" stand in for it.
+
+### Quality, with an error bar
+
+WikiText-2 test split, 16 windows × 512 tokens = 8,176 predicted tokens, run
+through the Phase 1 reference forward so the cache is not part of the
+measurement. Every configuration sees identical windows in identical order.
+
+| Precision | Perplexity | vs fp16 | Model | Compression | bits/wt |
+|---|---|---|---|---|---|
+| fp16 | 22.4164 | — | 988 MB | 1.00× | 16.00 |
+| **INT8** | **22.2941** | **−0.55%** | 631 MB | 1.57× | 8.01 |
+| INT4 g32 | 25.6600 | +14.47% * | 485 MB | 2.04× | 4.75 |
+| INT4 g64 | 26.0086 | +16.02% * | 468 MB | 2.11× | 4.38 |
+| INT4 g128 | 27.1472 | +21.10% * | 460 MB | 2.15× | 4.19 |
+
+**The baseline is 22.4164 ± 3.45% (one standard error).** A perplexity delta
+without an error bar is not interpretable, and this one earns its keep
+immediately: INT8's −0.55% is *smaller than the sampling error*, so the honest
+statement is **"INT8 is lossless within measurement precision"** — not "INT8
+improved the model", which is what the raw sign would have suggested. The `*`
+marks deltas larger than one standard error; only the INT4 rows have them.
+
+**INT4 costs 14–21% perplexity, and that is worse than published INT4 results.**
+Stated plainly rather than buried, per spec rule 5. Two reasons, both real:
+
+1. **This is round-to-nearest with no calibration.** GPTQ and AWQ spend a
+   calibration pass compensating quantization error against actual activations;
+   RTN just rounds. That gap is most of the difference.
+2. **0.5B is a small model.** Quantization robustness comes largely from
+   redundancy, and a 0.5B model has far less of it than the 7B+ models INT4
+   results are usually quoted on.
+
+**The group-size curve is the useful part.** Going 128 → 32 recovers a third of
+the loss (21.1% → 14.5%) for 0.56 more bits/weight, and *costs* whole-model
+compression (2.15× → 2.04×) because the metadata grows. That is the real
+trade-off surface, and it is why the kernel takes the group size as a parameter
+rather than baking in 128.
+
+Qualitatively, INT8 continuations track fp16 closely while INT4 diverges into
+different-but-fluent text — which is exactly the failure mode that makes a
+perplexity number necessary. Greedy decoding can look fine while the
+distribution underneath has measurably flattened.
+
+### A bug the correctness bar caught immediately
+
+The first version computed the scale in fp32, chose codes against it, then
+**stored the scale in fp16**. Round-to-nearest guarantees an error of at most
+half a quantization step, so the test asserted exactly that — from first
+principles, not as a tolerance — and it failed on 535 elements.
+
+The cause was real: at `q = 127`, an fp16 scale rounding of 2⁻¹¹ relative shifts
+the reconstruction by ~0.06 of a step, enough to break the half-step guarantee.
+The fix is to **round the scale to fp16 before choosing codes**, so quantization
+and dequantization agree on the same grid — which is also what the kernel will
+have to do. Free accuracy, found by refusing to widen a bound that was derived
+rather than guessed.
+
+The final bound in the test is `half_step + |reconstruction| × 2⁻¹¹`, both terms
+derived: round-to-nearest gives s/2, and the dequantized value is itself stored
+in fp16.
+
+- [x] INT8 per-channel symmetric + INT4 group-wise asymmetric, with tests
+- [x] Perplexity harness on WikiText-2, with standard errors
+- [x] Quality measured: INT8 lossless within error, INT4 +14-21%
+- [ ] Fused dequant-matmul kernel (unpack in registers, never materialize)
+- [ ] Acceptance table: model size, tokens/sec, perplexity, peak VRAM
