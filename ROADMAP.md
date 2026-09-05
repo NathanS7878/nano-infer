@@ -663,10 +663,19 @@ section.
 
 ### Known open items
 
-- **nano-infer is not published to GitHub** (no remote; 404 on both candidate
-  accounts). This blocks the reciprocal MiniDynamo link, and it means the git
-  history -- which CLAUDE.md rule 6 treats as part of the artifact -- is not
-  visible to anyone yet. The outbound link to MiniDynamo is done.
+- **nano-infer is prepared for publishing but NOT yet pushed.** Nathan pushes
+  it himself. Prep done 2026-09-04: MIT LICENSE added, and all 29 commits
+  rewritten to `NathanS7878 <988dragons@gmail.com>` (was
+  `Iceboy66 <98899dragons@gmail.com>`) so GitHub attributes the history to the
+  account MiniDynamo lives on. Verified content-identical across the rewrite
+  (same HEAD tree hash, same commit count); repo-local `user.name`/`user.email`
+  are set so future commits match.
+  - **Recovery:** the pre-rewrite history is tagged `pre-author-rewrite`
+    (1c4d972) and in `refs/original/`.
+  - **DO NOT push with `--tags` or `--mirror` until that tag is deleted** -- it
+    points at the old Iceboy66 history and would publish it.
+  - Once pushed, add the reciprocal link in MiniDynamo's README (that repo had
+    uncommitted work in flight; commit the link separately).
 - **Prefill is one request at a time** in `engine.py` (avoids padding ragged
   prompts). A production engine batches or chunks prefills; at high admission
   rates this would bottleneck. Recorded as a limitation, not hidden.
