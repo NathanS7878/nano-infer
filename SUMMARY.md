@@ -1502,7 +1502,7 @@ and it is the one the measurements support.
 | 0 — Ground truth | ✅ Complete | Hardware spec, benchmark harness, reference fixture, HF baseline |
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
 | 2 — KV cache & batching | ✅ Complete | Contiguous cache + prefill/decode split (15.6× at batch 32), paged cache (3.8× memory), continuous batching (1.55× on a request stream) |
-| 3 — Custom CUDA kernels | ✅ Complete | RMSNorm 7.7× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention 2.48× @ 11.1%. **End-to-end 2.33× (2.4× vs HF) at batch 32** |
+| 3 — Custom CUDA kernels | ✅ Complete | RMSNorm 7.7× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention **6.89× @ 30.3%** after the head-group refit (was 2.48× @ 11.1% — the denominator was wrong, see PROGRESS 2026-09-04). **End-to-end 2.19–2.35× vs PyTorch** |
 | 4 — Quantization | ✅ Complete | **INT8: lossless, 1.57× smaller, 1.17× tok/s at batch 1.** INT4: 2.15× smaller, 1.99× less VRAM, +21.1% ppl. Crossover reported |
 | 5 — Make it legible | ◐ Nearly done | README benchmark table, architecture diagram, WRITEUP.md, limitations |
 
@@ -1543,7 +1543,8 @@ pip install transformers safetensors tokenizers huggingface_hub datasets acceler
 | `python -m bench.kernel_rmsnorm` | Fused RMSNorm vs PyTorch, with bandwidth utilization |
 | `python -m bench.kernel_swiglu` | Fused SwiGLU vs PyTorch, with bandwidth utilization |
 | `python -m bench.kernel_rope` | Fused RoPE vs PyTorch, with bandwidth utilization |
-| `python -m bench.kernel_attention` | Fused decode attention; the two wins measured separately |
+| `python -m bench.kernel_attention` | Fused decode attention; fusion, gather and head-group wins measured separately |
+| `python -m bench.kernel_attention --sharing` | Is the kernel DRAM-bound or issue-bound? The experiment that reframed "11.1% of peak" |
 | `python -m bench.phase3_end_to_end` | End-to-end tokens/sec, kernels off vs on |
 | `python -m bench.perplexity` | Quality cost of INT8/INT4 on WikiText-2, with error bars |
 | `python -m bench.quant_speed` | Dequant-matmul speed and the batch-size crossover |

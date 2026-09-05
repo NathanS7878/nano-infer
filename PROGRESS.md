@@ -1078,3 +1078,131 @@ and it is the one the measurements support.
 - [ ] MiniDynamo cross-link (needs the real URL)
 - [ ] vLLM row (blocked on platform; see Gotcha #27)
 
+## 2026-09-04 — Kernel 4b: head-group fusion, and what it revealed
+
+### The measurement that started it
+
+The repo had decode attention recorded at **11.1% of peak bandwidth**, called it
+the weakest number in the project, and named two unimplemented fixes. Before
+writing either, I checked the number itself.
+
+`11.1%` counts **compulsory** bytes — each KV element once. But the kernel
+launched one block per (sequence, query head), and with GQA 14q/2kv seven blocks
+each read the same KV rows. So there are two possible denominators and only one
+had ever been computed.
+
+The experiment holds block count and per-block work **exactly** constant (448
+blocks, 512 threads, same dot products, same barriers) and varies only how many
+query heads share a KV head, which changes only the distinct footprint:
+
+| kv heads | n_rep | distinct | issued | us | distinct GB/s | issued GB/s | % peak |
+|---|---|---|---|---|---|---|---|
+| 14 | 1 | 234.9 MB | 234.9 MB | 1199.9 | 195.8 | 195.8 | 43.7% |
+| 7 | 2 | 117.4 MB | 234.9 MB | 875.3 | 134.2 | 268.3 | 59.9% |
+| 2 | 7 | 33.6 MB | 234.9 MB | 729.3 | 46.0 | 322.1 | **71.9%** |
+| 1 | 14 | 16.8 MB | 234.9 MB | 694.2 | 24.2 | 338.4 | 75.5% |
+
+Wall time **flattens** once n_rep >= 7 — the duplicate reads are cache hits, so
+DRAM was never the limit. But a cache hit still costs a load instruction and an
+issue slot, and against issued traffic the kernel was at **71.9% of peak**. It
+was never leaving 89% of the card unused. It was a load path near its ceiling
+carrying 7x more traffic than the algorithm needs.
+
+That inverts the fix. "Go faster" was not available. "Ask for less" was.
+Recorded as Gotcha #28. Reproduce: `python -m bench.kernel_attention --sharing`.
+
+### Kernel 4b
+
+One block per (sequence, **KV** head). The R = n_rep query heads sharing it ride
+along: each K element is loaded once into a register and fed to R dot products,
+each V element loaded once and fed to R accumulators. Arithmetic intensity goes
+0.5 -> 3.5 FLOP/byte. m, l and the correction factor become length-R register
+arrays, and one `block_reduce_vec<R>` reduces all R values with the barrier cost
+of a single reduction — otherwise the fusion would pay R times the
+synchronisation it exists to amortise.
+
+Two implementation notes worth keeping:
+- `corr` and `l` have to be **staged through shared memory** before anything
+  indexes them by a thread-varying index. Every thread holds identical copies
+  (they are outputs of block-wide reductions), but a dynamic index into a
+  register array spills the array to local memory and undoes the point.
+- The tile's slot indices are staged in shared once per tile. Without that, the
+  PV phase re-reads `slots[]` from global on every ngrp-strided step, and each is
+  a dependent load standing in front of a V read.
+
+| Shape | Phase 2 paged | Pre-gathered | Per-query-head | Grouped | Fusion win | vs paged | GB/s | % peak |
+|---|---|---|---|---|---|---|---|---|
+| b1 L128 | 373.8 | 305.2 | 32.8 | 35.0 | 0.94x | 11.40x | 2.0 | 0.4% |
+| b32 L128 | 380.2 | 310.0 | 61.4 | 38.9 | 1.58x | 9.77x | 53.9 | 12.0% |
+| b32 L512 | 514.5 | 415.7 | 200.1 | 80.5 | 2.48x | 6.39x | 104.1 | 23.2% |
+| b32 L1024 | 899.1 | 743.7 | 352.0 | 136.6 | 2.58x | 6.58x | 122.8 | 27.4% |
+| b32 L2048 | 1701.1 | 1355.0 | 674.0 | **247.0** | **2.73x** | **6.89x** | **135.9** | **30.3%** |
+
+**11.1% -> 30.3% of peak. 2.52x -> 6.89x vs the Phase 2 paged path.**
+
+Correctness first, as always. Error against the fp64 CPU ground truth is
+*identical* to the per-query-head kernel's on all 8 shapes tested, and both are
+0.42-1.00x the fp16 reference's — so the fusion is free numerically, not a
+trade. Per-head separation is asserted directly with a delta-softmax
+construction (deviation 0.000e+00). 130 tests pass.
+
+### Two sweeps behind the heuristics
+
+**Crossover (grouped speedup vs per-query-head, by block count):** the grouped
+kernel launches n_rep times fewer blocks, so it has a floor. It loses below 8
+blocks and wins above, growing with block count:
+
+| blocks | 2 | 4 | 6 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| L2048 | 0.64x | 0.64x | 0.64x | 1.06x | 1.82x | 2.55x | 2.92x |
+
+**Block size:** not a constant, but a constant TOTAL thread count. Measured best
+was 1024 at 8/16/32 blocks, 512 at 64, 256 at 128 — that is `blocks x threads ~
+32768` in every row, about 22 warps/SM on 46 SMs, roughly half the 48-warp max.
+Dividing a fixed budget reproduces the measured optimum or comes within 9%
+everywhere. Gotcha #31.
+
+### The result that matters more than the kernel
+
+**A 2.6x kernel moved end-to-end `generate_paged` by 0.99-1.03x.** Measured back
+to back in one process, both arms forced with `fuse_heads`, call count verified
+at 1512 per run (24 layers x 63 decode steps).
+
+| case | per-head tok/s | grouped tok/s | speedup | decode ms/step |
+|---|---|---|---|---|
+| b32 p32 g64 | 1572.8 | 1550.0 | 0.985x | 20.2 |
+| b32 p512 g64 | 1024.8 | 1057.1 | 1.032x | 20.1 |
+| b32 p1024 g64 | 624.9 | 622.5 | 0.996x | 19.9 |
+| b8 p1024 g64 | 307.4 | 307.1 | 0.999x | 18.4 |
+| b1 p1024 g64 | 53.2 | 54.4 | 1.022x | 17.5 |
+
+Look at the last column rather than the speedups. **Decode step time is ~20 ms
+regardless of batch size (1 vs 32 — 32x the work, +7%) and regardless of context
+length (33 vs 1025).** No GPU-bound loop can be invariant to both. And the
+attention kernel alone, timed on those exact tensors, costs 0.44 ms/step at
+context 33 versus 8.33 ms at context 1025 — a 7.9 ms difference that simply does
+not appear in the total.
+
+The cause, and it is countable rather than inferred: **~3,200 aten dispatches per
+decode step**, the same 3,218 at context 33 and at 1025. Only **169** are
+`linear`. The rest are metadata: `as_strided` x660, `view` x393, `transpose`
+x289, `reshape` x245, `select` x185. At a few microseconds of CPU dispatch each,
+that is the entire 20 ms.
+
+**The decode loop is CPU-dispatch-bound. The GPU is idle for most of it.** Which
+is Gotcha #4 of this project recurring one level up — I optimized the fastest
+part of a step I had never measured end to end. Recorded as Gotcha #29 and
+promoted to the immediate next action in ROADMAP.md; CUDA graphs are the obvious
+fix, since the decode shape is fixed across steps.
+
+Also recorded: `torch.profiler` could not be made to give a trustworthy
+GPU-utilization ratio here (summing `self_device_time_total` over
+`key_averages()` double-counts, and profiling inflates the CPU side enough that
+GPU-busy-per-step exceeds unprofiled wall time — both attempts returned
+113-423%). Its *counts* are reliable; its timings in this regime are not. The
+invariance experiments settled it without a profiler. Gotcha #30.
+
+One test-writing lesson too (Gotcha #32): the first per-head-separation test used
+a score gap of 7.5, which leaves 3.4% of the softmax mass off-target — enough to
+move the output by 0.137 and fail its own 0.02 bar. The kernel was right; the
+fixture's premise was not. Widening the gap to 3125 made the selection exact.

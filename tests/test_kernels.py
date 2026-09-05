@@ -687,3 +687,208 @@ def test_decode_attention_block_size_invariance(mod):
         else:
             drift = (out.float() - base.float()).abs().max().item()
             assert drift < 5e-3, f"block_size {bs} changed the answer by {drift:.3e}"
+
+
+# Head-group fusion (kernel 4b). The dispatcher picks between one block per
+# (sequence, query head) and one block per (sequence, KV head) on block count,
+# so BOTH paths have to be forced explicitly or the tests only ever exercise
+# whichever one the heuristic happens to choose for the case's shape.
+GROUPED_CASES = ATTN_CASES + [
+    (4, 8, 2, 64, 700),      # n_rep 4
+    (3, 16, 2, 64, 129),     # n_rep 8, block wider than the sequence
+    (5, 14, 7, 64, 260),     # n_rep 2, the shallowest grouping
+    (8, 14, 2, 64, 1),       # a single cached position, grouped
+]
+
+
+@pytest.mark.parametrize("batch,q_heads,kv_heads,head_dim,max_len", GROUPED_CASES)
+def test_decode_attention_grouped_matches_per_head(mod, batch, q_heads, kv_heads,
+                                                   head_dim, max_len):
+    """The head-group fused kernel must be no less accurate than the one it
+    replaces, on the same input.
+
+    The two kernels compute the same recurrence; they differ only in WHO
+    computes it. The per-query-head kernel gives each of the n_rep query heads
+    sharing a KV head its own block, so each block re-reads the same K and V.
+    The grouped kernel gives them one block between them, reads each K element
+    once into a register and feeds it to n_rep dot products.
+
+    That means the arithmetic per head is unchanged, and the bar is the strict
+    one: our error against the fp64 ground truth must not exceed the fp16
+    reference's — the same bar the per-query-head kernel is held to. The two
+    kernels may still differ from EACH OTHER, because the dispatcher picks a
+    different block size for each and the tile width sets how often the online
+    correction is applied.
+    """
+    if q_heads == kv_heads:
+        pytest.skip("n_rep == 1: nothing to group, the dispatcher cannot fuse")
+
+    torch.manual_seed(0)
+    q = torch.randn(batch, q_heads, head_dim, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    k_pool, v_pool, slot_table = _paged_setup(batch, kv_heads, head_dim, max_len)
+    lengths = torch.randint(1, max_len + 1, (batch,), device=cfg.DEVICE).long()
+    scale = head_dim ** -0.5
+
+    truth = _ground_truth_cpu(q, k_pool, v_pool, slot_table, lengths, scale)
+    ref = _reference_decode(q, k_pool, v_pool, slot_table, lengths, scale)
+    plain = mod.decode_attention_forward(q, k_pool, v_pool, slot_table,
+                                         lengths, scale, 0, -1)
+    grouped = mod.decode_attention_forward(q, k_pool, v_pool, slot_table,
+                                           lengths, scale, 0, 1)
+
+    assert grouped.shape == plain.shape and grouped.dtype == plain.dtype
+    assert torch.isfinite(grouped.float()).all(), "non-finite grouped output"
+
+    err_ref = (ref.double().cpu() - truth).abs().max().item()
+    err_plain = (plain.double().cpu() - truth).abs().max().item()
+    err_grp = (grouped.double().cpu() - truth).abs().max().item()
+    drift = (grouped.double() - plain.double()).abs().max().item()
+
+    print(f"\n[grouped {batch}x{q_heads}/{kv_heads}x{head_dim}, L<={max_len}, "
+          f"n_rep {q_heads // kv_heads}] vs fp64 truth: PyTorch {err_ref:.3e}, "
+          f"per-head {err_plain:.3e}, grouped {err_grp:.3e} "
+          f"(ratio {err_grp / max(err_ref, 1e-12):.3f}), "
+          f"grouped-vs-per-head {drift:.3e}")
+
+    assert err_grp <= err_ref * 1.05 + 1e-6, (
+        f"grouped kernel is less accurate than the fp16 reference it replaces: "
+        f"{err_grp:.3e} vs {err_ref:.3e}"
+    )
+    assert err_grp <= err_plain * 1.05 + 1e-6, (
+        f"head-group fusion cost accuracy against the per-query-head kernel: "
+        f"{err_grp:.3e} vs {err_plain:.3e}. The two run the same recurrence, so "
+        f"a real gap means the fusion changed the math, not just the schedule."
+    )
+    assert drift <= max(err_ref, err_plain) * 4 + 1e-5, (
+        f"the two paths disagree by {drift:.3e}, more than either one's own "
+        f"distance from the truth accounts for"
+    )
+
+
+def test_decode_attention_grouped_reduction_is_per_head(mod):
+    """The grouped kernel reduces n_rep softmaxes in one block. Prove they stay
+    SEPARATE.
+
+    This is the failure mode the fusion invites and that an averaged error
+    metric would hide: a reduction that accidentally spans the n_rep heads
+    sharing a block as well as the positions still produces finite, plausible
+    output — every head is still some combination of V rows, just the wrong one.
+    So each query head is aimed at a DIFFERENT cached position, hard enough that
+    its softmax is a delta, and its output must equal that position's V row.
+
+    Note what this does and does not catch. A leaked running SUM (l) or a leaked
+    accumulator scales or mixes the heads and shows up immediately. A leaked
+    running MAX would NOT: online softmax subtracts m from the scores and
+    divides by a sum computed with the same m, so an m that is too large cancels
+    exactly. That is a property of the algorithm, not a gap in the test — an
+    over-large m costs precision, not correctness, and the fp64-truth tests above
+    are what bound the precision.
+
+    The score gap has to be genuinely wide. An earlier version of this test used
+    a gap of 7.5, which leaves exp(0)*63 / (exp(7.5) + 63) = 3.4% of the softmax
+    mass spread across the non-target positions — enough to move the output by
+    0.14 and fail a test that was measuring the construction, not the kernel.
+    """
+    batch, q_heads, kv_heads, head_dim, L = 8, 14, 2, 64, 64
+    n_rep = q_heads // kv_heads
+    torch.manual_seed(0)
+
+    k_pool = torch.zeros(batch * L, kv_heads, head_dim,
+                         dtype=cfg.DTYPE, device=cfg.DEVICE)
+    v_pool = torch.randn(batch * L, kv_heads, head_dim,
+                         dtype=cfg.DTYPE, device=cfg.DEVICE)
+    slot_table = torch.randperm(batch * L, device=cfg.DEVICE).reshape(batch, L).long()
+    lengths = torch.full((batch,), L, device=cfg.DEVICE).long()
+
+    # position p of every sequence gets the one-hot key 50 * e_(p % head_dim);
+    # L == head_dim, so exactly one position carries each basis vector
+    for b in range(batch):
+        for p in range(L):
+            k_pool[slot_table[b, p], :, p % head_dim] = 50.0
+
+    # query head h is 500 * e_(target[h]), so its score at position target[h] is
+    # 500*50/8 = 3125 and 0 everywhere else. exp(-3125) underflows to zero, so
+    # the softmax is an exact delta and the output must be exactly one V row.
+    # Both 500 and 50 are exactly representable in fp16 and their product is far
+    # inside float range, where the kernel accumulates.
+    target = [(h * 7 + 3) % head_dim for h in range(q_heads)]
+    q = torch.zeros(batch, q_heads, head_dim, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    for h in range(q_heads):
+        q[:, h, target[h]] = 500.0
+    scale = head_dim ** -0.5
+
+    got = mod.decode_attention_forward(q, k_pool, v_pool, slot_table,
+                                       lengths, scale, 0, 1).float()
+
+    worst = 0.0
+    for b in range(batch):
+        for h in range(q_heads):
+            kvh = h // n_rep
+            want = v_pool[slot_table[b, target[h]], kvh].float()
+            worst = max(worst, (got[b, h] - want).abs().max().item())
+    print(f"\n[grouped per-head separation] worst deviation from the selected "
+          f"V row: {worst:.3e}")
+    assert worst < 1e-2, (
+        f"grouped heads are contaminating each other: {worst:.3e}. A reduction "
+        f"in the grouped kernel is leaking across the n_rep heads that share a "
+        f"block instead of staying per-head."
+    )
+
+
+def test_decode_attention_grouped_block_size_invariance(mod):
+    """Same knob, same requirement, on the grouped path.
+
+    The grouped kernel picks its block size from a total-thread budget rather
+    than a constant, so it lands on different widths than the per-query-head
+    kernel does. That makes this the test that would catch a shared-memory
+    layout that is only correct at one width — the tile arrays there are
+    R*threads wide, so their offsets move with the block size.
+    """
+    batch, q_heads, kv_heads, head_dim, max_len = 8, 14, 2, 64, 700
+    torch.manual_seed(0)
+    q = torch.randn(batch, q_heads, head_dim, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    k_pool, v_pool, slot_table = _paged_setup(batch, kv_heads, head_dim, max_len)
+    lengths = torch.randint(1, max_len + 1, (batch,), device=cfg.DEVICE).long()
+    scale = head_dim ** -0.5
+
+    truth = _ground_truth_cpu(q, k_pool, v_pool, slot_table, lengths, scale)
+    base = None
+    for bs in (64, 128, 256, 512, 1024):
+        out = mod.decode_attention_forward(q, k_pool, v_pool, slot_table,
+                                           lengths, scale, bs, 1)
+        err = (out.double().cpu() - truth).abs().max().item()
+        print(f"\n[grouped block_size={bs:4d}] err vs fp64 truth {err:.3e}")
+        assert err < 5e-3, f"grouped block_size {bs} is not just a knob: {err:.3e}"
+        if base is None:
+            base = out
+        else:
+            drift = (out.float() - base.float()).abs().max().item()
+            assert drift < 5e-3, f"grouped block_size {bs} changed the answer"
+
+
+def test_decode_attention_grouped_falls_back_when_it_cannot_group(mod):
+    """n_rep == 1 has nothing to fuse, and asking for it must fail loudly.
+
+    A silent fallback would be worse than an error: the benchmark's whole job is
+    to compare the two paths, and a forced flag that quietly does nothing turns
+    an A/B into an A/A that reads as "the fusion bought nothing".
+    """
+    batch, heads, head_dim, L = 4, 4, 64, 200
+    torch.manual_seed(0)
+    q = torch.randn(batch, heads, head_dim, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    k_pool, v_pool, slot_table = _paged_setup(batch, heads, head_dim, L)
+    lengths = torch.full((batch,), L, device=cfg.DEVICE).long()
+    scale = head_dim ** -0.5
+
+    with pytest.raises(RuntimeError, match="grouped path does not apply"):
+        mod.decode_attention_forward(q, k_pool, v_pool, slot_table,
+                                     lengths, scale, 0, 1)
+
+    # auto and forced-off must both still work and agree
+    auto = mod.decode_attention_forward(q, k_pool, v_pool, slot_table,
+                                        lengths, scale, 0, 0)
+    off = mod.decode_attention_forward(q, k_pool, v_pool, slot_table,
+                                       lengths, scale, 0, -1)
+    assert torch.equal(auto, off), (
+        "with n_rep == 1 the auto path must be the per-query-head kernel"
+    )

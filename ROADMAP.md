@@ -42,19 +42,19 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-04, Phase 5 mostly done (README, WRITEUP, limitations)._
+_Last updated: 2026-09-04, Phase 5 done + kernel 4b (head-group fusion) landed._
 
 | Phase | Status | Headline |
 |---|---|---|
 | 0 — Ground truth | ✅ Complete | Harness (<3% variance), HF baseline, reference fixture |
 | 1 — Correct but slow | ✅ Complete | From-scratch forward pass, token-for-token vs HF |
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
-| 3 — Custom CUDA kernels | ✅ Complete | 4/4 kernels, wired in, output verified. **End-to-end 2.33× at batch 32 (1739 tok/s), 2.4× vs HuggingFace** |
+| 3 — Custom CUDA kernels | ✅ Complete | 4/4 kernels + **4b head-group fusion**. Decode attention **6.89× vs Phase 2 paged, 30.3% of peak** (was 2.52× / 11.1%). End-to-end 2.19–2.35× vs PyTorch |
 | 4 — Quantization | ✅ Complete | **INT8 lossless, 1.57× smaller, 1.17× tok/s @ b1.** INT4 2.15× smaller, **1.99× less VRAM**, +21.1% ppl |
 | 5 — Make it legible | ◐ **Nearly done** | README + benchmark table + mermaid diagram + limitations ✅, WRITEUP.md ✅. **Open: MiniDynamo link, vLLM row (blocked)** |
 
-- **Tests:** 118 passing (`python -m pytest tests/ -q`)
-- **Commits:** 25 on `main`, clean tree
+- **Tests:** 130 passing (`python -m pytest tests/ -q`)
+- **Commits:** 26 on `main`, clean tree
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -89,7 +89,8 @@ $env:PYTHONPATH="C:\Users\Nathan stevens\OneDrive\Projects\nano-infer"
 | `-m bench.kernel_rmsnorm` | Fused RMSNorm vs PyTorch + bandwidth utilization |
 | `-m bench.kernel_swiglu` | Fused SwiGLU vs PyTorch + bandwidth utilization |
 | `-m bench.kernel_rope` | Fused RoPE vs PyTorch + bandwidth utilization |
-| `-m bench.kernel_attention` | Decode attention; fusion win and gather win separated |
+| `-m bench.kernel_attention` | Decode attention; fusion, gather and head-group wins separated |
+| `-m bench.kernel_attention --sharing` | **Is it DRAM-bound or issue-bound?** The experiment that reframed 11.1% |
 | `-m bench.phase3_end_to_end` | **The Phase 3 acceptance number**: tokens/sec, kernels off vs on |
 | `-m bench.perplexity` | Quality cost of INT8/INT4 on WikiText-2, with error bars |
 | `-m bench.quant_speed` | Dequant-matmul speed; **the batch-size crossover** |
@@ -118,6 +119,10 @@ nano_infer/
     swiglu.cu    kernel 2: fused SwiGLU (scalar + float4, grid-stride)
     rope.cu      kernel 3: fused RoPE (both shared- and per-sequence positions)
     attention_decode.cu
+                 kernel 4: online-softmax decode attention (one block per
+                 query head) AND kernel 4b, head-group fused (one block per
+                 KV head, n_rep query heads share every K/V read). The
+                 dispatcher picks on block count; fuse_heads forces either.
     quant_matmul.cu
                  Phase 4: fused INT8/INT4 dequant-matmul, unpacked in registers
                  kernel 4: online-softmax decode attention, walks the paged
@@ -327,6 +332,65 @@ These were all expensive to discover. Read before debugging anything.
     labelled -- do not fill it with a number from other hardware. To get one
     honestly, run the repo under WSL2 or on a Linux box and say so.
 
+28. **"% of peak" is a ratio, and the numerator must be the bytes the hardware
+    ACTUALLY MOVED — not the bytes your algorithm deserved to move.** Decode
+    attention was recorded at 11.1% of peak and treated as the weakest number in
+    the repo. That figure counts each KV element ONCE (compulsory bytes), but
+    the kernel launched one block per query head, so with GQA 14q/2kv seven
+    blocks each read the same KV rows. Against the traffic it actually issued it
+    was at **71.9% of peak**. `bench/kernel_attention.py --sharing` is the
+    experiment: hold block count and per-block work exactly constant, vary only
+    how many query heads share a KV head, and wall time goes FLAT once n_rep ≥ 7
+    (1199.9 → 729.3 → 694.2 µs for n_rep 1 → 7 → 14 while issued bytes stay at
+    235 MB). Flat means the duplicates are cache hits, so DRAM was never the
+    limit — but a cache hit still costs a load instruction and an issue slot.
+    **Report both numbers, or the gap between them will read as inefficiency
+    when it is actually the optimization you have not done yet.**
+
+29. **THE DECODE LOOP IS CPU-DISPATCH-BOUND, NOT GPU-BOUND. This invalidates
+    the intuition behind most of Phase 3.** Making decode attention 2.6× faster
+    moved end-to-end `generate_paged` by 0.99–1.03×, i.e. not at all — measured
+    back to back in one process with the call count verified at 1512. The
+    evidence is two invariances that no GPU-bound loop can show:
+      - step time is ~20 ms at batch 1 AND at batch 32 (32× the work, +7%);
+      - step time is ~20 ms at context 33 AND at context 1025, even though the
+        attention kernel alone costs 0.44 ms vs 8.33 ms per step on those exact
+        tensors.
+    The cause: **~3,200 aten dispatches per decode step** (identical count at
+    context 33 and 1025), of which only 169 are `linear`. The rest is CPU-side
+    bookkeeping — `as_strided` ×660, `view` ×393, `transpose` ×289, `reshape`
+    ×245, `select` ×185. At a few µs of dispatch each that is the entire 20 ms.
+    This is Gotcha #4 one level up. **Before optimizing any kernel further,
+    measure whether the engine is waiting on the GPU at all.**
+
+30. **Do not trust `torch.profiler` for a GPU-utilization RATIO here.** Summing
+    `self_device_time_total` over `key_averages()` double-counts (parents plus
+    children) and gives >100% utilization; and profiling inflates the CPU side
+    so much that GPU-busy-per-step measured under the profiler is not comparable
+    to unprofiled wall time. Both were tried and both produced 113–423%
+    "utilization". The *counts* it reports are trustworthy; the timings, in this
+    CPU-bound regime, are not. The invariance experiments above are what settled
+    it, and they need no profiler.
+
+31. **A "grouped" kernel trades traffic for parallelism, so it has a block-count
+    floor.** Kernel 4b launches n_rep times FEWER blocks. Measured crossover on
+    46 SMs: it loses below 8 blocks (0.64× at batch 1, which has 2) and wins
+    above, growing to 2.9× at 64 blocks. Its optimal block size is also not a
+    constant but a constant TOTAL thread count — `blocks × threads ≈ 32768`
+    (~22 warps/SM, about half the 48-warp max) reproduces the measured optimum
+    or comes within 9% at every point of a batch 4–64 × L 128–2048 sweep.
+
+32. **A hand-built "obviously correct" kernel test can be measuring its own
+    construction.** The first per-head-separation test for kernel 4b used a
+    score gap of 7.5, which leaves 3.4% of the softmax mass on the non-target
+    positions — enough to move the output by 0.137 and fail a 0.02 bar. The
+    kernel was right; the test's premise ("this softmax is a delta") was not.
+    Widening the gap to 3125 made the selection exact and the deviation 0.000.
+    **Compute what your fixture actually implies before believing it indicts the
+    code.**
+
+---
+
 ## Progress detail
 
 ### Phase 0 — Ground truth ✅
@@ -384,7 +448,7 @@ contiguous, was 78%).
 
 **1.55× throughput, 35.4% less wall time, identical output.**
 
-### Phase 3 — Custom CUDA kernels ◐ (1 of 4)
+### Phase 3 — Custom CUDA kernels ✅ (4 kernels + the head-group refit)
 
 **Target, measured:** decode achieves 26.5 GB/s = **5.9% of the 448 GB/s peak**.
 
@@ -453,18 +517,78 @@ regression test).
 
 At batch 32, context ≥ 512: **1.99× from the fusion, 1.24× from removing the
 gather** — measured separately on purpose. **Predicted ~24×, got 2.48×**; the
-miss is the finding, see Gotcha #17. **11.1% of peak is not good** (Phase 2
+miss is the finding, see Gotcha #17 — and then see Gotcha #28, which shows the
+denominator in "11.1% of peak" was the wrong one and led to kernel 4b below. **11.1% of peak is not good** (Phase 2
 decode was 5.9%, so this roughly doubles it) and the two identified, un-done
 optimizations are split-K/flash-decoding and collapsing the 7 query heads that
 share a KV head into one block. First kernel that cannot be bit-identical —
 correctness argued against an fp64 CPU ground truth (Gotchas #15, #16); our error
 is 0.48–1.00× the reference's on every shape.
 
+**Kernel 4b — head-group fusion ✅.** One block per (sequence, KV head) instead
+of per (sequence, query head), so the n_rep = 7 query heads sharing a KV head
+read each K and V element ONCE, into a register, and feed it to all seven. Issued
+traffic falls 7×; arithmetic is unchanged, so intensity rises from 0.5 to 3.5
+FLOP/byte. Barriers per tile are unchanged (7 vs 6) but each now covers 7× the
+work.
+
+Written because Gotcha #28's experiment showed the per-query-head kernel was at
+71.9% of peak on *issued* traffic — near its ceiling on a load path carrying 7×
+more than the algorithm needs. The fix was never "go faster", it was "ask for
+less".
+
+| Shape | Phase 2 paged | Pre-gathered | Per-query-head | **Grouped** | Fusion win | vs paged | GB/s | % peak |
+|---|---|---|---|---|---|---|---|---|
+| b1 L128 | 373.8 | 305.2 | 32.8 | 35.0 | 0.94× | 11.40× | 2.0 | 0.4% |
+| b32 L128 | 380.2 | 310.0 | 61.4 | **38.9** | 1.58× | 9.77× | 53.9 | 12.0% |
+| b32 L512 | 514.5 | 415.7 | 200.1 | **80.5** | 2.48× | 6.39× | 104.1 | 23.2% |
+| b32 L1024 | 899.1 | 743.7 | 352.0 | **136.6** | 2.58× | 6.58× | 122.8 | 27.4% |
+| b32 L2048 | 1701.1 | 1355.0 | 674.0 | **247.0** | **2.73×** | **6.89×** | **135.9** | **30.3%** |
+
+**11.1% → 30.3% of peak; 2.52× → 6.89× vs the Phase 2 paged path.** Numerically
+it is not a trade: error against the fp64 CPU ground truth is *identical* to the
+per-query-head kernel's on all 8 test shapes, and both are 0.42–1.00× the fp16
+reference's. Per-head separation asserted directly (delta-softmax construction,
+deviation 0.000e+00), plus block-size invariance and a loud failure if
+`fuse_heads=1` is asked for where n_rep == 1.
+
+**What it costs:** n_rep times fewer blocks, so it loses below 8 blocks — 0.64×
+at batch 1, which has only 2 for 46 SMs. The dispatcher picks on block count
+(Gotcha #31); `fuse_heads` (0 auto / 1 grouped / -1 per-head) forces either, so
+the benchmark A/Bs the two rather than reporting whatever auto chose.
+
+**And it buys nothing end to end** — see Gotcha #29. That is the more important
+result of the two.
+
 ---
 
 ## Next actions
 
-### ▶ IMMEDIATE: finish Phase 5 — two open items, then the project is done
+### ▶ IMMEDIATE: the decode loop is CPU-bound (Gotcha #29)
+
+**This is now the most valuable open problem in the repo, and it is worth more
+than any remaining kernel work.** The engine issues ~3,200 aten dispatches per
+decode step; only 169 are matmuls. Step time is invariant to batch size and to
+context length, which means the GPU is idle waiting for Python. Every kernel in
+Phase 3 is therefore optimizing a part of the step that is not the bottleneck.
+
+Concrete first moves, cheapest first:
+1. **Count and cut the metadata ops.** `as_strided` ×660, `view` ×393,
+   `transpose` ×289, `reshape` ×245 per step. Much of this is the
+   `view/transpose/contiguous` dance around attention; some is per-sequence
+   indexing (`select` ×185 at batch 32 vs absent at batch 1 — find that loop).
+2. **CUDA graphs for the decode step.** The shape is fixed across steps, which
+   is exactly the case graphs exist for; it would collapse ~3,200 dispatches
+   into one replay. This is what production engines do and it is the single
+   highest-leverage change available.
+3. Re-measure the Phase 3 kernels' end-to-end contribution afterwards. They
+   should finally show up.
+
+The old measurement to keep honest: `bench/phase3_end_to_end.py` reports
+2.19–2.35× kernels-on vs kernels-off. That gap is real but it is mostly RMSNorm
+and SwiGLU on the *prefill*, not decode attention.
+
+### Then: finish Phase 5 — two open items
 
 Phases 0-4 are complete and Phase 5 is mostly done: `README.md` now opens with
 the benchmark table (every row citing the script that reproduces it), a mermaid
@@ -489,13 +613,13 @@ Two things remain, and **neither is code**:
 
 ### Optional, if the project continues
 
-**Close the gap on kernel 4** -- 11.1% of peak is the weakest number in the
-repo, and the diagnosis (Gotcha #17) names two specific fixes that were never
-implemented: **split-K** (partition L across blocks, each producing a partial
-`(m, l, acc)`, then combine -- what real flash-decoding does for long context
-with few sequences) and **one block per KV head** instead of per query head, so
-the 7 heads sharing a KV head read it once between them. This would also improve
-the WRITEUP, which currently ends by admitting the number stands.
+**Split-K for kernel 4b.** The head-group fusion (the second of Gotcha #17's two
+named fixes) is now done: 30.3% of peak, 6.89× vs Phase 2 paged. **Split-K is
+still not**, and it is exactly what the grouped kernel needs at small batch,
+where it has too few blocks to fill the card and loses to the per-query-head
+path. Partition L across blocks, each producing a partial `(m, l, acc)`, then
+combine — real flash-decoding. It would let the grouped kernel win at batch 1
+too and retire the dispatcher's block-count fallback.
 
 **A tensor-core quantized matmul.** The INT4/INT8 kernel loses above batch ~4
 because it accumulates in scalar fp32 while cuBLAS rides HMMA (Gotcha #25).
@@ -506,15 +630,6 @@ real fix, and a much larger kernel.
 the headline numbers if VRAM allows. Two conclusions here are explicitly
 0.5B-specific and would likely change: INT4's 21% perplexity cost (larger models
 have more redundancy and quantize better), and the batch-4 crossover.
-
-### Then: optional — close the gap on kernel 4
-
-Deferred, not abandoned. 11.1% of peak is the weakest number in the
-phase and the diagnosis (Gotcha #17) points at two specific fixes: **split-K**
-(partition L across blocks, each producing a partial `(m, l, acc)`, then combine
-— this is what real flash-decoding does for long context with few sequences) and
-**one block per KV head** instead of per query head, so the 7 heads sharing a KV
-head read it once between them.
 
 ### Phase 4 — Quantization
 
@@ -543,6 +658,10 @@ section.
 - Benchmarks show run-to-run variance (contiguous batch-32 read 828 and 736
   tok/s on different runs). Prefer ratios over absolutes where possible, and
   state the variance.
+- **The decode loop is CPU-dispatch-bound** (Gotcha #29) — the largest open
+  problem, promoted to the immediate next action above.
+- **Split-K is still unimplemented**, so kernel 4b falls back to the
+  per-query-head kernel below 8 blocks.
 
 ---
 

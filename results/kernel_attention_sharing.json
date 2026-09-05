@@ -1,0 +1,52 @@
+{
+  "hardware": "NVIDIA GeForce RTX 3070 (see HARDWARE.md)",
+  "peak_bandwidth_gbs": 448.0,
+  "batch": 32,
+  "length": 2048,
+  "q_heads": 14,
+  "head_dim": 64,
+  "runs": 30,
+  "warmup": 10,
+  "results": [
+    {
+      "kv_heads": 14,
+      "n_rep": 1,
+      "distinct_mb": 234.881024,
+      "issued_mb": 234.881024,
+      "us": 1199.8500003755908,
+      "distinct_gbs": 195.7586564374504,
+      "issued_gbs": 195.7586564374504,
+      "issued_pct_peak": 43.69612866907375
+    },
+    {
+      "kv_heads": 7,
+      "n_rep": 2,
+      "distinct_mb": 117.440512,
+      "issued_mb": 234.881024,
+      "us": 875.3499996601022,
+      "distinct_gbs": 134.1640624271458,
+      "issued_gbs": 268.3281248542916,
+      "issued_pct_peak": 59.89467072640438
+    },
+    {
+      "kv_heads": 2,
+      "n_rep": 7,
+      "distinct_mb": 33.554432,
+      "issued_mb": 234.881024,
+      "us": 729.2999998753658,
+      "distinct_gbs": 46.00909365930935,
+      "issued_gbs": 322.0636556151655,
+      "issued_pct_peak": 71.88920884267087
+    },
+    {
+      "kv_heads": 1,
+      "n_rep": 14,
+      "distinct_mb": 16.777216,
+      "issued_mb": 234.881024,
+      "us": 694.1500005268608,
+      "distinct_gbs": 24.169438863741366,
+      "issued_gbs": 338.37214409237913,
+      "issued_pct_peak": 75.52949644919177
+    }
+  ]
+}

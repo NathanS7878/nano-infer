@@ -106,11 +106,24 @@ bandwidth against 448 GB/s — the honest metric for a memory-bound kernel, sinc
 | 1. Fused RMSNorm | 7.66× | 75.5% | — | `python -m bench.kernel_rmsnorm` |
 | 2. Fused SwiGLU | 1.65× | 89.5% | 1.67× ✓ | `python -m bench.kernel_swiglu` |
 | 3. Fused RoPE | 5.03× | 87.6% | 5.00× ✓ | `python -m bench.kernel_rope` |
-| 4. Decode attention (online softmax) | 2.48× | 11.1% | ~24× ✗ | `python -m bench.kernel_attention` |
+| 4. Decode attention, per query head | 2.52× | 11.1% | ~24× ✗ | `python -m bench.kernel_attention` |
+| 4b. Decode attention, head-grouped | **6.89×** | **30.3%** | — | `python -m bench.kernel_attention` |
 
 Kernels 2 and 3 landed within 1% of a ceiling derived by counting bytes before
 any code was written. **Kernel 4 missed by 10×**, and finding out why is the
 subject of [WRITEUP.md](WRITEUP.md).
+
+Kernel 4b is the answer to that miss. The "11.1% of peak" is computed against
+*compulsory* bytes — each KV element counted once — but with GQA 14q/2kv the
+kernel launched one block per query head, so seven blocks each read the same KV
+rows. Against the bytes it actually **issued**, it was already at 76% of peak
+(`python -m bench.kernel_attention --sharing` is the experiment that shows this:
+hold block count and per-block work fixed, vary only the distinct footprint, and
+wall time goes flat). It was never 11% of the card. It was a load path near its
+ceiling carrying 7× more traffic than the algorithm needs. So 4b gives one block
+all seven query heads that share a KV head, reads each K and V element once into
+a register, and feeds it to all seven — **2.60× on the kernel, at identical
+numerical error.**
 
 ## Quantization: what it costs
 
@@ -146,10 +159,20 @@ with no calibration, on a 0.5B model with little redundancy to spare.
 
 Stated plainly, because a repo that only lists wins is not reporting.
 
-- **Decode attention runs at 11.1% of peak bandwidth.** It is latency-bound, not
-  bandwidth-bound, and the diagnosis points at two specific fixes — split-K
-  (flash-decoding proper) and one block per KV head — **neither of which is
-  implemented**. This is the weakest number in the project.
+- **The kernel speedups do not reach end-to-end throughput.** Making decode
+  attention 2.6× faster moved `generate_paged` by 0.99–1.03×, i.e. not at all.
+  The decode step costs ~20 ms *regardless of batch size (1 vs 32) or context
+  length (33 vs 1025)*, which no GPU-bound loop can do. It issues ~3,200 aten
+  ops per step — only 169 of them `linear`, the rest `as_strided` ×660, `view`
+  ×393, `transpose` ×289, `reshape` ×245 — and at a few µs of dispatch each that
+  is the whole 20 ms. **The decode loop is CPU-dispatch-bound, so the GPU is
+  idle for most of it.** This is the single most important open problem in the
+  repo and it is not a kernel problem.
+- **Decode attention is still only at 30.3% of peak**, up from 11.1%. Split-K
+  (flash-decoding proper) is the remaining named fix and is **not implemented**;
+  it is also what the head-grouped kernel needs to stop losing at batch 1, where
+  it has just 2 blocks for 46 SMs. Below 8 blocks the dispatcher falls back to
+  the per-query-head kernel.
 - **The quantized matmul loses above batch ~4.** cuBLAS stays weight-bound to
   batch 32 and rides tensor cores; a scalar-fp32 dequant kernel cannot follow.
   INT4 at batch 32 is 0.50× fp16.

@@ -151,10 +151,53 @@ reporting isn't "N× faster than PyTorch." It's percentage of peak bandwidth,
 because that one tells you how much room is left, and whether you're even in the
 right regime to be asking.**
 
-Decode attention still sits at 11.1% of peak. The diagnosis names the two fixes —
-split-K partitioning across blocks, and one block per KV head instead of per
-query head — and neither is implemented. That's the honest state of it, and it's
-in the README's limitations section rather than this paragraph alone.
+### Postscript: the metric was also wrong
+
+The paragraph above used to end here, with decode attention at 11.1% of peak and
+two named-but-unimplemented fixes. Implementing one of them showed that the
+number itself had been misread.
+
+11.1% was computed against *compulsory* bytes — each KV element counted once.
+But the kernel launched one block per (sequence, query head), and with GQA 14q/2kv
+seven blocks each read the same KV rows. So the question "is it near the peak?"
+has two different answers depending on which bytes you count, and I had only ever
+computed one of them.
+
+The experiment that settles it holds block count and per-block work exactly
+constant and varies only how many query heads share a KV head:
+
+| kv heads | n_rep | distinct | issued | µs | issued GB/s | % of peak |
+|---|---|---|---|---|---|---|
+| 14 | 1 | 235 MB | 235 MB | 1199.9 | 195.8 | 43.7% |
+| 2 | 7 | 33.6 MB | 235 MB | 729.3 | 322.1 | **71.9%** |
+| 1 | 14 | 16.8 MB | 235 MB | 694.2 | 338.4 | 75.5% |
+
+Wall time flattens once n_rep ≥ 7: the duplicate reads *are* absorbed by cache,
+so DRAM was never the limit. But a cache hit still costs a load instruction and
+an issue slot, and against the traffic it actually asks for the kernel was at
+**72% of peak, not 11%.** It was never leaving 89% of the card unused. It was a
+load path near its ceiling, carrying seven times more traffic than the algorithm
+requires.
+
+That reframes the fix completely. "Go faster" was never available. "Ask for less"
+was. One block per *KV* head, each K and V element read once into a register and
+fed to all seven query heads sharing it: **2.60× on the kernel, 6.89× against the
+Phase 2 paged path, 11.1% → 30.3% of compulsory peak**, at numerically identical
+error against the fp64 ground truth.
+
+So the lesson survives in a sharper form. Percentage of peak is still the number
+worth reporting — but a percentage is a ratio, and **the numerator has to be the
+bytes the hardware actually moved, not the bytes your algorithm deserved to
+move.** The gap between those two is not noise. It *was* the optimization.
+
+And the sting in the tail: none of it reaches end-to-end throughput. A 2.6×
+kernel moved `generate_paged` by 0.99×, because the decode step takes ~20 ms
+whether the batch is 1 or 32 and whether the context is 33 tokens or 1025 — it
+issues ~3,200 aten dispatches per step, of which only 169 are matmuls. The loop
+is CPU-dispatch-bound and the GPU is idle through most of it. Which is Gotcha #4
+of this project, recurring one level up: *profile before optimizing, and profile
+the thing you are actually waiting on.* I optimized the fastest part of a step I
+had never once measured end to end.
 
 ---
 
