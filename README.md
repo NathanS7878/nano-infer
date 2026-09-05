@@ -4,7 +4,7 @@ A single-GPU LLM inference engine written from scratch — four custom CUDA kern
 and INT8/INT4 quantization — that loads an open-weights transformer and generates
 tokens **without** `model.generate()`, vLLM, TensorRT-LLM, or FlashAttention.
 
-It is the GPU-worker layer beneath [MiniDynamo](https://github.com/) *(link TBD)*,
+It is the GPU-worker layer beneath [MiniDynamo](https://github.com/NathanS7878/MiniDynamo),
 a distributed KV-cache-aware inference router. MiniDynamo decides *which worker*
 runs a request; nano-infer is what that worker actually does on the GPU.
 

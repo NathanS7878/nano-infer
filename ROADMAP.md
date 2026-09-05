@@ -51,7 +51,7 @@ _Last updated: 2026-09-04, Phase 5 done + kernel 4b (head-group fusion) landed._
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
 | 3 — Custom CUDA kernels | ✅ Complete | 4/4 kernels + **4b head-group fusion**. Decode attention **6.89× vs Phase 2 paged, 30.3% of peak** (was 2.52× / 11.1%). End-to-end 2.19–2.35× vs PyTorch |
 | 4 — Quantization | ✅ Complete | **INT8 lossless, 1.57× smaller, 1.17× tok/s @ b1.** INT4 2.15× smaller, **1.99× less VRAM**, +21.1% ppl |
-| 5 — Make it legible | ◐ **Nearly done** | README + benchmark table + mermaid diagram + limitations ✅, WRITEUP.md ✅. **Open: MiniDynamo link, vLLM row (blocked)** |
+| 5 — Make it legible | ✅ Complete | README + benchmark table + mermaid diagram + limitations ✅, WRITEUP.md ✅, MiniDynamo link ✅. **vLLM row blocked (Gotcha #27); reciprocal link blocked on publishing this repo** |
 
 - **Tests:** 130 passing (`python -m pytest tests/ -q`)
 - **Commits:** 26 on `main`, clean tree
@@ -599,11 +599,25 @@ block-size fix that followed.
 
 Two things remain, and **neither is code**:
 
-1. **The MiniDynamo cross-link is still a placeholder** in `README.md` line 7:
-   `[MiniDynamo](https://github.com/) *(link TBD)*`. Nathan has the real URL.
-   Also add the reciprocal link from MiniDynamo's README back here -- the two
-   repos are meant to read as one story ("router down to the CUDA kernel"), and
-   that only works if a reader can get from either to the other.
+1. **MiniDynamo cross-link: half done.** `README.md` line 7 now points at
+   https://github.com/NathanS7878/MiniDynamo (verified 200, and it matches that
+   repo's own git remote). **The reciprocal link cannot be written yet:
+   nano-infer is not published.** This repo has no git remote configured, and
+   both `NathanS7878/nano-infer` and `Iceboy66/nano-infer` return 404. So there
+   is no URL for MiniDynamo's README to point at.
+
+   To finish, in this order:
+   (a) publish nano-infer under `NathanS7878` (the account MiniDynamo lives on
+       -- note this repo's git author is currently `Iceboy66`, so check which
+       identity should own it before pushing);
+   (b) add the reciprocal line to MiniDynamo's README. That repo is checked out
+       at `../MiniDynamo` on `main` and had **uncommitted work in flight** as of
+       2026-09-04 (`router/src/main.rs`, `router/src/router.rs`, untracked
+       `router/src/dashboard.html`) -- do not fold a README link into that
+       change; commit it separately.
+
+   The two repos are meant to read as one story ("router down to the CUDA
+   kernel"), and that only works if a reader can get from either to the other.
 
 2. **The vLLM row is blocked, not pending** (Gotcha #27). vLLM has no Windows
    wheels and its sdist will not unpack here. Options, in order of honesty:
@@ -649,8 +663,10 @@ section.
 
 ### Known open items
 
-- **MiniDynamo cross-link is a placeholder** in README.md (`https://github.com/`
-  *(link TBD)*). Needs the real URL, and a reciprocal link from MiniDynamo.
+- **nano-infer is not published to GitHub** (no remote; 404 on both candidate
+  accounts). This blocks the reciprocal MiniDynamo link, and it means the git
+  history -- which CLAUDE.md rule 6 treats as part of the artifact -- is not
+  visible to anyone yet. The outbound link to MiniDynamo is done.
 - **Prefill is one request at a time** in `engine.py` (avoids padding ragged
   prompts). A production engine batches or chunks prefills; at high admission
   rates this would bottleneck. Recorded as a limitation, not hidden.
