@@ -1504,7 +1504,7 @@ and it is the one the measurements support.
 | 2 — KV cache & batching | ✅ Complete | Contiguous cache + prefill/decode split (15.6× at batch 32), paged cache (3.8× memory), continuous batching (1.55× on a request stream) |
 | 3 — Custom CUDA kernels | ✅ Complete | RMSNorm 7.7× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention 2.48× @ 11.1%. **End-to-end 2.33× (2.4× vs HF) at batch 32** |
 | 4 — Quantization | ✅ Complete | **INT8: lossless, 1.57× smaller, 1.17× tok/s at batch 1.** INT4: 2.15× smaller, 1.99× less VRAM, +21.1% ppl. Crossover reported |
-| 5 — Make it legible | Planned | README benchmark table, architecture diagram, WRITEUP.md, limitations |
+| 5 — Make it legible | ◐ Nearly done | README benchmark table, architecture diagram, WRITEUP.md, limitations |
 
 ### Phase 2 specifics
 

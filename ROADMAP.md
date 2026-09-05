@@ -42,7 +42,7 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-04, Phase 4 COMPLETE (acceptance table done)._
+_Last updated: 2026-09-04, Phase 5 mostly done (README, WRITEUP, limitations)._
 
 | Phase | Status | Headline |
 |---|---|---|
@@ -51,10 +51,10 @@ _Last updated: 2026-09-04, Phase 4 COMPLETE (acceptance table done)._
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
 | 3 — Custom CUDA kernels | ✅ Complete | 4/4 kernels, wired in, output verified. **End-to-end 2.33× at batch 32 (1739 tok/s), 2.4× vs HuggingFace** |
 | 4 — Quantization | ✅ Complete | **INT8 lossless, 1.57× smaller, 1.17× tok/s @ b1.** INT4 2.15× smaller, **1.99× less VRAM**, +21.1% ppl |
-| 5 — Make it legible | ⬜ **NEXT** | README table, diagram, WRITEUP.md, limitations |
+| 5 — Make it legible | ◐ **Nearly done** | README + benchmark table + mermaid diagram + limitations ✅, WRITEUP.md ✅. **Open: MiniDynamo link, vLLM row (blocked)** |
 
 - **Tests:** 118 passing (`python -m pytest tests/ -q`)
-- **Commits:** 23 on `main`, clean tree
+- **Commits:** 25 on `main`, clean tree
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -319,6 +319,14 @@ These were all expensive to discover. Read before debugging anything.
     bound it would be ~2x faster. The byte-counted 2x/4x ceilings were never
     approached -- do not quote them as achieved.
 
+27. **vLLM cannot be installed on this machine, and that is a documented dead
+    end rather than an untried task.** vLLM publishes no Windows wheels; `pip
+    install vllm` falls back to the sdist, which fails to unpack under Windows
+    path-length limits (verified with `pip install --dry-run vllm`). Its
+    supported platform is Linux. The README's vLLM row is deliberately empty and
+    labelled -- do not fill it with a number from other hardware. To get one
+    honestly, run the repo under WSL2 or on a Linux box and say so.
+
 ## Progress detail
 
 ### Phase 0 — Ground truth ✅
@@ -456,48 +464,48 @@ is 0.48–1.00× the reference's on every shape.
 
 ## Next actions
 
-### ▶ IMMEDIATE: Phase 5 — make it legible
+### ▶ IMMEDIATE: finish Phase 5 — two open items, then the project is done
 
-Phases 0-4 are complete. What is left decides whether any of it lands with a
-reader: per CLAUDE.md the repo "is worthless to a recruiter who cannot see the
-result in 30 seconds".
+Phases 0-4 are complete and Phase 5 is mostly done: `README.md` now opens with
+the benchmark table (every row citing the script that reproduces it), a mermaid
+architecture diagram, the quantization trade-off table, and a limitations
+section. `WRITEUP.md` is written -- 1,100 words on the decode-attention ceiling
+miss, the controlled experiment that diagnosed it as latency-bound, and the
+block-size fix that followed.
 
-1. **README opening with the benchmark table.** nano-infer vs HuggingFace vs
-   vLLM, same hardware/model/prompts, methodology stated, link to the script.
-   The **vLLM row has never been run** and is a known open item - either run it
-   or say plainly that it is absent and why.
-2. **One architecture diagram**: request in, through the cache, through the
-   kernels, token out.
-3. **`WRITEUP.md`, 800-1200 words on ONE non-obvious lesson.** Five strong
-   candidates now, all with before/after numbers already in PROGRESS.md:
-   - **#4** paged cache: blamed memory traffic, was 97% Python, found by
-     profiling, 3.62x fix. (The original pick.)
-   - **#15** `torch.softmax` fp64 on CUDA returning wrong values, which made a
-     correct kernel look wrong by 0.18 - "two implementations agreeing with each
-     other and not with the oracle indicts the oracle".
-   - **#17** decode attention predicted ~24x, delivered 2.48x, with the scaling
-     experiment that showed latency-bound rather than bandwidth-bound.
-   - **#21** the variance metric that got WORSE when measured harder, because
-     (max-min)/median is sample-size dependent.
-   - **#26** INT8 and INT4 measuring identical speed, proving neither was
-     bandwidth-bound and the byte-counted ceilings never applied.
-   **#15 or #17 are the strongest** - both are "I was wrong, here is how I found
-   out", which is what the spec says interviewers remember.
-4. **Limitations section**, from what is already recorded: prefill is one
-   request at a time (`engine.py`); decode attention sits at 11.1% of peak with
-   split-K identified but not done; the quantized matmul loses above batch 4;
-   INT4 costs 21% perplexity with RTN and no calibration; benchmarks are
-   single-GPU on a machine that shares its card with a desktop.
-5. **Fix the MiniDynamo cross-link**, still a placeholder in README.md, and add
-   the reciprocal link from MiniDynamo.
+Two things remain, and **neither is code**:
 
-### Then: Phase 5 — make it legible
+1. **The MiniDynamo cross-link is still a placeholder** in `README.md` line 7:
+   `[MiniDynamo](https://github.com/) *(link TBD)*`. Nathan has the real URL.
+   Also add the reciprocal link from MiniDynamo's README back here -- the two
+   repos are meant to read as one story ("router down to the CUDA kernel"), and
+   that only works if a reader can get from either to the other.
 
-The README table, the architecture diagram, and `WRITEUP.md`. Note there are now
-several strong candidates for the writeup beyond the original Gotcha #4 pick:
-the fp64-softmax-on-CUDA bug that made a correct kernel look wrong (#15), the
-decode-attention ceiling miss that turned out to be latency (#17), and the
-"variance metric got worse when I measured harder" finding (#21).
+2. **The vLLM row is blocked, not pending** (Gotcha #27). vLLM has no Windows
+   wheels and its sdist will not unpack here. Options, in order of honesty:
+   (a) leave it labelled as it is now -- already done, and defensible;
+   (b) run the repo under WSL2 or on a Linux machine and produce a real row;
+   (c) do NOT quote a vLLM number measured on other hardware.
+
+### Optional, if the project continues
+
+**Close the gap on kernel 4** -- 11.1% of peak is the weakest number in the
+repo, and the diagnosis (Gotcha #17) names two specific fixes that were never
+implemented: **split-K** (partition L across blocks, each producing a partial
+`(m, l, acc)`, then combine -- what real flash-decoding does for long context
+with few sequences) and **one block per KV head** instead of per query head, so
+the 7 heads sharing a KV head read it once between them. This would also improve
+the WRITEUP, which currently ends by admitting the number stands.
+
+**A tensor-core quantized matmul.** The INT4/INT8 kernel loses above batch ~4
+because it accumulates in scalar fp32 while cuBLAS rides HMMA (Gotcha #25).
+Dequantizing into fp16 fragments and issuing tensor-core instructions is the
+real fix, and a much larger kernel.
+
+**Scale to a bigger model.** CLAUDE.md suggests Qwen2.5-1.5B or Llama-3.2-1B for
+the headline numbers if VRAM allows. Two conclusions here are explicitly
+0.5B-specific and would likely change: INT4's 21% perplexity cost (larger models
+have more redundancy and quantize better), and the batch-4 crossover.
 
 ### Then: optional — close the gap on kernel 4
 

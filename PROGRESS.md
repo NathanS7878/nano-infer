@@ -1047,3 +1047,34 @@ and it is the one the measurements support.
 
 - [x] Wire into model.py + acceptance table (size, tokens/sec, perplexity, VRAM)
 - [x] **PHASE 4 COMPLETE**
+
+---
+
+## Phase 5 — Make it legible (2026-09-04)
+
+- **README.md** rewritten around the benchmark table: HF vs Phase 1 vs Phase 2
+  vs Phase 3 vs INT8, at batch 1 and batch 32, every row citing the script that
+  reproduces it. Plus a mermaid architecture diagram (request -> cache ->
+  kernels -> token), the four-kernel table with % of peak and predicted-vs-actual
+  ceilings, the quantization trade-off table, and a limitations section.
+- **WRITEUP.md** written, ~1,100 words: "The ceiling that wasn't". Three kernels
+  hit a byte-counted ceiling within 1%; decode attention missed it by 10x. The
+  controlled experiment (hold the KV pool fixed, vary only how many query heads
+  share it -- 2 to 8 heads quadruples the work and wall time does not move)
+  showed it was latency-bound rather than bandwidth-bound, and the block-size
+  sweep that followed took it from 7.9% to 11.1% of peak, 3.6x at batch 1.
+  Closes with the same pattern appearing twice more (RoPE beating its ceiling,
+  INT4 and INT8 measuring identically).
+- **vLLM row: blocked, and labelled as such.** No Windows wheels; the sdist
+  fails to unpack under Windows path-length limits (verified with
+  `pip install --dry-run vllm`). Recorded as Gotcha #27 with the honest options.
+- **Still open:** the MiniDynamo cross-link placeholder in README.md, and the
+  reciprocal link from MiniDynamo.
+
+- [x] README with the benchmark table and methodology
+- [x] Architecture diagram
+- [x] WRITEUP.md
+- [x] Limitations section
+- [ ] MiniDynamo cross-link (needs the real URL)
+- [ ] vLLM row (blocked on platform; see Gotcha #27)
+
