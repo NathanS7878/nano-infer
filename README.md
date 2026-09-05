@@ -12,6 +12,7 @@ runs a request; nano-infer is what that worker actually does on the GPU.
 > Full write-up: **[SUMMARY.md](SUMMARY.md)** — what was built, what was measured,
 > and what went wrong. One lesson in depth: **[WRITEUP.md](WRITEUP.md)**.
 > Current state: [ROADMAP.md](ROADMAP.md). Dated log: [PROGRESS.md](PROGRESS.md).
+> MIT licensed.
 
 ## The benchmark table
 
