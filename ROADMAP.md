@@ -42,7 +42,7 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-04, Phase 5 done + kernel 4b (head-group fusion) landed._
+_Last updated: 2026-09-06. Phase 5 done, kernel 4b landed, repo published._
 
 | Phase | Status | Headline |
 |---|---|---|
@@ -599,22 +599,17 @@ block-size fix that followed.
 
 Two things remain, and **neither is code**:
 
-1. **MiniDynamo cross-link: half done.** `README.md` line 7 now points at
-   https://github.com/NathanS7878/MiniDynamo (verified 200, and it matches that
-   repo's own git remote). **The reciprocal link cannot be written yet:
-   nano-infer is not published.** This repo has no git remote configured, and
-   both `NathanS7878/nano-infer` and `Iceboy66/nano-infer` return 404. So there
-   is no URL for MiniDynamo's README to point at.
+1. **MiniDynamo cross-link: outbound done, reciprocal STILL OPEN.**
+   `README.md` line 7 points at https://github.com/NathanS7878/MiniDynamo.
+   nano-infer is now published at https://github.com/NathanS7878/nano-infer, so
+   the blocker is gone -- **MiniDynamo's README still has no link back here**
+   (verified 2026-09-06: no match for "nano-infer" in that file).
 
-   To finish, in this order:
-   (a) publish nano-infer under `NathanS7878` (the account MiniDynamo lives on
-       -- note this repo's git author is currently `Iceboy66`, so check which
-       identity should own it before pushing);
-   (b) add the reciprocal line to MiniDynamo's README. That repo is checked out
-       at `../MiniDynamo` on `main` and had **uncommitted work in flight** as of
-       2026-09-04 (`router/src/main.rs`, `router/src/router.rs`, untracked
-       `router/src/dashboard.html`) -- do not fold a README link into that
-       change; commit it separately.
+   To finish: add the reciprocal line to MiniDynamo's README. That repo is
+   checked out at `../MiniDynamo` on `main` and **still had uncommitted work in
+   flight** as of 2026-09-06 (`router/src/main.rs`, `router/src/router.rs`,
+   untracked `router/src/dashboard.html`) -- do not fold a README link into that
+   change; stage README.md alone and commit it separately.
 
    The two repos are meant to read as one story ("router down to the CUDA
    kernel"), and that only works if a reader can get from either to the other.
@@ -663,19 +658,25 @@ section.
 
 ### Known open items
 
-- **nano-infer is prepared for publishing but NOT yet pushed.** Nathan pushes
-  it himself. Prep done 2026-09-04: MIT LICENSE added, and all 29 commits
-  rewritten to `NathanS7878 <988dragons@gmail.com>` (was
-  `Iceboy66 <98899dragons@gmail.com>`) so GitHub attributes the history to the
-  account MiniDynamo lives on. Verified content-identical across the rewrite
-  (same HEAD tree hash, same commit count); repo-local `user.name`/`user.email`
-  are set so future commits match.
-  - **Recovery:** the pre-rewrite history is tagged `pre-author-rewrite`
-    (1c4d972) and in `refs/original/`.
-  - **DO NOT push with `--tags` or `--mirror` until that tag is deleted** -- it
-    points at the old Iceboy66 history and would publish it.
-  - Once pushed, add the reciprocal link in MiniDynamo's README (that repo had
-    uncommitted work in flight; commit the link separately).
+- **PUBLISHED** at https://github.com/NathanS7878/nano-infer (2026-09-06),
+  MIT licensed. Two history rewrites happened before the push, both verified
+  content-identical (same HEAD tree hash, same commit count, empty diff):
+  1. every commit re-authored to `NathanS7878 <988dragons@gmail.com>` (was
+     `Iceboy66 <98899dragons@gmail.com>`), so GitHub attributes the history to
+     the account MiniDynamo lives on;
+  2. the `Co-Authored-By: Claude ...` trailer stripped from all 29 commits that
+     carried it, at Nathan's request. **Do not reintroduce that trailer in this
+     repo** -- it puts a second entry in GitHub's contributors list, which is
+     what the rewrite existed to remove.
+
+  Backup refs (`pre-author-rewrite`, `refs/original/`, `refs/backup/`) have all
+  been deleted; the pre-rewrite history no longer exists locally. Repo-local
+  `user.name`/`user.email` are set so future commits match.
+  - **Possible loose end:** GitHub's contributors list is cached and still
+    showed the stripped co-author after the force-push. It usually clears on
+    its own. If it has not, the definitive fix is deleting and recreating the
+    repo, then `git push -u origin main` -- cheap only while there are no
+    stars, forks or issues to lose.
 - **Prefill is one request at a time** in `engine.py` (avoids padding ragged
   prompts). A production engine batches or chunks prefills; at high admission
   rates this would bottleneck. Recorded as a limitation, not hidden.
