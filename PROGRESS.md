@@ -1369,3 +1369,94 @@ weights in about a quarter of the bytes. Phase 4 measured the INT4 matmul
 kernel LOSING to cuBLAS above batch 4 — in the host-bound regime. Under graphs,
 at batch 1, do you expect INT4 decode to be faster or slower than fp16, and by
 roughly how much? Commit to a number before looking at the next entry.
+
+## 2026-09-16 (cont.) — Quantization under CUDA graphs, and capture paid once
+
+### Quantization's speed story, re-asked
+
+Every Phase 4 speed number came from the eager engine, now known to be
+host-bound. Gotcha #26 had leaned on that without knowing it: "INT8 and INT4
+measure the SAME speed ... ~33 us floor per call."
+
+**Safety first.** The dequant-matmul kernels have no host reads in their launch
+path; with INT8 and with INT4 weights the static decode step raised no sync under
+`set_sync_debug_mode("error")`, and eager-static == `generate_paged` and graph ==
+eager-static, token for token, at batches 1, 4 and 32.
+
+**Prediction, written before running.** Weight bytes per step: fp16 987.9 MB,
+INT8 630.7 MB, INT4 459.6 MB (the tied lm_head stays fp16), so byte ceilings
+1.57x and 2.15x. Phase 4 put the kernel at 2.7-29.8% of peak, so expected well
+under ceiling: **~1.3x INT8, ~1.5x INT4 at batch 1; INT4 slower than fp16 at
+batch 32.**
+
+**Measured** (`bench/quant_graph.py`, contended GPU 26% / 1,317 MiB, arms
+round-robin; decode ms/step; speedup vs fp16 on the same engine):
+
+| batch | precision | eager ms | eager vs fp16 | graph ms | **graph vs fp16** | graph weight % peak |
+|---|---|---|---|---|---|---|
+| 1 | fp16 | 20.04 | 1.00x | 3.67 | 1.00x | 60.1% |
+| 1 | int8 | 17.95 | 1.12x | 2.72 | **1.35x** | 51.8% |
+| 1 | int4 | 17.20 | 1.16x | 2.59 | **1.42x** | 39.7% |
+| 4 | fp16 | 20.85 | 1.00x | 3.91 | 1.00x | 56.3% |
+| 4 | int8 | 17.54 | 1.19x | 3.58 | 1.09x | 39.3% |
+| 4 | int4 | 17.49 | 1.19x | 4.77 | **0.82x** | 21.5% |
+| 32 | fp16 | 21.89 | 1.00x | 4.39 | 1.00x | 50.3% |
+| 32 | int8 | 20.35 | 1.08x | 16.54 | **0.27x** | 8.5% |
+| 32 | int4 | 32.37 | 0.68x | 28.18 | **0.16x** | 3.6% |
+
+**Scoring the prediction.** Batch 1: predicted 1.3x / 1.5x, measured 1.35x /
+1.42x — held. Batch 32 direction — held. NOT predicted: INT4 already losing at
+batch 4, and the size of the batch-32 loss (0.16x).
+
+**What it means.**
+- The host overhead was diluting the quantized kernel's loss ~3x. Eager INT4 at
+  batch 32 looked like 0.68x; graphed it is 0.16x. Removing the host sped fp16 up
+  5x and could not speed up a GPU-slow kernel.
+- At batch 1 graphs finally let quantization pay. INT8 reached 86% of its byte
+  ceiling, INT4 66%. INT4 vs INT8 is only 1.05x despite streaming 1.37x fewer
+  bytes (39.7% vs 51.8% of peak on their own bytes): #26's "INT4 cannot turn
+  fewer bytes into speed" survives; its "same speed" was partly the host floor.
+- The tied lm_head is unquantized and is 59% of INT4's weight traffic.
+- **The tensor-core quantized matmul is now the top kernel item**, not an
+  optional extra.
+
+Recorded as Gotcha #38; #25 and #26 annotated in place rather than rewritten.
+
+### Capture paid once: DecodeGraphRunner
+
+Capture was 0.12-0.25 s per call. None of what a graph binds depends on the
+prompt — KV pool, read table, rope tables, state buffers all follow from
+(batch, prompt_len, max_new_tokens) — so `DecodeGraphRunner` captures on its
+first `generate` and serves every later prompt of that shape with prefill +
+replay. `generate_paged_static` became a one-shot wrapper around it.
+
+It reuses the KV pool without zeroing. Safe because prefill overwrites
+[0, prompt_len) and every decode step writes its slot before any read (the
+kernel's loop is bounded by `lengths`; the PyTorch path masks by it). That is an
+argument, so it is also a test: three DIFFERENT prompts through one runner must
+equal fresh one-shot runs, kernels on and off, and an earlier returned tensor
+must not change afterwards (`generate` returns a clone). Plus: capture happens
+once (0.126 s then 0.000 s), and the runner raises if the kernel setting differs
+from the one it captured with, or if the shape is wrong. 155 tests passing.
+
+`bench/decode_graph_runner.py` (contended, 29% / 1,289 MiB), whole-call tok/s,
+each call a different prompt:
+
+| batch | new tokens | eager paged | one-shot graph | reused runner | runner vs one-shot |
+|---|---|---|---|---|---|
+| 1 | 64 | 1.00x | 3.33x | **4.90x** | 1.47x |
+| 32 | 64 | 1.00x | 3.26x | **4.62x** | 1.42x |
+| 32 | 16 | 1.00x | **1.61x** | **3.61x** | **2.24x** |
+
+Capture is a fixed cost per call, so the shorter the generation the more of the
+graph's win it eats: at 16 tokens one-shot graphs are barely worth it. Gotcha #39.
+
+### Not done, and why
+
+- **Clean-GPU numbers.** Every run today was on a contended desktop. Ratios are
+  sound by construction; absolutes wait for Nathan to close the GPU-using apps.
+- **Tensor-core quantized matmul.** Now clearly the right next kernel, and a
+  large one. Per CLAUDE.md, Nathan should predict memory- vs compute-bound
+  before it is written, so it was not started unilaterally.
+- **Scaling to 1.5B.** Needs a ~3 GB model download, which needs Nathan's
+  go-ahead.

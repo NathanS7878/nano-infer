@@ -42,7 +42,7 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-16. CUDA-graph decode landed: the host bottleneck is gone for static batches._
+_Last updated: 2026-09-16. CUDA-graph decode + reusable runner landed; quantization re-measured under graphs._
 
 | Phase | Status | Headline |
 |---|---|---|
@@ -51,11 +51,11 @@ _Last updated: 2026-09-16. CUDA-graph decode landed: the host bottleneck is gone
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
 | 3 — Custom CUDA kernels | ✅ Complete | 4/4 kernels + **4b head-group fusion**. Decode attention **6.89× vs Phase 2 paged, 30.3% of peak** (was 2.52× / 11.1%). End-to-end 2.19–2.35× vs PyTorch |
 | + CUDA-graph decode | ✅ Landed | **Decode 5.3–5.5× faster at short context, 4.0–4.2× long** (graph+kernels vs paged+kernels). Decode now streams weights at **60% of peak** (was 10.9%). Contended-GPU run: ratios solid, absolutes need a clean rerun |
-| 4 — Quantization | ✅ Complete | **INT8 lossless, 1.57× smaller, 1.17× tok/s @ b1.** INT4 2.15× smaller, **1.99× less VRAM**, +21.1% ppl |
+| 4 — Quantization | ✅ Complete (speed re-measured under graphs, #38) | **INT8 lossless, 1.57× smaller, 1.17× tok/s @ b1.** INT4 2.15× smaller, **1.99× less VRAM**, +21.1% ppl |
 | 5 — Make it legible | ✅ Complete | README + benchmark table + mermaid diagram + limitations ✅, WRITEUP.md ✅, MiniDynamo link ✅. **vLLM row blocked (Gotcha #27); reciprocal link blocked on publishing this repo** |
 
-- **Tests:** 150 passing (`python -m pytest tests/ -q`)
-- **Commits:** 34 on `main`
+- **Tests:** 155 passing (`python -m pytest tests/ -q`)
+- **Commits:** 36 on `main`
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -92,6 +92,8 @@ $env:PYTHONPATH="C:\Users\Nathan stevens\OneDrive\Projects\nano-infer"
 | `-m bench.kernel_rope` | Fused RoPE vs PyTorch + bandwidth utilization |
 | `-m bench.kernel_attention` | Decode attention; fusion, gather and head-group wins separated |
 | `-m bench.decode_graph` | **paged vs static vs CUDA graph**, kernels off/on, arms round-robin |
+| `-m bench.decode_graph_runner` | capture every call vs once (`DecodeGraphRunner`) |
+| `-m bench.quant_graph` | fp16/INT8/INT4 × eager/graph decode — Phase 4's speed story, re-asked |
 | `-m bench.kernel_attention --sharing` | **Is it DRAM-bound or issue-bound?** The experiment that reframed 11.1% |
 | `-m bench.phase3_end_to_end` | **The Phase 3 acceptance number**: tokens/sec, kernels off vs on |
 | `-m bench.perplexity` | Quality cost of INT8/INT4 on WikiText-2, with error bars |
@@ -114,7 +116,9 @@ nano_infer/
   engine.py      Request, RunStats, ContinuousBatchingEngine (static + continuous)
   quant.py       INT8 per-channel + INT4 group-wise; the quality reference
   decode_graph.py  static, sync-free decode step + CUDA-graph capture of it.
-                 Static batches only (generate_paged's contract); the
+                 DecodeGraphRunner captures once per (batch, prompt_len,
+                 max_new_tokens) and serves many prompts; generate_paged_static
+                 is the one-shot wrapper. Static batches only; the
                  continuous-batching engine is NOT graphed
   kernels/
     __init__.py  JIT loader — handles ninja/MSVC/CUDA-libpath quirks
@@ -321,6 +325,10 @@ These were all expensive to discover. Read before debugging anything.
     still weight-bound there and rides tensor cores; a scalar-fp32 dequant
     kernel cannot follow. Verified not to be register pressure: splitting batch
     32 into four BT=8 tiles gives 0.97x.
+    **UPDATE (2026-09-16), see #38:** end to end under CUDA graphs the loss is
+    far worse than the eager engine showed — INT4 decode is **0.16×** fp16 at
+    batch 32 (eager: 0.68×) and already **0.82×** at batch 4 (eager: 1.19×).
+    The op-level batch-4 crossover still roughly holds for INT8, not for INT4.
 
 26. **INT8 and INT4 measure the SAME speed here, which proves neither is
     bandwidth-bound.** ~1.8x both, at 2.7-29.8% of peak, with an identical
@@ -328,6 +336,12 @@ These were all expensive to discover. Read before debugging anything.
     kernels 1-3 hit at ~58 us). INT4 moves half of INT8's bytes; if bandwidth
     bound it would be ~2x faster. The byte-counted 2x/4x ceilings were never
     approached -- do not quote them as achieved.
+    **UPDATE (2026-09-16), see #38:** the "same speed" was partly the host floor.
+    Under graphs at batch 1, INT4 decode is 1.05x faster than INT8 -- not
+    identical, but nowhere near the 1.37x fewer bytes it streams. INT8 runs at
+    51.8% of peak on its own bytes, INT4 at 39.7%. So the conclusion survives in
+    a sharper form: the INT4 unpack costs enough arithmetic that it cannot turn
+    its smaller bytes into proportional speed.
 
 27. **vLLM cannot be installed on this machine, and that is a documented dead
     end rather than an untried task.** vLLM publishes no Windows wheels; `pip
@@ -451,6 +465,43 @@ These were all expensive to discover. Read before debugging anything.
     rounding (Gotcha #2): 2 of 32 sequences diverge on one shape, as an exact
     tie (gap 0.0000) and a 0.0156 near-tie. Attributed by holding everything but
     width fixed, per #20.
+
+38. **Every Phase 4 speed number was taken in the host-bound regime, and the
+    host overhead was DILUTING the quantized kernel's loss about 3x.**
+    `bench/quant_graph.py`, decode vs fp16 on the same engine, kernels on:
+
+    | | batch 1 | batch 4 | batch 32 |
+    |---|---|---|---|
+    | INT8 eager | 1.12x | 1.19x | 1.08x |
+    | INT8 **graph** | **1.35x** | 1.09x | **0.27x** |
+    | INT4 eager | 1.16x | 1.19x | 0.68x |
+    | INT4 **graph** | **1.42x** | **0.82x** | **0.16x** |
+
+    At batch 1, graphs let quantization finally pay: weight bytes per step
+    fall from 987.9 MB to 630.7 (INT8) and 459.6 (INT4), byte-counted ceilings
+    1.57x and 2.15x. INT8 reached 86% of its ceiling, INT4 only 66%. At batch 32
+    fp16 decode drops to 4.39 ms but INT4 stays at 28.18 ms, because the dequant
+    kernel itself is now the entire bottleneck -- removing the host helps fp16
+    and cannot help a slow GPU kernel. **This promotes the tensor-core quantized
+    matmul from "optional, much larger kernel" to the single thing standing
+    between quantization and a speed win above batch 1.**
+    Also: the tied lm_head is NOT quantized and is **59%** of INT4's per-step
+    weight traffic (272.3 of 459.6 MB). It caps INT4's ceiling at 2.15x, and it
+    is unmeasured whether quantizing it would cost perplexity.
+    Prediction written before measuring: ~1.3x INT8 / ~1.5x INT4 at batch 1,
+    INT4 slower at batch 32. Batch 1 and the batch-32 direction held; the batch-4
+    INT4 loss and the size of the batch-32 loss were not predicted.
+
+39. **One-shot CUDA graphs barely help SHORT generations; capture must be
+    amortised.** `bench/decode_graph_runner.py`, batch 32, whole call vs eager:
+    64 tokens -> one-shot 3.26x, reused runner **4.62x**; 16 tokens -> one-shot
+    only **1.61x**, reused runner **3.61x**. Capture (0.12-0.25 s) is a fixed
+    cost per call, so the shorter the generation the more of the win it eats.
+    `DecodeGraphRunner` reuses its KV pool WITHOUT zeroing it; that is safe
+    because prefill overwrites [0, prompt_len) and each decode step writes its
+    slot before anything can read it. Tested with three different prompts
+    through one runner against fresh runs, kernels on and off -- a leak would
+    otherwise produce fluent, wrong text.
 
 ---
 
@@ -647,21 +698,35 @@ launch no GPU work, so a graph erases their host cost entirely, and cutting them
 by hand first would have been effort a graph makes moot. Measured that way
 instead — the static (sync-free, eager) column is the no-graph control.
 
+### ✅ DONE 2026-09-16
+- Quantization under graphs (#38): graph-safe, sync-free, token-identical;
+  INT8 1.35x / INT4 1.42x at batch 1, INT4 0.16x at batch 32.
+- Capture amortised (#39): `DecodeGraphRunner`, 3.61-4.62x vs eager end to end.
+
 ### ▶ IMMEDIATE, in order
 
-1. **Clean-GPU rerun of `bench/decode_graph.py`** before any of these absolutes
-   go in the README. Needs Wallpaper Engine / browsers / Steam closed — target
-   ~0% util and <500 MiB (Gotcha #18). This needs Nathan at the machine.
-2. **Quantization under graphs.** Decode is now weight-streaming bound (#36), and
-   INT8/INT4 move 2×/4× fewer weight bytes. Phase 4's speed conclusions were all
-   measured in the host-bound regime, so they may not survive. First check that
-   the quantized matmul is graph-safe, then measure.
-3. **Amortise capture.** 0.12–0.25 s per call is ~28% of a short batch-32 call.
-   Cache the graph (plus its static state and KV pool) per
-   (batch, prompt_len, max_new_tokens) so repeated calls replay only.
-4. **Graph the continuous-batching engine** — one graph per batch size with
-   padded slots, as production engines do. Larger change; `engine.py` is
-   entirely ungraphed today.
+1. **Clean-GPU rerun** of `bench/decode_graph.py`, `bench/quant_graph.py` and
+   `bench/decode_graph_runner.py` before any CUDA-graph absolute goes in the
+   README. All three ran contended (23-29% util, ~1.3 GB from desktop apps).
+   Target ~0% util and <500 MiB (#18). **Needs Nathan to close Wallpaper Engine,
+   browsers, Steam, Discord, Spotify.**
+2. **Tensor-core quantized matmul** — now the top kernel item (#38). Under graphs
+   INT4 decode is 0.16x fp16 at batch 32 and loses from batch 4. Dequantize into
+   fp16 fragments and issue tensor-core instructions instead of accumulating in
+   scalar fp32. Per CLAUDE.md: have Nathan predict memory- vs compute-bound
+   first. A cheaper first experiment: dequantize the 168 projections to fp16
+   at load time and graph THAT, to measure the ceiling a perfect quantized
+   kernel could approach at each batch.
+3. **Quantizing the lm_head** — 59% of INT4's per-step weight traffic (#38).
+   Measure perplexity first; the embedding is tied, so this changes the input
+   embedding too unless the head is split off.
+4. **Graph the continuous-batching engine** — one graph per batch-size bucket
+   with padded slots. `engine.py` is entirely ungraphed today and still pays the
+   host overhead.
+5. **Scale to Qwen2.5-1.5B or Llama-3.2-1B** (CLAUDE.md headline). ~3 GB
+   download, so ask Nathan first. Architecture must be read from the checkpoint:
+   e.g. Qwen2.5-1.5B's n_rep of 6 has no grouped-kernel instantiation (2, 4, 7,
+   8, 14, 16), so it would silently use the per-query-head path.
 
 ### Then: finish Phase 5 — two open items
 
@@ -764,6 +829,9 @@ section.
   is not graphed.
 - **CUDA-graph absolutes were measured on a contended GPU.** Ratios stand;
   tok/s needs a clean rerun before publishing.
+- **Quantized decode is slower than fp16 from batch 4 up under graphs** (INT4
+  0.82x at batch 4, 0.16x at batch 32). The Phase 4 README table's speed
+  columns come from the host-bound eager engine and understate that loss.
 - **Split-K is still unimplemented**, so kernel 4b falls back to the
   per-query-head kernel below 8 blocks.
 

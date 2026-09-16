@@ -151,6 +151,11 @@ peak bandwidth** (the eager engine: 10.9%), with step time finally growing with
 context — decode is now bound by the GPU, which is where the kernels live.
 Token output is identical to the eager engine with kernels on.
 
+Capture costs 0.12–0.25 s, so it has to be paid once, not per call. A reused
+`DecodeGraphRunner` (`python -m bench.decode_graph_runner`) takes a batch-32
+call from **3.26× to 4.62×** the eager engine at 64 tokens, and from **1.61× to
+3.61×** at 16 tokens, where per-call capture had eaten most of the win.
+
 ## Quantization: what it costs
 
 WikiText-2 test split, 8,176 predicted tokens. Reproduce:
@@ -181,6 +186,24 @@ carries a scale and a zero point.
 memory saving, buys nothing in speed, and costs 21% perplexity — round-to-nearest
 with no calibration, on a 0.5B model with little redundancy to spare.
 
+**The speed columns above were measured on the eager engine, which turned out to
+be host-bound — and that hid most of the quantized kernel's cost.** Re-measured
+with CUDA-graph decode (`python -m bench.quant_graph`; contended GPU, ratios
+only), decode speed vs fp16:
+
+| | batch 1 | batch 4 | batch 32 |
+|---|---|---|---|
+| INT8, eager | 1.12× | 1.19× | 1.08× |
+| INT8, **CUDA graph** | **1.35×** | 1.09× | **0.27×** |
+| INT4, eager | 1.16× | 1.19× | 0.68× |
+| INT4, **CUDA graph** | **1.42×** | **0.82×** | **0.16×** |
+
+With the host out of the loop, quantization finally pays at batch 1 — INT8
+reaches 86% of its 1.57× byte-counted ceiling. But above batch 1 the dequant
+kernel becomes the whole bottleneck: fp16 decode at batch 32 drops to 4.39 ms
+while INT4 stays at 28.18 ms. The tied `lm_head` stays fp16 and is 59% of INT4's
+per-step weight traffic, which caps INT4's ceiling at 2.15× regardless.
+
 ## Limitations
 
 Stated plainly, because a repo that only lists wins is not reporting.
@@ -191,7 +214,9 @@ Stated plainly, because a repo that only lists wins is not reporting.
   (`nano_infer/decode_graph.py`) removes that for `generate_paged`-style static
   batches: **5.3–5.5× faster decode at short context, 4.0–4.2× at long**. The
   continuous-batching engine (`engine.py`) is **not** graphed and still pays
-  it. Graph capture also costs 0.12–0.25 s per call, rebuilt every call.
+  it. Graphs are also exact-shape only: `DecodeGraphRunner` captures once per
+  (batch, prompt length, new tokens), with no bucketing or padding, and the
+  one-shot `generate_paged_static` recaptures every call (0.12–0.25 s).
 - **The CUDA-graph numbers came from a contended GPU** (23% utilization from
   other desktop apps at start). The ratios are robust — every arm ran
   round-robin inside each repeat — but the absolute tok/s are not publishable
@@ -201,9 +226,11 @@ Stated plainly, because a repo that only lists wins is not reporting.
   it is also what the head-grouped kernel needs to stop losing at batch 1, where
   it has just 2 blocks for 46 SMs. Below 8 blocks the dispatcher falls back to
   the per-query-head kernel.
-- **The quantized matmul loses above batch ~4.** cuBLAS stays weight-bound to
-  batch 32 and rides tensor cores; a scalar-fp32 dequant kernel cannot follow.
-  INT4 at batch 32 is 0.50× fp16.
+- **The quantized matmul loses from batch 4 up, and badly under CUDA graphs.**
+  cuBLAS stays weight-bound to batch 32 and rides tensor cores; a scalar-fp32
+  dequant kernel cannot follow. INT4 decode is 0.82× fp16 at batch 4 and
+  **0.16×** at batch 32 once host overhead no longer dilutes it. A tensor-core
+  quantized matmul is the fix and is **not implemented**.
 - **INT4 costs 21% perplexity.** Round-to-nearest, no GPTQ/AWQ calibration pass.
   Published INT4 results are better and are measured on much larger models.
 - **Prefill is one request at a time** (`engine.py`), to avoid padding ragged
