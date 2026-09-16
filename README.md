@@ -126,6 +126,31 @@ all seven query heads that share a KV head, reads each K and V element once into
 a register, and feeds it to all seven — **2.60× on the kernel, at identical
 numerical error.**
 
+## Removing the host from the decode loop
+
+The eager decode step turned out to be host-bound: ~20 ms per step whether the
+batch was 1 or 32 and the context 33 or 1025 tokens — ~3,200 aten dispatches and
+65 GPU→host synchronisations per step. `nano_infer/decode_graph.py` builds a
+decode step with no host inputs at all (every KV block allocated up front, all
+bookkeeping derived on the GPU), then captures it as a CUDA graph. Reproduce:
+`python -m bench.decode_graph`.
+
+Decode ms/step, kernels on — **ratios only**; this run was on a contended GPU
+(see Limitations):
+
+| Batch | Prompt | Eager paged | Eager, syncs removed | **CUDA graph** | Speedup |
+|---|---|---|---|---|---|
+| 1 | 32 | 20.14 | 18.62 | **3.67** | **5.49×** |
+| 32 | 32 | 23.29 | 19.42 | **4.41** | **5.28×** |
+| 32 | 512 | 22.48 | 19.24 | **5.66** | **3.97×** |
+
+Two things this separated that one number would have hidden. Removing all 65
+syncs alone bought only **1.00–1.20×** — dispatch, not synchronisation, was the
+cost. And once graphed, a batch-1 step streams **988 MB of weights at 60% of
+peak bandwidth** (the eager engine: 10.9%), with step time finally growing with
+context — decode is now bound by the GPU, which is where the kernels live.
+Token output is identical to the eager engine with kernels on.
+
 ## Quantization: what it costs
 
 WikiText-2 test split, 8,176 predicted tokens. Reproduce:
@@ -160,15 +185,17 @@ with no calibration, on a 0.5B model with little redundancy to spare.
 
 Stated plainly, because a repo that only lists wins is not reporting.
 
-- **The kernel speedups do not reach end-to-end throughput.** Making decode
-  attention 2.6× faster moved `generate_paged` by 0.99–1.03×, i.e. not at all.
-  The decode step costs ~20 ms *regardless of batch size (1 vs 32) or context
-  length (33 vs 1025)*, which no GPU-bound loop can do. It issues ~3,200 aten
-  ops per step — only 169 of them `linear`, the rest `as_strided` ×660, `view`
-  ×393, `transpose` ×289, `reshape` ×245 — and at a few µs of dispatch each that
-  is the whole 20 ms. **The decode loop is CPU-dispatch-bound, so the GPU is
-  idle for most of it.** This is the single most important open problem in the
-  repo and it is not a kernel problem.
+- **The eager decode loop is host-bound; only static batches are fixed.** The
+  eager step costs ~20 ms regardless of batch size or context length — ~3,200
+  aten dispatches and 65 GPU→host syncs per step. CUDA-graph decode
+  (`nano_infer/decode_graph.py`) removes that for `generate_paged`-style static
+  batches: **5.3–5.5× faster decode at short context, 4.0–4.2× at long**. The
+  continuous-batching engine (`engine.py`) is **not** graphed and still pays
+  it. Graph capture also costs 0.12–0.25 s per call, rebuilt every call.
+- **The CUDA-graph numbers came from a contended GPU** (23% utilization from
+  other desktop apps at start). The ratios are robust — every arm ran
+  round-robin inside each repeat — but the absolute tok/s are not publishable
+  until rerun on an idle card, so none appear in the table above.
 - **Decode attention is still only at 30.3% of peak**, up from 11.1%. Split-K
   (flash-decoding proper) is the remaining named fix and is **not implemented**;
   it is also what the head-grouped kernel needs to stop losing at batch 1, where

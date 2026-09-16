@@ -1206,3 +1206,166 @@ One test-writing lesson too (Gotcha #32): the first per-head-separation test use
 a score gap of 7.5, which leaves 3.4% of the softmax mass off-target — enough to
 move the output by 0.137 and fail its own 0.02 bar. The kernel was right; the
 fixture's premise was not. Widening the gap to 3125 made the selection exact.
+
+## 2026-09-06 — Published, and the two history rewrites before it
+
+Not engineering, but part of the artifact (CLAUDE.md rule 6), so recorded.
+
+- MIT LICENSE added.
+- All commits re-authored from `Iceboy66 <98899dragons@gmail.com>` to
+  `NathanS7878 <988dragons@gmail.com>`, so GitHub attributes the history to the
+  account MiniDynamo lives on. Verified content-identical: same HEAD tree hash,
+  same commit count, empty diff against a backup ref.
+- The `Co-Authored-By: Claude ...` trailer stripped from the 29 commits carrying
+  it, at Nathan's request, and force-pushed. Again content-identical.
+- Published at https://github.com/NathanS7878/nano-infer. Nathan did every GitHub
+  step himself; nothing was pushed from the assistant session.
+- Backup refs deleted after the push landed.
+
+## 2026-09-16 — MiniDynamo reciprocal link
+
+MiniDynamo's README now links back here (MiniDynamo commit `1d2a1aa`), so the
+"router down to the CUDA kernel" story reads in both directions. That repo had
+unrelated uncommitted work in flight (`router/src/main.rs`, `router/src/router.rs`,
+untracked `router/src/dashboard.html`); only README.md was staged. MiniDynamo had
+no local git identity, so a commit would have been authored as Iceboy66 — its
+local `user.name`/`user.email` are now set to NathanS7878 to match.
+
+## 2026-09-16 — CUDA-graph decode: removing the host from the loop
+
+### What was actually in the step
+
+Gotcha #29 had counted ~3,200 aten dispatches per decode step. Before designing
+a fix, the GPU->host synchronisations were counted too, with
+`torch.cuda.set_sync_debug_mode("warn")`:
+
+| batch | syncs per decode step | where |
+|---|---|---|
+| 1 | 3 | `forward_paged:629`, `:630`, `cache.plan:247` |
+| 32 | **65** | 32 x `int(lengths[i])` at :629, 32 x at :630, 1 x `int(lengths.max())` |
+
+The first attempt reported 5 syncs over 10 steps. Python's default warning
+filter shows each call site once; `warnings.simplefilter("always")` gave the
+real count. (Gotcha #34.)
+
+Both costs exist for one reason: the step recomputes bookkeeping whose answer is
+known before decode starts. In `generate_paged` every sequence's final length is
+prompt + max_new_tokens.
+
+### The design (`nano_infer/decode_graph.py`)
+
+- Allocate every KV block before decode; build the `[batch, final_len]` read
+  table ONCE.
+- Derive per-step state on the GPU: `lengths = pos + 1`, write slot =
+  `read.gather(1, pos)`, mask = `arange < lengths`.
+- The step writes its argmax into its own input buffer, records it via
+  `index_copy_` at a device-side step counter, and advances `pos` in place.
+
+So a decode step has no host inputs at all — no H2D copy, no sync, no allocator
+call — which is the precondition for a CUDA graph. It reuses
+`model.attention_paged` unchanged, so it runs the same attention code as eager.
+
+`use_graph=False` runs this static step eagerly; `use_graph=True` captures it.
+Keeping both separates the sync/bookkeeping win from the dispatch win.
+
+Skipped on purpose: hand-cutting the view/transpose/reshape ops first. They
+launch no GPU work, so a graph erases their host cost entirely; the eager static
+mode is the control that shows what the graph adds.
+
+### Correctness first
+
+| check | result |
+|---|---|
+| graph replay vs eager static step, 5 shapes x kernels off/on | **bitwise equal, 10/10** |
+| static graph vs `generate_paged`, kernels ON, 5 shapes | **token-identical, 5/5** |
+| same, kernels OFF, batch 32 p32 g64 | 2 of 32 sequences diverge — both near-ties |
+| step under `set_sync_debug_mode("error")`, kernels off/on | **no sync raised** |
+
+The kernels-off divergence was attributed, not bounded (Gotcha #20). The one
+structural difference is that the read table is `final_len` wide from the first
+step instead of growing. Holding everything else fixed:
+- width 33 twice: bitwise identical (not nondeterminism);
+- width 33 vs 96: layer-0 attention moves by 1.5e-05 to 6.1e-05 (fp16 rounding
+  from a different `q @ K^T` shape, Gotcha #2);
+- decode kernel at width 33 vs 96: **bitwise identical** — it reads `lengths` and
+  never materialises scores, so kernels-on parity is structural, not luck.
+The flips: seq 17 at step 1, reference top-1/top-2 gap **0.0000** (exact tie);
+seq 21 at step 62, gap **0.0156** — both below the 0.02-0.04 logit shift the
+width causes. (Gotcha #37.)
+
+One bug on the way (Gotcha #35): warmup ran on a side stream after
+`side.synchronize()`, which waits on the WRONG stream. The prefill and state
+snapshots were still queued on the default stream, so warmup restored from
+unwritten clones -> garbage `pos` -> out-of-bounds gather. Passed at batch 1 on
+timing, asserted at batch 4. Fixed with `torch.cuda.synchronize()` at the capture
+boundaries.
+
+20 new tests in `tests/test_decode_graph.py`; 150 passing overall.
+
+### The measurement (`bench/decode_graph.py`)
+
+**Contended GPU: 23% utilization and 1,353 MiB at start** (Wallpaper Engine,
+browsers, Steam, Discord, Spotify). The benchmark was built for that: all six
+arms run round-robin inside every repeat, so background load hits each arm
+equally and the RATIOS hold. The absolutes are not publishable and are not in
+the README table. cv stayed at 0.2-6.9%.
+
+Decode ms/step:
+
+| batch | prompt | paged off | paged on | static off | static on | graph off | graph on | graph vs paged (on) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 32 | 49.36 | 20.14 | 46.78 | 18.62 | 7.38 | **3.67** | **5.49x** |
+| 4 | 32 | 48.90 | 21.12 | 48.69 | 18.72 | 7.27 | **3.95** | **5.35x** |
+| 16 | 32 | 49.08 | 22.16 | 48.35 | 19.20 | 8.43 | **4.05** | **5.47x** |
+| 32 | 32 | 51.89 | 23.29 | 48.13 | 19.42 | 9.67 | **4.41** | **5.28x** |
+| 32 | 512 | 50.84 | 22.48 | 47.99 | 19.24 | 17.82 | **5.66** | **3.97x** |
+| 8 | 1024 | 49.08 | 21.79 | 47.32 | 19.34 | 10.98 | **5.17** | **4.22x** |
+
+End to end, including prefill AND capture, batch 32 p32 g64: 1,359.6 -> 4,669.2
+tok/s with kernels on (3.43x).
+
+Capture: 0.12-0.14 s kernels on, 0.22-0.25 s kernels off (more ops to record),
+paid every call. At batch 32 p32 g64 with kernels on that is 0.124 s of a
+0.439 s call — 28%.
+
+### What it showed
+
+**1. Syncs were cheap; dispatch was the cost.** Static (all 65 syncs removed)
+vs paged: 1.00-1.20x. Graph vs paged: 5.3-6.7x at short context. Counting a
+cost is not measuring its weight. (Gotcha #34.)
+
+**2. Gotcha #29 drew the wrong lesson, and this is the correction.** Under the
+old `paged` engine, all kernels on vs all off is **2.21-2.45x on decode**. #29
+claimed the Phase 3 kernels were optimizing a part of the step nobody waited on,
+and the roadmap said the end-to-end kernel gain was "mostly prefill". Both wrong.
+What had been flat was kernel 4 vs 4b — the same number of launches. In a
+host-bound loop **a fusion pays through the launches it deletes, not the GPU time
+it saves**: RMSNorm and SwiGLU each collapse a chain of PyTorch ops into one
+launch, 4b replaces one launch with one launch. (Gotcha #33.)
+
+**3. Decode is now GPU-bound, and specifically weight-streaming-bound.** Weights
+read per step, computed from the checkpoint shapes: 24 x 29.8 MB of layer
+matrices + 272.3 MB tied lm_head = **987.9 MB** (the lm_head is 28% of it).
+
+| engine | batch | ms/step | weight GB/s | % of 448 GB/s peak |
+|---|---|---|---|---|
+| graph+kernels | 1 | 3.67 | 269.2 | **60.1%** |
+| graph+kernels | 4 | 3.95 | 250.1 | 55.8% |
+| graph+kernels | 32 | 4.41 | 224.0 | 50.0% |
+| paged+kernels | 1 | 20.14 | 49.1 | 10.9% |
+| paged+kernels | 32 | 23.29 | 42.4 | 9.5% |
+
+Floor at peak: 2.21 ms/step. Weights-only, so it understates total traffic
+(KV reads excluded), and it was measured contended. And the signature changed:
+step time now GROWS with context (batch 32 kernels off, 9.67 -> 17.82 ms from
+p32 to p512), the invariance that proved #29 is gone. Kernels on vs off under
+graphs is 1.84-2.19x at short context and **3.15x at batch 32 p512**, where the
+attention kernel is finally what the engine waits on. (Gotcha #36.)
+
+### Prediction question for Nathan, before the next experiment
+
+Decode is now streaming ~1 GB of weights at ~60% of peak. INT4 stores those
+weights in about a quarter of the bytes. Phase 4 measured the INT4 matmul
+kernel LOSING to cuBLAS above batch 4 — in the host-bound regime. Under graphs,
+at batch 1, do you expect INT4 decode to be faster or slower than fp16, and by
+roughly how much? Commit to a number before looking at the next entry.

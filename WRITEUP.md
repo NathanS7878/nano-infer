@@ -190,14 +190,27 @@ worth reporting — but a percentage is a ratio, and **the numerator has to be t
 bytes the hardware actually moved, not the bytes your algorithm deserved to
 move.** The gap between those two is not noise. It *was* the optimization.
 
-And the sting in the tail: none of it reaches end-to-end throughput. A 2.6×
-kernel moved `generate_paged` by 0.99×, because the decode step takes ~20 ms
-whether the batch is 1 or 32 and whether the context is 33 tokens or 1025 — it
-issues ~3,200 aten dispatches per step, of which only 169 are matmuls. The loop
-is CPU-dispatch-bound and the GPU is idle through most of it. Which is Gotcha #4
-of this project, recurring one level up: *profile before optimizing, and profile
-the thing you are actually waiting on.* I optimized the fastest part of a step I
-had never once measured end to end.
+And the sting in the tail: the refit did not reach end-to-end throughput. A
+2.6× faster kernel moved `generate_paged` by 0.99×, because the decode step took
+~20 ms whether the batch was 1 or 32 and the context 33 tokens or 1025 — ~3,200
+aten dispatches per step, only 169 of them matmuls. The loop was host-bound.
+Which is Gotcha #4 of this project, recurring one level up: *profile before
+optimizing, and profile the thing you are actually waiting on.*
+
+I first drew the wrong lesson from that — that the Phase 3 kernels were
+optimizing a part of the step nobody was waiting on. The same engine, with all
+kernels off versus on, is 2.2–2.5× on decode. What had actually been flat was
+kernel 4 versus 4b, which launch the *same number* of kernels. In a host-bound
+loop, a fusion pays through the launches it deletes, not the GPU time it saves:
+RMSNorm and SwiGLU each turned a chain of PyTorch ops into one launch; 4b turned
+one launch into one launch.
+
+Capturing the decode step as a CUDA graph removed the host from the loop: decode
+5.3× faster at batch 32, and a batch-1 step now streams its 988 MB of weights at
+60% of peak bandwidth rather than 11%. Only then did step time start growing with
+context, and only then did the attention kernel become something the engine was
+actually waiting on — kernels on versus off under graphs is 3.15× at a 512-token
+context.
 
 ---
 

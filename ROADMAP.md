@@ -42,7 +42,7 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-06. Phase 5 done, kernel 4b landed, repo published._
+_Last updated: 2026-09-16. CUDA-graph decode landed: the host bottleneck is gone for static batches._
 
 | Phase | Status | Headline |
 |---|---|---|
@@ -50,11 +50,12 @@ _Last updated: 2026-09-06. Phase 5 done, kernel 4b landed, repo published._
 | 1 — Correct but slow | ✅ Complete | From-scratch forward pass, token-for-token vs HF |
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
 | 3 — Custom CUDA kernels | ✅ Complete | 4/4 kernels + **4b head-group fusion**. Decode attention **6.89× vs Phase 2 paged, 30.3% of peak** (was 2.52× / 11.1%). End-to-end 2.19–2.35× vs PyTorch |
+| + CUDA-graph decode | ✅ Landed | **Decode 5.3–5.5× faster at short context, 4.0–4.2× long** (graph+kernels vs paged+kernels). Decode now streams weights at **60% of peak** (was 10.9%). Contended-GPU run: ratios solid, absolutes need a clean rerun |
 | 4 — Quantization | ✅ Complete | **INT8 lossless, 1.57× smaller, 1.17× tok/s @ b1.** INT4 2.15× smaller, **1.99× less VRAM**, +21.1% ppl |
 | 5 — Make it legible | ✅ Complete | README + benchmark table + mermaid diagram + limitations ✅, WRITEUP.md ✅, MiniDynamo link ✅. **vLLM row blocked (Gotcha #27); reciprocal link blocked on publishing this repo** |
 
-- **Tests:** 130 passing (`python -m pytest tests/ -q`)
-- **Commits:** 26 on `main`, clean tree
+- **Tests:** 150 passing (`python -m pytest tests/ -q`)
+- **Commits:** 34 on `main`
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -90,6 +91,7 @@ $env:PYTHONPATH="C:\Users\Nathan stevens\OneDrive\Projects\nano-infer"
 | `-m bench.kernel_swiglu` | Fused SwiGLU vs PyTorch + bandwidth utilization |
 | `-m bench.kernel_rope` | Fused RoPE vs PyTorch + bandwidth utilization |
 | `-m bench.kernel_attention` | Decode attention; fusion, gather and head-group wins separated |
+| `-m bench.decode_graph` | **paged vs static vs CUDA graph**, kernels off/on, arms round-robin |
 | `-m bench.kernel_attention --sharing` | **Is it DRAM-bound or issue-bound?** The experiment that reframed 11.1% |
 | `-m bench.phase3_end_to_end` | **The Phase 3 acceptance number**: tokens/sec, kernels off vs on |
 | `-m bench.perplexity` | Quality cost of INT8/INT4 on WikiText-2, with error bars |
@@ -111,6 +113,9 @@ nano_infer/
   cache.py       KVCache (contiguous), PagedKVCache, BlockAllocator, SlotPlan
   engine.py      Request, RunStats, ContinuousBatchingEngine (static + continuous)
   quant.py       INT8 per-channel + INT4 group-wise; the quality reference
+  decode_graph.py  static, sync-free decode step + CUDA-graph capture of it.
+                 Static batches only (generate_paged's contract); the
+                 continuous-batching engine is NOT graphed
   kernels/
     __init__.py  JIT loader — handles ninja/MSVC/CUDA-libpath quirks
     bindings.cpp PYBIND11_MODULE for all kernels (one .cu cannot own it once
@@ -363,6 +368,12 @@ These were all expensive to discover. Read before debugging anything.
     This is Gotcha #4 one level up. **Before optimizing any kernel further,
     measure whether the engine is waiting on the GPU at all.**
 
+    **CORRECTION (2026-09-16), see #33:** the headline above overreaches. The
+    measurement is right and so is the diagnosis — but "invalidates the
+    intuition behind most of Phase 3" is wrong. Kernels on vs off under this
+    same engine is 2.2–2.5× on DECODE. What was flat was kernel 4 vs 4b, which
+    launch the same number of kernels. Fixed by CUDA graphs: #36.
+
 30. **Do not trust `torch.profiler` for a GPU-utilization RATIO here.** Summing
     `self_device_time_total` over `key_averages()` double-counts (parents plus
     children) and gives >100% utilization; and profiling inflates the CPU side
@@ -388,6 +399,58 @@ These were all expensive to discover. Read before debugging anything.
     Widening the gap to 3125 made the selection exact and the deviation 0.000.
     **Compute what your fixture actually implies before believing it indicts the
     code.**
+
+33. **In a dispatch-bound loop, a fusion pays through the LAUNCHES it deletes,
+    not the GPU time it saves.** Under the old `paged` engine, all kernels on vs
+    all off is **2.2–2.5× on decode** — clearly visible end to end, despite the
+    loop being host-bound. Kernel 4 → 4b, which made attention 2.6× faster on
+    the GPU but launches the same number of kernels, was 1.00×. Both are
+    explained by one rule: when the host is the bottleneck, count dispatches.
+    RMSNorm and SwiGLU each replace a chain of PyTorch ops with one launch, so
+    they paid; 4b replaced one launch with one launch, so it could not. Gotcha
+    #29 drew the wrong lesson from the right measurement, and the ROADMAP said
+    the end-to-end kernel gain was "mostly prefill" — also wrong.
+
+34. **The 65 synchronisations were real and nearly free to remove — and removing
+    them bought almost nothing.** `set_sync_debug_mode` counted 65 GPU→host syncs
+    per decode step at batch 32 (two `int(lengths[i])` per sequence in
+    `forward_paged`, one `int(lengths.max())` in `cache.plan`), 3 at batch 1.
+    The static step deletes all of them: **1.00–1.20× on decode.** CUDA graphs,
+    which delete the dispatches, gave 5.3–6.7×. Counting a cost is not the same
+    as measuring its weight — measure the removal separately.
+    **Counting gotcha:** Python's default warning filter shows each call site
+    ONCE, so `set_sync_debug_mode("warn")` undercounted 650 syncs as 5. Wrap in
+    `warnings.catch_warnings()` + `simplefilter("always")`.
+
+35. **CUDA-graph warmup on a side stream must synchronise the DEVICE, not the
+    side stream.** `side.synchronize()` waits on the side stream, but the
+    prefill and state snapshots were still queued on the default stream. The
+    warmup restored state from unwritten clones → garbage `pos` → out-of-bounds
+    gather. Passed at batch 1 on timing luck, asserted at batch 4. Use
+    `torch.cuda.synchronize()` at every capture boundary; they are once per
+    call and outside the replay loop, so they cost nothing that matters.
+
+36. **Under CUDA graphs decode is WEIGHT-STREAMING-bound, and now shows the
+    GPU-bound signature the old engine never did.** A decode step reads 988 MB
+    of weights (24 × 29.8 MB of layers + **272 MB tied lm_head, 28% of it**).
+    graph+kernels at batch 1: 3.67 ms/step = **269 GB/s = 60% of peak**; the old
+    engine managed 10.9%. Floor at 448 GB/s: 2.21 ms/step. And step time now
+    GROWS with context (batch 32, kernels off: 9.67 ms at p32 → 17.82 ms at
+    p512) — the invariance that proved #29 is gone. Kernels on vs off under
+    graphs: 1.8–2.2× at short context, **3.15× at batch 32 p512** where the
+    attention kernel is finally the thing being waited on.
+    **Capture is not free:** 0.12–0.25 s per call (more ops to record with
+    kernels off), about 28% of a 64-token batch-32 call, because the graph is
+    rebuilt every call. Production engines capture once per batch size.
+
+37. **A graphed step whose read table is padded to final length is exact under
+    the decode kernel and only near-tie-exact under PyTorch attention.** The
+    kernel reads `lengths` and never materialises scores, so width cannot reach
+    its arithmetic (asserted: output bitwise equal at width 33 vs 96). The
+    PyTorch path sees width as the shape of `q @ K^T`, which changes fp16
+    rounding (Gotcha #2): 2 of 32 sequences diverge on one shape, as an exact
+    tie (gap 0.0000) and a 0.0156 near-tie. Attributed by holding everything but
+    width fixed, per #20.
 
 ---
 
@@ -564,29 +627,41 @@ result of the two.
 
 ## Next actions
 
-### ▶ IMMEDIATE: the decode loop is CPU-bound (Gotcha #29)
+### ✅ DONE: the decode loop was host-bound — CUDA graphs (Gotchas #33–#37)
 
-**This is now the most valuable open problem in the repo, and it is worth more
-than any remaining kernel work.** The engine issues ~3,200 aten dispatches per
-decode step; only 169 are matmuls. Step time is invariant to batch size and to
-context length, which means the GPU is idle waiting for Python. Every kernel in
-Phase 3 is therefore optimizing a part of the step that is not the bottleneck.
+`nano_infer/decode_graph.py`, measured by `bench/decode_graph.py`. Decode
+ms/step (**contended GPU: 23% util / 1.35 GB at start — ratios are robust
+because arms run round-robin per repeat; absolutes are NOT publishable**):
 
-Concrete first moves, cheapest first:
-1. **Count and cut the metadata ops.** `as_strided` ×660, `view` ×393,
-   `transpose` ×289, `reshape` ×245 per step. Much of this is the
-   `view/transpose/contiguous` dance around attention; some is per-sequence
-   indexing (`select` ×185 at batch 32 vs absent at batch 1 — find that loop).
-2. **CUDA graphs for the decode step.** The shape is fixed across steps, which
-   is exactly the case graphs exist for; it would collapse ~3,200 dispatches
-   into one replay. This is what production engines do and it is the single
-   highest-leverage change available.
-3. Re-measure the Phase 3 kernels' end-to-end contribution afterwards. They
-   should finally show up.
+| batch | prompt | paged, off | paged, on | static, on | **graph, off** | **graph, on** | graph vs paged (on) |
+|---|---|---|---|---|---|---|---|
+| 1 | 32 | 49.36 | 20.14 | 18.62 | 7.38 | **3.67** | **5.49×** |
+| 4 | 32 | 48.90 | 21.12 | 18.72 | 7.27 | **3.95** | **5.35×** |
+| 16 | 32 | 49.08 | 22.16 | 19.20 | 8.43 | **4.05** | **5.47×** |
+| 32 | 32 | 51.89 | 23.29 | 19.42 | 9.67 | **4.41** | **5.28×** |
+| 32 | 512 | 50.84 | 22.48 | 19.24 | 17.82 | **5.66** | **3.97×** |
+| 8 | 1024 | 49.08 | 21.79 | 19.34 | 10.98 | **5.17** | **4.22×** |
 
-The old measurement to keep honest: `bench/phase3_end_to_end.py` reports
-2.19–2.35× kernels-on vs kernels-off. That gap is real but it is mostly RMSNorm
-and SwiGLU on the *prefill*, not decode attention.
+Step 1 (cut metadata ops) was deliberately skipped: view/transpose/reshape
+launch no GPU work, so a graph erases their host cost entirely, and cutting them
+by hand first would have been effort a graph makes moot. Measured that way
+instead — the static (sync-free, eager) column is the no-graph control.
+
+### ▶ IMMEDIATE, in order
+
+1. **Clean-GPU rerun of `bench/decode_graph.py`** before any of these absolutes
+   go in the README. Needs Wallpaper Engine / browsers / Steam closed — target
+   ~0% util and <500 MiB (Gotcha #18). This needs Nathan at the machine.
+2. **Quantization under graphs.** Decode is now weight-streaming bound (#36), and
+   INT8/INT4 move 2×/4× fewer weight bytes. Phase 4's speed conclusions were all
+   measured in the host-bound regime, so they may not survive. First check that
+   the quantized matmul is graph-safe, then measure.
+3. **Amortise capture.** 0.12–0.25 s per call is ~28% of a short batch-32 call.
+   Cache the graph (plus its static state and KV pool) per
+   (batch, prompt_len, max_new_tokens) so repeated calls replay only.
+4. **Graph the continuous-batching engine** — one graph per batch size with
+   padded slots, as production engines do. Larger change; `engine.py` is
+   entirely ungraphed today.
 
 ### Then: finish Phase 5 — two open items
 
@@ -684,8 +759,11 @@ section.
 - Benchmarks show run-to-run variance (contiguous batch-32 read 828 and 736
   tok/s on different runs). Prefer ratios over absolutes where possible, and
   state the variance.
-- **The decode loop is CPU-dispatch-bound** (Gotcha #29) — the largest open
-  problem, promoted to the immediate next action above.
+- **Host-bound decode: fixed for `generate_paged`-style static batches** by CUDA
+  graphs (#36). **Still host-bound in `engine.py`** (continuous batching), which
+  is not graphed.
+- **CUDA-graph absolutes were measured on a contended GPU.** Ratios stand;
+  tok/s needs a clean rerun before publishing.
 - **Split-K is still unimplemented**, so kernel 4b falls back to the
   per-query-head kernel below 8 blocks.
 
