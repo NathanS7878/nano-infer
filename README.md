@@ -245,8 +245,13 @@ Stated plainly, because a repo that only lists wins is not reporting.
 - **The quantized matmul loses from batch 4 up, and badly under CUDA graphs.**
   cuBLAS stays weight-bound to batch 32 and rides tensor cores; a scalar-fp32
   dequant kernel cannot follow. INT4 decode is 0.82× fp16 at batch 4 and
-  **0.16×** at batch 32 once host overhead no longer dilutes it. A tensor-core
-  quantized matmul is the fix and is **not implemented**.
+  **0.16×** at batch 32 once host overhead no longer dilutes it. The fix would
+  be to multiply on tensor cores, and **that attempt failed**: the only
+  device-side tensor-core interface available (`nvcuda::wmma`, an internal,
+  undocumented header) does not compute a matrix multiply as used — wrong by
+  63–90%, nonzero on zero inputs, not even bilinear. Reproduce with
+  `python -m bench.hmma_probe`. A dequantize-to-workspace + cuBLAS kernel is
+  possible with supported APIs, but by byte count it is capped near 0.44× fp16.
 - **INT4 costs 21% perplexity.** Round-to-nearest, no GPTQ/AWQ calibration pass.
   Published INT4 results are better and are measured on much larger models.
 - **Prefill is one request at a time** (`engine.py`), to avoid padding ragged

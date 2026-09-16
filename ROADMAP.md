@@ -42,7 +42,7 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-16. CUDA-graph decode + runner + quantization re-measured, and rerun clean. Tensor-core quantized matmul in progress._
+_Last updated: 2026-09-16. CUDA-graph decode rerun clean. Tensor-core quantized matmul BLOCKED (#40). Next: Qwen2.5-1.5B._
 
 | Phase | Status | Headline |
 |---|---|---|
@@ -55,7 +55,7 @@ _Last updated: 2026-09-16. CUDA-graph decode + runner + quantization re-measured
 | 5 — Make it legible | ✅ Complete | README + benchmark table + mermaid diagram + limitations ✅, WRITEUP.md ✅, MiniDynamo link ✅. **vLLM row blocked (Gotcha #27); reciprocal link blocked on publishing this repo** |
 
 - **Tests:** 155 passing (`python -m pytest tests/ -q`)
-- **Commits:** 36 on `main`
+- **Commits:** 38 on `main`
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -94,6 +94,7 @@ $env:PYTHONPATH="C:\Users\Nathan stevens\OneDrive\Projects\nano-infer"
 | `-m bench.decode_graph` | **paged vs static vs CUDA graph**, kernels off/on, arms round-robin |
 | `-m bench.decode_graph_runner` | capture every call vs once (`DecodeGraphRunner`) |
 | `-m bench.quant_graph` | fp16/INT8/INT4 × eager/graph decode — Phase 4's speed story, re-asked |
+| `-m bench.hmma_probe` | **negative result**: tensor-core fragments do not compute a matmul as used (#40) |
 | `-m bench.kernel_attention --sharing` | **Is it DRAM-bound or issue-bound?** The experiment that reframed 11.1% |
 | `-m bench.phase3_end_to_end` | **The Phase 3 acceptance number**: tokens/sec, kernels off vs on |
 | `-m bench.perplexity` | Quality cost of INT8/INT4 on WikiText-2, with error bars |
@@ -120,6 +121,9 @@ nano_infer/
                  max_new_tokens) and serves many prompts; generate_paged_static
                  is the one-shot wrapper. Static batches only; the
                  continuous-batching engine is NOT graphed
+  kernels/experimental/hmma_probe.cu
+                 NOT in the engine build. Built only by bench/hmma_probe.py
+                 to reproduce the tensor-core dead end (#40)
   kernels/
     __init__.py  JIT loader — handles ninja/MSVC/CUDA-libpath quirks
     bindings.cpp PYBIND11_MODULE for all kernels (one .cu cannot own it once
@@ -508,6 +512,31 @@ These were all expensive to discover. Read before debugging anything.
     otherwise produce fluent, wrong text.
     (Clean rerun: 64 tokens 3.17x -> 4.38x; 16 tokens 1.61x -> 3.51x.)
 
+40. **The tensor-core quantized matmul is a dead end with the interfaces
+    available, and the evidence is reproducible** (`python -m bench.hmma_probe`).
+    The plan: dequantize one weight tile at a time into shared memory, multiply
+    it on tensor cores through `nvcuda::wmma` (`<mma.h>`, `mma_sync(D,A,B,C) =
+    A.B + C`). Step 1 -- plain fp16 X.W^T on m16n16k16 fragments, no
+    quantization, purely to pin the undocumented layout -- came back 63-90% off
+    on every real projection shape (cuBLAS: ~0.05%). The probe then ruled out
+    layout as the cause:
+      - 0 of 16 interpretations (A row/col x B row/col x store row/col x
+        aliased/separate accumulator) match ANY candidate product, on
+        small-integer inputs whose products are exact in fp16;
+      - a single 1 anywhere in X lights up the same output cells wherever it is;
+      - all-zero inputs give nonzero output, nondeterministically when aliased;
+      - y(2X) != 2 y(X) -- not bilinear, so not a multiply of any layout.
+    The type definitions agree: the "16x16" fp16 matrix fragment has 16 storage
+    elements, not 256, and the accumulator 8. The header is marked proprietary
+    and internal ("must not be used directly") with no element semantics.
+    Stopped there on purpose: reverse-engineering an undocumented internal by
+    probing bit patterns could not produce a claim this repo could defend.
+    **Lesson: prove the interface before building on it.** Step 1 existed to
+    test only the layout, which is why the failure surfaced in one small
+    experiment instead of inside a quantized kernel where it would have looked
+    like a dequantization bug. Nathan's prediction for this kernel stays
+    untested.
+
 ---
 
 ## Progress detail
@@ -731,22 +760,11 @@ cross-session caveat stated beside them.
 
 ### ▶ IMMEDIATE, in order
 
-1. **Tensor-core quantized matmul — IN PROGRESS.** — now the top kernel item (#38). Under graphs
-   INT4 decode is 0.16x fp16 at batch 32 and loses from batch 4. Dequantize into
-   fp16 fragments and issue tensor-core instructions instead of accumulating in
-   scalar fp32. Per CLAUDE.md: have Nathan predict memory- vs compute-bound
-   first. The bar it has to clear is already measured: graphed fp16 decode
-   (**4.14 ms at batch 32, clean**), since dequantizing to fp16 at load time
-   simply IS the fp16 row. A quantized kernel wins only if it keeps fp16's
-   compute cost while streaming fewer bytes.
-   **Nathan's prediction, recorded 2026-09-16 before any code: compute-bound,
-   and it WILL beat graphed fp16 at batch 32.**
-   Design so far (see PROGRESS): tensor cores via `<mma.h>` / `nvcuda::wmma`,
-   fp16 m16n16k16 fragments. Fragment element layout is undocumented, so a
-   quantized tile is dequantized into SHARED memory (one 512-byte tile per
-   worker, never the matrix in global memory) and loaded from there. Step 1,
-   a plain fp16 tensor-core matmul to pin the layout, is in
-   `nano_infer/kernels/quant_hmma.cu` with tests in `tests/test_quant_hmma.py`.
+1. **Scale to Qwen2.5-1.5B-Instruct** (CLAUDE.md's headline model). Downloaded
+   with Nathan's permission (3.10 GB). Read its architecture from config.json;
+   note its query/KV head ratio has no grouped-kernel instantiation (2, 4, 7, 8,
+   14, 16), so check which decode kernel it actually runs before trusting any
+   attention number.
 2. **Quantizing the lm_head** — 59% of INT4's per-step weight traffic (#38).
    Measure perplexity first; the embedding is tied, so this changes the input
    embedding too unless the head is split off.
@@ -758,10 +776,27 @@ cross-session caveat stated beside them.
    per-query-head kernel, so it would not change what the engine runs. Now that
    decode is weight-streaming bound (#36), attention is not the batch-1
    bottleneck either.
-5. **Scale to Qwen2.5-1.5B or Llama-3.2-1B** (CLAUDE.md headline). Nathan
-   granted the ~3 GB download on 2026-09-16; Qwen2.5-1.5B-Instruct downloaded. Architecture must be read from the checkpoint:
-   e.g. Qwen2.5-1.5B's n_rep of 6 has no grouped-kernel instantiation (2, 4, 7,
-   8, 14, 16), so it would silently use the per-query-head path.
+
+### ✗ BLOCKED: tensor-core quantized matmul (#40)
+
+Attempted 2026-09-16 and abandoned with evidence. The only device-side
+tensor-core interface available, `nvcuda::wmma` in `<mma.h>`, does not compute a
+matmul when used as a dense 16x16x16 multiply, and its header is marked
+internal/proprietary with no element semantics. Reproduce the negative result:
+`python -m bench.hmma_probe`. **Nathan's prediction (compute-bound; beats graphed
+fp16 at 4.14 ms/step, batch 32) was not tested -- neither confirmed nor
+refuted.**
+
+What remains possible, with honest ceilings:
+- **Dequantize into a bounded fp16 workspace, then cuBLAS.** Works with a
+  supported API, but it reads the packed weights, writes fp16, then streams that
+  fp16 -- about 0.26 + 1 + 1 = 2.26x fp16's weight bytes -- so in the
+  memory-bound regime it is capped near **0.44x fp16**. Better than INT4's
+  0.16x at batch 32, never better than fp16. Also a literal reading of
+  CLAUDE.md's "never materialize the dequantized weight matrix" needs care: a
+  row-chunked workspace is not the matrix, but it is fp16 weights in VRAM.
+- **Accept the trade.** INT4 already wins 1.42x at batch 1 under graphs and
+  halves VRAM; state that it loses above batch 1, as the README now does.
 
 ### Then: finish Phase 5 — two open items
 

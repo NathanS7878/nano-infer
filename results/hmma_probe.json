@@ -1,0 +1,192 @@
+{
+  "hardware": "NVIDIA GeForce RTX 3070 (see HARDWARE.md)",
+  "header": "<mma.h> -> crt/mma.h, crt/mma.hpp (CUDA 12.4, conda-forge)",
+  "step1_matmul": [
+    {
+      "B": 16,
+      "N": 32,
+      "K": 48,
+      "max_abs_truth": 19.254078878089786,
+      "cublas_err": 0.007407337194308639,
+      "fragment_err": 14.895672712475061
+    },
+    {
+      "B": 16,
+      "N": 896,
+      "K": 896,
+      "max_abs_truth": 118.5298488602275,
+      "cublas_err": 0.05285241059027612,
+      "fragment_err": 94.67137981532142
+    },
+    {
+      "B": 32,
+      "N": 128,
+      "K": 896,
+      "max_abs_truth": 113.78289596363902,
+      "cublas_err": 0.04542640084400773,
+      "fragment_err": 72.22012476902455
+    },
+    {
+      "B": 32,
+      "N": 4864,
+      "K": 896,
+      "max_abs_truth": 140.79078020801535,
+      "cublas_err": 0.05083554273005575,
+      "fragment_err": 126.26981660100864
+    },
+    {
+      "B": 32,
+      "N": 896,
+      "K": 4864,
+      "max_abs_truth": 299.3985845951829,
+      "cublas_err": 0.178960177807312,
+      "fragment_err": 240.03894122842757
+    }
+  ],
+  "interpretations": [
+    {
+      "mode": 0,
+      "A_col": false,
+      "B_col": false,
+      "store_col": false,
+      "separate_C": false,
+      "matches": []
+    },
+    {
+      "mode": 1,
+      "A_col": true,
+      "B_col": false,
+      "store_col": false,
+      "separate_C": false,
+      "matches": []
+    },
+    {
+      "mode": 2,
+      "A_col": false,
+      "B_col": true,
+      "store_col": false,
+      "separate_C": false,
+      "matches": []
+    },
+    {
+      "mode": 3,
+      "A_col": true,
+      "B_col": true,
+      "store_col": false,
+      "separate_C": false,
+      "matches": []
+    },
+    {
+      "mode": 4,
+      "A_col": false,
+      "B_col": false,
+      "store_col": true,
+      "separate_C": false,
+      "matches": []
+    },
+    {
+      "mode": 5,
+      "A_col": true,
+      "B_col": false,
+      "store_col": true,
+      "separate_C": false,
+      "matches": []
+    },
+    {
+      "mode": 6,
+      "A_col": false,
+      "B_col": true,
+      "store_col": true,
+      "separate_C": false,
+      "matches": []
+    },
+    {
+      "mode": 7,
+      "A_col": true,
+      "B_col": true,
+      "store_col": true,
+      "separate_C": false,
+      "matches": []
+    },
+    {
+      "mode": 8,
+      "A_col": false,
+      "B_col": false,
+      "store_col": false,
+      "separate_C": true,
+      "matches": []
+    },
+    {
+      "mode": 9,
+      "A_col": true,
+      "B_col": false,
+      "store_col": false,
+      "separate_C": true,
+      "matches": []
+    },
+    {
+      "mode": 10,
+      "A_col": false,
+      "B_col": true,
+      "store_col": false,
+      "separate_C": true,
+      "matches": []
+    },
+    {
+      "mode": 11,
+      "A_col": true,
+      "B_col": true,
+      "store_col": false,
+      "separate_C": true,
+      "matches": []
+    },
+    {
+      "mode": 12,
+      "A_col": false,
+      "B_col": false,
+      "store_col": true,
+      "separate_C": true,
+      "matches": []
+    },
+    {
+      "mode": 13,
+      "A_col": true,
+      "B_col": false,
+      "store_col": true,
+      "separate_C": true,
+      "matches": []
+    },
+    {
+      "mode": 14,
+      "A_col": false,
+      "B_col": true,
+      "store_col": true,
+      "separate_C": true,
+      "matches": []
+    },
+    {
+      "mode": 15,
+      "A_col": true,
+      "B_col": true,
+      "store_col": true,
+      "separate_C": true,
+      "matches": []
+    }
+  ],
+  "zero_inputs": [
+    {
+      "mode": 0,
+      "nonzero_cells": 3,
+      "max_abs": 2.0,
+      "deterministic": false
+    },
+    {
+      "mode": 8,
+      "nonzero_cells": 4,
+      "max_abs": 2.0,
+      "deterministic": true
+    }
+  ],
+  "bilinear": false,
+  "verdict": "fragments do NOT behave as a matmul as used here (ROADMAP #40 stands)"
+}

@@ -1536,3 +1536,90 @@ fragments and one instruction, `mma_sync(D, A, B, C) = A.B + C`.
 With Nathan's permission: 3.10 GB from huggingface.co/Qwen/Qwen2.5-1.5B-Instruct
 (model.safetensors 3,087.5 MB, plus config, generation config and tokenizer).
 Not yet loaded; architecture to be read from its config.json, not assumed.
+
+## 2026-09-16 (cont.) — Tensor-core quantized matmul: a dead end, proven
+
+### The plan
+
+INT4 decode is 0.16x fp16 at batch 32 under graphs (#38), matching the ~8x gap
+between this card's scalar fp32 (~20.3 TFLOP/s) and fp16 tensor-core
+(~163 TFLOP/s) throughput. So the accumulation had to move to tensor cores. The
+only device-side interface is `nvcuda::wmma` (`<mma.h>` -> `crt/mma.h[pp]`):
+fixed-shape register fragments and `mma_sync(D, A, B, C) = A.B + C`.
+
+Rejected up front: the sub-byte integer path (4-bit `s4`/`u4` fragments). It
+multiplies 4-bit by 4-bit, which would require quantized activations -- a
+different, unmeasured quality trade.
+
+Chosen: fp16 `m16n16k16` fragments. Their element layout is undocumented and the
+only supported ways to fill one are `load_matrix_sync` from memory and
+`fill_fragment`, so a quantized tile would be dequantized into shared memory and
+loaded from there -- one tile per worker, never the matrix in global memory.
+
+### Step 1 -- prove the interface before building on it
+
+Before any dequantization: a plain fp16 X.W^T on fragments, both operands loaded
+from global memory, compared with torch. Tests used rectangular shapes and
+structured row/column scales so a layout error could not pass as rounding.
+
+Two compile issues on the way, both recorded because they will recur:
+- torch's extension build defines `__CUDA_NO_HALF_CONVERSIONS__`, which compiles
+  out every numeric `__half` constructor. fp16 zero was built from raw bits
+  (`__half_raw` with `.x = 0`).
+- the 3-D launch dimension type is `dim3`.
+
+**Result: 63-90% error on every shape** (e.g. batch 32 x gate_proj: fragment
+error 1.263e+02 against a 1.408e+02 output scale; cuBLAS 5.08e-02). Finite and
+plausibly sized -- the signature a layout error was expected to have.
+
+### It was not layout
+
+With every dimension 16, a single tile removes `ldm` from the question, leaving
+A row/col x B row/col x store row/col, plus whether `mma_sync` tolerates the
+accumulator aliasing its own C input: 16 interpretations. The probe ran all of
+them against ten candidate products on small-integer inputs (exact in fp16):
+
+- **0 of 16 match any candidate.**
+- X = I, W = I gives 3 nonzero cells, not an identity.
+- A single 1 at x[0,1], x[1,0], x[0,15] or x[15,0] produces IDENTICAL outputs --
+  the result does not depend on where the input is.
+- Output values like 1.19e-7 and 6.56e-7 are fp16 subnormals: small raw integers
+  reinterpreted as half-floats.
+- **All-zero inputs give nonzero output** (up to 1.3e-4 in one run, 2.0 in
+  another), and with an aliased accumulator not the same output twice.
+- **y(2X) != 2 y(X).** Not bilinear, so not a multiply under any layout.
+
+The type definitions agree once read carefully: the m16n16k16 fp16 matrix
+fragment derives from `__frag_base<__half, 16>` -- 16 storage elements, not 256
+-- and the accumulator holds 8. These are not dense 16x16 matrices, and the
+header, marked proprietary and "internal ... must not be used directly",
+documents no element semantics.
+
+### Decision
+
+Stopped. Reverse-engineering an undocumented internal by probing bit patterns
+could not produce a claim this repo could defend. The probe was moved OUT of the
+engine build into `nano_infer/kernels/experimental/hmma_probe.cu`, built only by
+`bench/hmma_probe.py` as its own extension, so the negative result stays
+reproducible (hard rule 3) without the engine carrying code that does not work.
+The step-1 tests were removed -- they tested an external interface, not this
+repo's code. `bindings.cpp` and `kernels/__init__.py` are byte-identical to
+before the attempt; 155 tests still pass.
+
+**Nathan's prediction** (compute-bound; beats graphed fp16 at 4.14 ms/step, batch
+32) **was not tested** -- neither confirmed nor refuted. My counter-prediction
+(dequant-traffic-bound, near fp16) is equally untested.
+
+### What remains, with ceilings
+
+- Dequantize into a bounded fp16 workspace, then cuBLAS: supported APIs, but it
+  moves ~2.26x fp16's weight bytes (read packed, write fp16, stream fp16), so it
+  is capped near 0.44x fp16 when memory-bound. Better than 0.16x, never better
+  than fp16.
+- Accept the trade: INT4 is 1.42x at batch 1 and halves VRAM; it loses above
+  batch 1, and the README says so.
+
+**Lesson (Gotcha #40): prove the interface before building on it.** Step 1
+tested only the layout, which is why this surfaced as one small, attributable
+experiment rather than as a mysterious error inside a quantized kernel, where it
+would have looked like a dequantization bug.
