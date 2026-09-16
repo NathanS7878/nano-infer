@@ -15,6 +15,18 @@ Architecture facts below were read directly from the model config on 2026-08-20
     activation            silu (SwiGLU)
     tie_word_embeddings   True   (output projection reuses the embedding matrix)
     native dtype          bfloat16
+
+SELECTING A DIFFERENT MODEL. Set NANO_INFER_MODEL before importing anything
+from nano_infer, e.g.
+
+    NANO_INFER_MODEL=Qwen/Qwen2.5-1.5B-Instruct python -m bench.decode_graph
+
+The default is Qwen2.5-0.5B-Instruct, so every existing script, test and
+recorded number is unchanged. model.QwenConfig() reads the SELECTED checkpoint's
+config.json and refuses architectures the engine does not implement, rather than
+running one model's weights through another model's dimensions. Results and the
+parity fixture are written per model (see RESULTS_DIR, REFERENCE_FIXTURE), so a
+larger model's runs can never overwrite the 0.5B numbers the README cites.
 """
 from __future__ import annotations
 
@@ -25,7 +37,12 @@ import torch
 
 # --- model & precision -----------------------------------------------------
 
-MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL_NAME = os.environ.get("NANO_INFER_MODEL", DEFAULT_MODEL)
+
+# "Qwen/Qwen2.5-0.5B-Instruct" -> "qwen2.5-0.5b". The 0.5B slug reproduces the
+# fixture filename that predates model selection, so nothing had to be renamed.
+MODEL_SLUG = MODEL_NAME.split("/")[-1].lower().replace("-instruct", "")
 
 # We run and compare in fp16, deliberately. Phase 1's acceptance bar is a logit
 # difference under 1e-3 *in fp16*, so the HF reference must be captured in the
@@ -41,8 +58,11 @@ SEED = 0
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
-RESULTS_DIR = REPO_ROOT / "results"
-REFERENCE_FIXTURE = FIXTURES_DIR / "reference_qwen2.5-0.5b.pt"
+# The default model keeps writing to results/ itself, where every number the
+# README cites already lives; any other model gets its own subdirectory.
+RESULTS_DIR = (REPO_ROOT / "results" if MODEL_NAME == DEFAULT_MODEL
+               else REPO_ROOT / "results" / MODEL_SLUG)
+REFERENCE_FIXTURE = FIXTURES_DIR / f"reference_{MODEL_SLUG}.pt"
 
 # --- the canonical prompt set ----------------------------------------------
 # Five prompts, intentionally varied (factual, reasoning, code, list, open).

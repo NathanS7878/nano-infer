@@ -698,6 +698,8 @@ GROUPED_CASES = ATTN_CASES + [
     (3, 16, 2, 64, 129),     # n_rep 8, block wider than the sequence
     (5, 14, 7, 64, 260),     # n_rep 2, the shallowest grouping
     (8, 14, 2, 64, 1),       # a single cached position, grouped
+    (32, 12, 2, 128, 300),   # Qwen2.5-1.5B geometry: n_rep 6, head_dim 128
+    (1, 12, 2, 128, 513),    # 1.5B at batch 1, spanning a tile boundary
 ]
 
 

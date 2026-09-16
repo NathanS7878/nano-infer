@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import glob
 import os
-from dataclasses import dataclass
+import functools
+import json
+from dataclasses import dataclass, field
 
 import contextlib
 
@@ -30,27 +32,85 @@ from safetensors import safe_open
 from . import config as cfg
 
 
+@functools.lru_cache(maxsize=None)
+def checkpoint_config(model_name: str) -> dict:
+    """The selected checkpoint's config.json, validated against what this engine
+    actually implements.
+
+    Everything the forward pass depends on is checked here, and anything it does
+    not implement raises. The failure this prevents is the quiet one: a model
+    that loads, runs, and produces fluent text through an architecture detail
+    the engine ignores -- RoPE scaling, an untied output head, sliding-window
+    attention -- exactly like the adjacent-pair RoPE bug in ROADMAP #12.
+    """
+    from huggingface_hub import hf_hub_download, try_to_load_from_cache
+    path = try_to_load_from_cache(model_name, "config.json")
+    if not isinstance(path, str):
+        path = hf_hub_download(model_name, "config.json")
+    with open(path, encoding="utf-8") as f:
+        c = json.load(f)
+
+    problems = []
+    if c.get("model_type") != "qwen2":
+        problems.append(f"model_type {c.get('model_type')!r} (engine implements qwen2)")
+    if c.get("hidden_act") != "silu":
+        problems.append(f"hidden_act {c.get('hidden_act')!r} (engine implements SwiGLU/silu)")
+    if c.get("rope_scaling"):
+        problems.append(f"rope_scaling {c['rope_scaling']!r} (engine implements plain RoPE)")
+    if not c.get("tie_word_embeddings", False):
+        problems.append("untied lm_head (engine reuses the embedding as the output head)")
+    if c.get("use_sliding_window", False):
+        problems.append("sliding-window attention (engine attends to the full context)")
+    if c["hidden_size"] % c["num_attention_heads"]:
+        problems.append("hidden_size not divisible by num_attention_heads")
+    if c["num_attention_heads"] % c["num_key_value_heads"]:
+        problems.append("query heads not a multiple of KV heads")
+    if problems:
+        raise ValueError(f"{model_name} is not supported by this engine: "
+                         + "; ".join(problems))
+    return c
+
+
+def _arch(key: str):
+    """Default factory reading one field from the SELECTED model's config.json at
+    construction time, so QwenConfig() always describes the weights load_weights()
+    will actually load."""
+    def factory():
+        c = checkpoint_config(cfg.MODEL_NAME)
+        if key == "head_dim":
+            return c["hidden_size"] // c["num_attention_heads"]
+        return c[key]
+    return factory
+
+
 @dataclass(frozen=True)
 class QwenConfig:
-    """Architecture constants — read from the model on 2026-08-20, not assumed."""
-    vocab_size: int = 151936
-    hidden_size: int = 896
-    intermediate_size: int = 4864
-    num_layers: int = 24
-    num_q_heads: int = 14
-    num_kv_heads: int = 2
-    head_dim: int = 64
-    rms_norm_eps: float = 1e-6
-    rope_theta: float = 1_000_000.0     # Qwen2.5 default
-    tie_word_embeddings: bool = True
+    """Architecture constants, read from the selected checkpoint's config.json.
+
+    Until 2026-09-16 these were hard-coded 0.5B values (read once from the model
+    on 2026-08-20). They now come from config.MODEL_NAME's own config.json, which
+    for the default 0.5B model yields exactly those constants -- pinned by
+    tests/test_model_select.py -- and for any other model raises if the
+    architecture needs something the engine does not implement.
+    """
+    vocab_size: int = field(default_factory=_arch("vocab_size"))
+    hidden_size: int = field(default_factory=_arch("hidden_size"))
+    intermediate_size: int = field(default_factory=_arch("intermediate_size"))
+    num_layers: int = field(default_factory=_arch("num_hidden_layers"))
+    num_q_heads: int = field(default_factory=_arch("num_attention_heads"))
+    num_kv_heads: int = field(default_factory=_arch("num_key_value_heads"))
+    head_dim: int = field(default_factory=_arch("head_dim"))
+    rms_norm_eps: float = field(default_factory=_arch("rms_norm_eps"))
+    rope_theta: float = field(default_factory=_arch("rope_theta"))
+    tie_word_embeddings: bool = field(default_factory=_arch("tie_word_embeddings"))
 
     @property
     def q_dim(self) -> int:
-        return self.num_q_heads * self.head_dim      # 896
+        return self.num_q_heads * self.head_dim      # 896 on 0.5B, 1536 on 1.5B
 
     @property
     def kv_dim(self) -> int:
-        return self.num_kv_heads * self.head_dim     # 128
+        return self.num_kv_heads * self.head_dim     # 128 on 0.5B, 256 on 1.5B
 
 
 def load_weights(dtype: torch.dtype = cfg.DTYPE, device: str = cfg.DEVICE) -> dict:

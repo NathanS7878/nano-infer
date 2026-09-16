@@ -697,9 +697,14 @@ torch::Tensor decode_attention_forward(
                 // instantiated; anything else falls through to the general
                 // per-query-head kernel, which handles every n_rep.
                 switch (n_rep) {
+                    // 6 is Qwen2.5-1.5B (12 query / 2 KV heads); 7 is 0.5B.
+                    // A ratio missing here does not fail -- it silently runs
+                    // the slower per-query-head kernel -- so add new models'
+                    // ratios deliberately and test them.
                     NI_GROUPED_CASE(2)  NI_GROUPED_CASE(4)
-                    NI_GROUPED_CASE(7)  NI_GROUPED_CASE(8)
-                    NI_GROUPED_CASE(14) NI_GROUPED_CASE(16)
+                    NI_GROUPED_CASE(6)  NI_GROUPED_CASE(7)
+                    NI_GROUPED_CASE(8)  NI_GROUPED_CASE(14)
+                    NI_GROUPED_CASE(16)
                     default: launched = false;
                 }
                 TORCH_CHECK(launched || fuse_heads <= 0,
