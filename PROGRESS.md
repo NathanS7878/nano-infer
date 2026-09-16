@@ -1460,3 +1460,79 @@ graph's win it eats: at 16 tokens one-shot graphs are barely worth it. Gotcha #3
   before it is written, so it was not started unilaterally.
 - **Scaling to 1.5B.** Needs a ~3 GB model download, which needs Nathan's
   go-ahead.
+
+## 2026-09-16 (cont.) — Clean rerun, Nathan's prediction, 1.5B downloaded
+
+### Clean rerun
+
+Nathan closed the GPU-using apps. Verified before running rather than assumed:
+utilization 0-2% across three samples (was 23-29%), but 950 MiB still held by
+processes that remained resident and idle (Wallpaper Engine, Edge, Discord, a
+Steam helper) -- above #18's 500 MiB target. Utilization is what competes for
+the card during timing, so the run went ahead, and the benchmarks' strict
+"contended" stamp was left as-is rather than loosened to make it pass. Nothing
+else ran during it: no kernel compile, no download.
+
+| measure | contended | clean |
+|---|---|---|
+| graph vs eager decode, b1 p32 (kernels on) | 5.49x | **5.19x** (17.88 -> 3.45 ms) |
+| graph vs eager decode, b4 p32 | 5.35x | **5.18x** |
+| graph vs eager decode, b16 p32 | 5.47x | **5.02x** |
+| graph vs eager decode, b32 p32 | 5.28x | **4.94x** (20.43 -> 4.14 ms) |
+| graph vs eager decode, b32 p512 | 3.97x | **3.85x** |
+| graph vs eager decode, b8 p1024 | 4.22x | **3.81x** |
+| syncs removed only (static vs eager) | 1.00-1.20x | 1.01-1.18x |
+| kernels on vs off under graphs, b32 p512 | 3.15x | 3.13x |
+| INT8 / INT4 graph vs fp16, b1 | 1.35x / 1.42x | 1.34x / 1.42x |
+| INT8 / INT4 graph vs fp16, b4 | 1.09x / 0.82x | 1.10x / 0.82x |
+| INT8 / INT4 graph vs fp16, b32 | 0.27x / 0.16x | 0.27x / 0.16x |
+| reused runner vs eager, b32 g64 | 4.62x | 4.38x |
+| reused runner vs eager, b32 g16 | 3.61x | 3.51x |
+| graphed fp16 b1, weight bandwidth | 60.1% | 64.4% |
+
+Every ratio landed within a few percent of its contended measurement -- the
+round-robin design doing its job. Absolutes went into the README headline table
+beside the HF row: reused-runner decode is **259.9 tok/s at batch 1 and 6,909.0
+at batch 32**, which is 9.67x the HF row. That HF row is from an earlier
+session, and in this run the eager kernels engine measured ~9% below its own
+older Phase 3 row, so the README gives the same-session ratio (4.38x) as the
+firmer claim and states the cross-session uncertainty.
+
+### Nathan's prediction for the tensor-core quantized matmul
+
+Recorded before any kernel code existed: **compute-bound, and it will beat
+graphed fp16 decode at batch 32.** The bar, from the clean rerun: **4.14-4.15
+ms/step.**
+
+My own reading, recorded separately so both can be scored: the tensor-core
+multiply itself will be fast, but every weight tile must first be dequantized
+through shared memory (see below), so I expect the kernel to be limited by that
+dequant traffic rather than by compute, and to land near fp16 rather than
+clearly beat it. We will see.
+
+### Design so far
+
+Tensor cores are driven through `<mma.h>` (`nvcuda::wmma`): fixed-shape register
+fragments and one instruction, `mma_sync(D, A, B, C) = A.B + C`.
+
+- Sub-byte integer IMMA exists (4-bit `s4`/`u4` fragments loaded straight from
+  packed memory), but it multiplies 4-bit by 4-bit -- it would need activations
+  quantized too. Rejected: that is a different quality trade, unmeasured here.
+- fp16 HMMA fragments (m16n16k16) fit. But a fragment's element layout is
+  undocumented; the only supported ways to fill one are `load_matrix_sync` from
+  memory and `fill_fragment`. So a quantized weight tile has to exist in memory
+  before it can be loaded. CLAUDE.md forbids materializing the dequantized
+  matrix in GLOBAL memory, so the plan is one 16x16 tile at a time in SHARED
+  memory.
+- Step 1 (written, not yet compiled, deliberately not referenced by the build
+  while the clean benchmarks were running): `hmma_matmul_f16`, a plain fp16
+  X.W^T on tensor cores with both operands loaded from global memory. Its job
+  is only to pin the undocumented layout semantics (row/col major, ldm) against
+  torch. Tests use rectangular shapes and structured row/column scales so a
+  layout error cannot pass as rounding.
+
+### Qwen2.5-1.5B-Instruct downloaded
+
+With Nathan's permission: 3.10 GB from huggingface.co/Qwen/Qwen2.5-1.5B-Instruct
+(model.safetensors 3,087.5 MB, plus config, generation config and tokenizer).
+Not yet loaded; architecture to be read from its config.json, not assumed.

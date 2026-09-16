@@ -25,9 +25,21 @@ reproducible by a script in this repo.
 | HuggingFace `generate()` | 22.9 | 714.6 | 1.00× | `python -m bench.phase2_cache` |
 | nano-infer, no cache (Phase 1) | 25.4 | 53.3 | 0.07× | `python -m bench.phase1_nocache` |
 | nano-infer, paged KV cache (Phase 2) | 24.6 | 724.1 | 1.01× | `python -m bench.phase2_cache` |
-| **nano-infer + custom kernels (Phase 3)** | **58.6** | **1739.1** | **2.43×** | `python -m bench.phase3_end_to_end` |
+| nano-infer + custom kernels (Phase 3) | 58.6 | 1739.1 | 2.43× | `python -m bench.phase3_end_to_end` |
 | nano-infer + INT8 weights (Phase 4) | 67.9 | 1274.9 | 1.78× | `python -m bench.quant_acceptance` |
+| nano-infer + kernels + CUDA-graph decode, capture every call | 178.2 | 5003.2 | 7.00× | `python -m bench.decode_graph_runner` |
+| **nano-infer + kernels + CUDA-graph decode, capture once** | **259.9** | **6909.0** | **9.67×** | `python -m bench.decode_graph_runner` |
 | vLLM | — | — | — | **not run — see below** |
+
+**About the two CUDA-graph rows.** They were measured on 2026-09-16, a later
+session than the HF row, and cross-session numbers on this desktop move by
+several percent (ROADMAP #18, #21): in the same run, the eager kernels engine
+measured 1579.1 tok/s at batch 32, ~9% below the Phase 3 row. So the
+same-session ratio is the firmer claim — **4.38× the eager kernels engine at
+batch 32** — and the "vs HF" figure carries that ~10% uncertainty. Median of 5
+runs after 2 warmups; GPU at 0–1% utilization during the run; 870–960 MiB was still held by idle desktop processes (Wallpaper Engine, Edge, Discord, a Steam helper), above the 500 MiB target of ROADMAP #18. "Capture once" reuses one
+`DecodeGraphRunner`, as a server handling one request shape would; every timed
+call still gets a different prompt.
 
 **The INT8 row is faster at batch 1 and slower at batch 32, and that is the
 point.** It is not a worse engine; it is a different trade. See
@@ -135,26 +147,30 @@ decode step with no host inputs at all (every KV block allocated up front, all
 bookkeeping derived on the GPU), then captures it as a CUDA graph. Reproduce:
 `python -m bench.decode_graph`.
 
-Decode ms/step, kernels on — **ratios only**; this run was on a contended GPU
-(see Limitations):
+Decode ms/step, kernels on. GPU at 0–1% utilization during the run; 870–960 MiB was still held by idle desktop processes (Wallpaper Engine, Edge, Discord, a Steam helper), above the 500 MiB target of ROADMAP #18:
 
 | Batch | Prompt | Eager paged | Eager, syncs removed | **CUDA graph** | Speedup |
 |---|---|---|---|---|---|
-| 1 | 32 | 20.14 | 18.62 | **3.67** | **5.49×** |
-| 32 | 32 | 23.29 | 19.42 | **4.41** | **5.28×** |
-| 32 | 512 | 22.48 | 19.24 | **5.66** | **3.97×** |
+| 1 | 32 | 17.88 | 16.71 | **3.45** | **5.19×** |
+| 32 | 32 | 20.43 | 17.61 | **4.14** | **4.94×** |
+| 32 | 512 | 20.54 | 17.45 | **5.33** | **3.85×** |
+| 8 | 1024 | 18.49 | 17.12 | **4.85** | **3.81×** |
 
 Two things this separated that one number would have hidden. Removing all 65
-syncs alone bought only **1.00–1.20×** — dispatch, not synchronisation, was the
-cost. And once graphed, a batch-1 step streams **988 MB of weights at 60% of
-peak bandwidth** (the eager engine: 10.9%), with step time finally growing with
+syncs alone bought only **1.01–1.18×** — dispatch, not synchronisation, was the
+cost. And once graphed, a batch-1 step streams **988 MB of weights at 64% of
+peak bandwidth** (the eager engine: 12.3%), with step time finally growing with
 context — decode is now bound by the GPU, which is where the kernels live.
 Token output is identical to the eager engine with kernels on.
 
-Capture costs 0.12–0.25 s, so it has to be paid once, not per call. A reused
+These were first measured on a contended desktop (23% utilization) with every
+arm run round-robin so the ratios would survive; the clean rerun above landed
+within a few percent of them (e.g. batch 32: 5.28× contended, 4.94× clean).
+
+Capture costs 0.11–0.21 s, so it has to be paid once, not per call. A reused
 `DecodeGraphRunner` (`python -m bench.decode_graph_runner`) takes a batch-32
-call from **3.26× to 4.62×** the eager engine at 64 tokens, and from **1.61× to
-3.61×** at 16 tokens, where per-call capture had eaten most of the win.
+call from **3.17× to 4.38×** the eager engine at 64 tokens, and from **1.61× to
+3.51×** at 16 tokens, where per-call capture had eaten most of the win.
 
 ## Quantization: what it costs
 
@@ -188,20 +204,19 @@ with no calibration, on a 0.5B model with little redundancy to spare.
 
 **The speed columns above were measured on the eager engine, which turned out to
 be host-bound — and that hid most of the quantized kernel's cost.** Re-measured
-with CUDA-graph decode (`python -m bench.quant_graph`; contended GPU, ratios
-only), decode speed vs fp16:
+with CUDA-graph decode (`python -m bench.quant_graph`), decode speed vs fp16:
 
 | | batch 1 | batch 4 | batch 32 |
 |---|---|---|---|
-| INT8, eager | 1.12× | 1.19× | 1.08× |
-| INT8, **CUDA graph** | **1.35×** | 1.09× | **0.27×** |
-| INT4, eager | 1.16× | 1.19× | 0.68× |
+| INT8, eager | 1.15× | 1.20× | 1.05× |
+| INT8, **CUDA graph** | **1.34×** | 1.10× | **0.27×** |
+| INT4, eager | 1.13× | 1.18× | 0.67× |
 | INT4, **CUDA graph** | **1.42×** | **0.82×** | **0.16×** |
 
 With the host out of the loop, quantization finally pays at batch 1 — INT8
-reaches 86% of its 1.57× byte-counted ceiling. But above batch 1 the dequant
-kernel becomes the whole bottleneck: fp16 decode at batch 32 drops to 4.39 ms
-while INT4 stays at 28.18 ms. The tied `lm_head` stays fp16 and is 59% of INT4's
+reaches 85% of its 1.57× byte-counted ceiling. But above batch 1 the dequant
+kernel becomes the whole bottleneck: fp16 decode at batch 32 drops to 4.15 ms
+while INT4 stays at 26.40 ms. The tied `lm_head` stays fp16 and is 59% of INT4's
 per-step weight traffic, which caps INT4's ceiling at 2.15× regardless.
 
 ## Limitations
@@ -212,15 +227,16 @@ Stated plainly, because a repo that only lists wins is not reporting.
   eager step costs ~20 ms regardless of batch size or context length — ~3,200
   aten dispatches and 65 GPU→host syncs per step. CUDA-graph decode
   (`nano_infer/decode_graph.py`) removes that for `generate_paged`-style static
-  batches: **5.3–5.5× faster decode at short context, 4.0–4.2× at long**. The
+  batches: **4.9–5.2× faster decode at short context, 3.8× at long**. The
   continuous-batching engine (`engine.py`) is **not** graphed and still pays
   it. Graphs are also exact-shape only: `DecodeGraphRunner` captures once per
   (batch, prompt length, new tokens), with no bucketing or padding, and the
   one-shot `generate_paged_static` recaptures every call (0.12–0.25 s).
-- **The CUDA-graph numbers came from a contended GPU** (23% utilization from
-  other desktop apps at start). The ratios are robust — every arm ran
-  round-robin inside each repeat — but the absolute tok/s are not publishable
-  until rerun on an idle card, so none appear in the table above.
+- **The CUDA-graph rows were not measured on a fully idle machine.** GPU
+  utilization was 0–1%, but 870–960 MiB stayed held by idle desktop processes,
+  above this project's 500 MiB target. They also come from a later session
+  than the HF row, so their "vs HF" ratios carry the ~10% cross-session
+  variance described under the benchmark table.
 - **Decode attention is still only at 30.3% of peak**, up from 11.1%. Split-K
   (flash-decoding proper) is the remaining named fix and is **not implemented**;
   it is also what the head-grouped kernel needs to stop losing at batch 1, where
