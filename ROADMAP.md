@@ -714,16 +714,22 @@ instead — the static (sync-free, eager) column is the no-graph control.
    INT4 decode is 0.16x fp16 at batch 32 and loses from batch 4. Dequantize into
    fp16 fragments and issue tensor-core instructions instead of accumulating in
    scalar fp32. Per CLAUDE.md: have Nathan predict memory- vs compute-bound
-   first. A cheaper first experiment: dequantize the 168 projections to fp16
-   at load time and graph THAT, to measure the ceiling a perfect quantized
-   kernel could approach at each batch.
+   first. The bar it has to clear is already measured: graphed fp16 decode
+   (4.39 ms at batch 32), since dequantizing to fp16 at load time simply IS
+   the fp16 row. A quantized kernel wins only if it keeps fp16's compute cost
+   while streaming fewer bytes.
 3. **Quantizing the lm_head** — 59% of INT4's per-step weight traffic (#38).
    Measure perplexity first; the embedding is tied, so this changes the input
    embedding too unless the head is split off.
 4. **Graph the continuous-batching engine** — one graph per batch-size bucket
    with padded slots. `engine.py` is entirely ungraphed today and still pays the
    host overhead.
-5. **Scale to Qwen2.5-1.5B or Llama-3.2-1B** (CLAUDE.md headline). ~3 GB
+5. **Split-K for kernel 4b — deprioritised.** It fixes the grouped kernel
+   losing at batch 1, but the dispatcher already routes batch 1 to the
+   per-query-head kernel, so it would not change what the engine runs. Now that
+   decode is weight-streaming bound (#36), attention is not the batch-1
+   bottleneck either.
+6. **Scale to Qwen2.5-1.5B or Llama-3.2-1B** (CLAUDE.md headline). ~3 GB
    download, so ask Nathan first. Architecture must be read from the checkpoint:
    e.g. Qwen2.5-1.5B's n_rep of 6 has no grouped-kernel instantiation (2, 4, 7,
    8, 14, 16), so it would silently use the per-query-head path.
