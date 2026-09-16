@@ -1,0 +1,103 @@
+{
+  "hardware": "NVIDIA GeForce RTX 3070 (see HARDWARE.md)",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "warmup": 2,
+  "repeats": 5,
+  "gpu_at_start": {
+    "utilization_pct": 29,
+    "memory_used_mib": 1289
+  },
+  "contended": true,
+  "results": [
+    {
+      "batch": 1,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "arm": "paged",
+      "call_s": 1.2951780000003055,
+      "tok_s": 49.41405737279733,
+      "vs_paged": 1.0,
+      "vs_one_shot": 0.30007767272020097
+    },
+    {
+      "batch": 1,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "arm": "one-shot",
+      "call_s": 0.38865399999849615,
+      "tok_s": 164.67088978949823,
+      "vs_paged": 3.332470526497391,
+      "vs_one_shot": 1.0
+    },
+    {
+      "batch": 1,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "arm": "runner",
+      "call_s": 0.2644825999996101,
+      "tok_s": 241.9818921928866,
+      "vs_paged": 4.8970253619792565,
+      "vs_one_shot": 1.469487973874535
+    },
+    {
+      "batch": 32,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "arm": "paged",
+      "call_s": 1.4526503999986744,
+      "tok_s": 1409.8368058838305,
+      "vs_paged": 1.0,
+      "vs_one_shot": 0.3067077254097957
+    },
+    {
+      "batch": 32,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "arm": "one-shot",
+      "call_s": 0.44553909999922325,
+      "tok_s": 4596.678495789865,
+      "vs_paged": 3.2604330349484636,
+      "vs_one_shot": 1.0
+    },
+    {
+      "batch": 32,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "arm": "runner",
+      "call_s": 0.31417010000041046,
+      "tok_s": 6518.761651720913,
+      "vs_paged": 4.623770371517775,
+      "vs_one_shot": 1.4181460934654226
+    },
+    {
+      "batch": 32,
+      "prompt_len": 32,
+      "new_tokens": 16,
+      "arm": "paged",
+      "call_s": 0.37113919999865175,
+      "tok_s": 1379.5363033650447,
+      "vs_paged": 1.0,
+      "vs_one_shot": 0.6194096446882078
+    },
+    {
+      "batch": 32,
+      "prompt_len": 32,
+      "new_tokens": 16,
+      "arm": "one-shot",
+      "call_s": 0.22988720000103058,
+      "tok_s": 2227.1792426794736,
+      "vs_paged": 1.6144404734016855,
+      "vs_one_shot": 1.0
+    },
+    {
+      "batch": 32,
+      "prompt_len": 32,
+      "new_tokens": 16,
+      "arm": "runner",
+      "call_s": 0.10277979999955278,
+      "tok_s": 4981.52360680044,
+      "vs_paged": 3.6110130589888936,
+      "vs_one_shot": 2.236696315832789
+    }
+  ]
+}

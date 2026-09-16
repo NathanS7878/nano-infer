@@ -251,3 +251,82 @@ def test_one_new_token_needs_no_decode(loaded):
         got = generate_paged_static(ids, weights, cf, 1, timings=timings)
     assert torch.equal(ref, got)
     assert timings["decode_steps"] == 0 and timings["capture_s"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# DecodeGraphRunner: capture once, serve many prompts of one shape
+# ---------------------------------------------------------------------------
+
+from nano_infer.decode_graph import DecodeGraphRunner  # noqa: E402
+
+
+@pytest.mark.parametrize("use_kernels", [False, True])
+def test_runner_reuse_matches_fresh_runs(loaded, use_kernels):
+    """One runner, three DIFFERENT prompts, each equal to a fresh one-shot run.
+
+    This is the test that would catch stale state leaking between prompts. The
+    runner reuses its KV pool without zeroing it, on the argument that prefill
+    overwrites [0, prompt_len) and every decode step writes its slot before any
+    read. If that argument were wrong, the second and third prompts would attend
+    to the first prompt's KV and still produce fluent, wrong tokens -- so the
+    comparison is against runs that never shared a pool.
+
+    Also checks the returned tensor is a copy: an earlier result must not change
+    when the runner serves the next prompt.
+    """
+    weights, cf = loaded
+    batch, plen, gen = 4, 24, 40
+    prompts = [_prompt(batch, plen, seed=s) for s in (101, 202, 303)]
+    with M.using_kernels(use_kernels):
+        runner = DecodeGraphRunner(weights, cf, batch, plen, gen)
+        results = [runner.generate(p) for p in prompts]
+        first_snapshot = results[0].clone()
+        fresh = [generate_paged_static(p, weights, cf, gen) for p in prompts]
+
+    assert runner.captures == 1, f"captured {runner.captures} times, expected once"
+    for i, (got, want) in enumerate(zip(results, fresh)):
+        assert torch.equal(got, want), (
+            f"prompt {i} through a reused runner differs from a fresh run in "
+            f"{int((got != want).sum())} tokens -- state from an earlier prompt "
+            f"is leaking into the graph")
+    assert torch.equal(results[0], first_snapshot), (
+        "an earlier result changed after later calls: generate() returned the "
+        "runner's output buffer instead of a copy")
+    assert not torch.equal(results[0], results[1]), (
+        "different prompts produced identical output; the test is not exercising "
+        "stale state")
+
+
+def test_runner_pays_capture_once(loaded):
+    """The point of the runner: the second call of a shape has no capture."""
+    weights, cf = loaded
+    batch, plen, gen = 2, 16, 24
+    with M.using_kernels(True):
+        runner = DecodeGraphRunner(weights, cf, batch, plen, gen)
+        t1, t2 = {}, {}
+        runner.generate(_prompt(batch, plen, seed=1), timings=t1)
+        runner.generate(_prompt(batch, plen, seed=2), timings=t2)
+    print(f"\n[runner] capture first call {t1['capture_s']:.3f} s, "
+          f"second call {t2['capture_s']:.3f} s")
+    assert t1["capture_s"] > 0.0
+    assert t2["capture_s"] == 0.0
+
+
+def test_runner_refuses_a_kernel_setting_it_was_not_captured_with(loaded):
+    """A graph replays the path it recorded. Flipping the global kernel switch
+    after capture would silently keep running the old path, so it must raise."""
+    weights, cf = loaded
+    batch, plen, gen = 2, 16, 8
+    with M.using_kernels(True):
+        runner = DecodeGraphRunner(weights, cf, batch, plen, gen)
+        runner.generate(_prompt(batch, plen, seed=5))
+    with M.using_kernels(False):
+        with pytest.raises(RuntimeError, match="captured with kernels on"):
+            runner.generate(_prompt(batch, plen, seed=6))
+
+
+def test_runner_refuses_the_wrong_shape(loaded):
+    weights, cf = loaded
+    runner = DecodeGraphRunner(weights, cf, 2, 16, 8)
+    with pytest.raises(ValueError, match="built for"):
+        runner.generate(_prompt(3, 16, seed=7))
