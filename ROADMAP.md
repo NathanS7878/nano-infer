@@ -57,7 +57,7 @@ _Last updated: 2026-09-19. **Scaled to the benchmark model Qwen2.5-1.5B** (bf16)
 
 - **Tests:** 165 passing on 0.5B/fp16, 164 passing + 2 skipped on 1.5B/bf16
   (`python -m pytest tests/ -q`, and again with `NANO_INFER_MODEL=Qwen/Qwen2.5-1.5B-Instruct`)
-- **Commits:** 42 on `main`
+- **Commits:** `git rev-list --count HEAD` on `main` — **all unpushed**; the remote repo does not exist yet (see Known open items)
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -1001,7 +1001,7 @@ section.
   returned, not what it was supposed to do.)
 
   The local repository is ready: MIT licensed, `origin` already configured,
-  **42 commits on `main`**, every one authored `NathanS7878
+  **the whole history on `main`** (`git rev-list --count HEAD`), every commit authored `NathanS7878
   <988dragons@gmail.com>` and free of `Co-Authored-By` trailers (verified:
   `git log --format='%an <%ae>' | sort -u` yields exactly one line).
   Creating the repo and pushing are steps Nathan does himself — see
