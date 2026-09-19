@@ -54,7 +54,7 @@ SHAPES = [
 
 
 def _ulp_key(t: torch.Tensor) -> torch.Tensor:
-    """Map fp16 bit patterns to a monotonically ordered integer key.
+    """Map 16-bit float (fp16 or bf16) bit patterns to an ordered integer key.
 
     Positive floats already order correctly as signed integers; negatives are
     reversed, so they are reflected. Adjacent representable values then differ
@@ -65,10 +65,18 @@ def _ulp_key(t: torch.Tensor) -> torch.Tensor:
 
 
 def compare(ref: torch.Tensor, got: torch.Tensor) -> dict:
-    """ULP distance, exact fraction, and relative error between two fp16 tensors."""
+    """ULP distance, exact fraction, and relative error between two 16-bit float
+    tensors of the same dtype.
+
+    The ULP key works unchanged for bf16: like fp16 it is sign / biased exponent /
+    fraction, so positive values order monotonically by bit pattern. Only the
+    epsilon and tiny values differ, so they come from the tensor's own dtype --
+    grading bf16 with fp16's epsilon would be measuring in the wrong units.
+    """
+    assert ref.dtype == got.dtype and ref.dtype in (torch.float16, torch.bfloat16)
     ulp = (_ulp_key(ref) - _ulp_key(got)).abs()
     rel = ((ref.float() - got.float()).abs()
-           / ref.float().abs().clamp(min=torch.finfo(torch.float16).tiny))
+           / ref.float().abs().clamp(min=torch.finfo(ref.dtype).tiny))
     return {
         "max_ulp": int(ulp.max()) if ulp.numel() else 0,
         "exact_frac": float((ulp == 0).float().mean()) if ulp.numel() else 1.0,
@@ -78,7 +86,7 @@ def compare(ref: torch.Tensor, got: torch.Tensor) -> dict:
 
 
 def assert_parity(ref: torch.Tensor, got: torch.Tensor, label: str) -> dict:
-    eps = torch.finfo(torch.float16).eps
+    eps = torch.finfo(ref.dtype).eps
     s = compare(ref, got)
     print(f"\n[{label}] max {s['max_ulp']} ulp, {s['exact_frac']*100:.3f}% exact, "
           f"rel {s['max_rel']:.2e} ({s['max_rel']/eps:.2f} eps), abs {s['max_abs']:.2e}")

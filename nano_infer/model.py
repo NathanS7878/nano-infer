@@ -407,6 +407,22 @@ def greedy_decode(input_ids: torch.Tensor, weights: dict, cf: "QwenConfig",
 
 _KERNELS_ENABLED = False
 
+# Attention scores in fp32. OFF by default, so the engine stays bit-identical to
+# HuggingFace, which computes q @ k^T in the model dtype before upcasting.
+#
+# Why the option exists (ROADMAP #45): on Qwen2.5-1.5B the raw product q.k
+# reaches 264,115, where bf16's resolution is 1,024. Against an fp32 ground
+# truth, the dtype-score path -- HF's own bf16 model included -- lands up to
+# 71 bf16 ULPs away; the same path with ONLY that one multiply in fp32 lands
+# within 4.9. Every other op stays in the model dtype, so the cost is one
+# upcast of q and k per attention call.
+#
+# Applies to the cached and paged PyTorch attention paths. The Phase 1
+# reference ignores it, exactly as it ignores the kernel switch, so the project
+# keeps an HF-identical answer key. The decode kernel needs no switch: it
+# already accumulates q.k in fp32.
+_FP32_ATTENTION_SCORES = False
+
 
 def _qlinear(x: torch.Tensor, w, bias=None) -> torch.Tensor:
     """Linear over a weight that may be an fp16 tensor OR a packed quantized one.
@@ -428,6 +444,22 @@ def _qlinear(x: torch.Tensor, w, bias=None) -> torch.Tensor:
         return y if bias is None else y + bias
     return F.linear(x, w, bias)
 
+
+
+def fp32_attention_scores_enabled() -> bool:
+    return _FP32_ATTENTION_SCORES
+
+
+@contextlib.contextmanager
+def using_fp32_attention_scores(enabled: bool = True):
+    """Scoped switch for fp32 attention scores (see _FP32_ATTENTION_SCORES)."""
+    global _FP32_ATTENTION_SCORES
+    previous = _FP32_ATTENTION_SCORES
+    _FP32_ATTENTION_SCORES = bool(enabled)
+    try:
+        yield
+    finally:
+        _FP32_ATTENTION_SCORES = previous
 
 
 def kernels_enabled() -> bool:
@@ -521,8 +553,10 @@ def attention_cached(x: torch.Tensor, weights: dict, layer: int,
     v_all = repeat_kv(v_all, n_rep)
 
     scale = cf.head_dim ** -0.5
-    scores = (q @ k_all.transpose(-1, -2)) * scale                    # [b,14,n,total]
-    scores = scores.float()
+    if _FP32_ATTENTION_SCORES:
+        scores = (q.float() @ k_all.float().transpose(-1, -2)) * scale
+    else:
+        scores = ((q @ k_all.transpose(-1, -2)) * scale).float()      # [b,14,n,total]
 
     if n > 1:
         # causal mask over the [n, total] window: query i (absolute start_pos+i)
@@ -663,7 +697,18 @@ def attention_paged(x: torch.Tensor, weights: dict, layer: int,
     k_all = repeat_kv(k_all, n_rep)
     v_all = repeat_kv(v_all, n_rep)
 
-    scores = (q @ k_all.transpose(-1, -2)).float() * scale            # [b,14,n,L]
+    # Scale BEFORE the upcast, in the model dtype -- the same order as Phase 1's
+    # attention(), attention_cached() and HF itself. This path used to upcast
+    # first and scale in fp32. On 0.5B that was invisible: head_dim 64 makes the
+    # scale exactly 1/8, a power of two, so both orders give identical bits and
+    # "paging must not change the computation" passed by architectural
+    # coincidence. On Qwen2.5-1.5B (head_dim 128, scale 1/sqrt(128)) bf16 rounds
+    # the scaled product and the two orders differed by 1.31 logits after
+    # prefill. Matching the order took that to exactly 0.0 (ROADMAP #43).
+    if _FP32_ATTENTION_SCORES:
+        scores = (q.float() @ k_all.float().transpose(-1, -2)) * scale
+    else:
+        scores = ((q @ k_all.transpose(-1, -2)) * scale).float()      # [b,14,n,L]
     scores = scores.masked_fill(~allowed, float("-inf"))
 
     probs = torch.softmax(scores, dim=-1).to(x.dtype)

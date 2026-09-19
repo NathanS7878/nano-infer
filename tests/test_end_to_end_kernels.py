@@ -100,44 +100,38 @@ def test_paged_generation_matches_with_kernels_on(loaded, batch):
     weights, cf = loaded
     ids = _prompt(batch)
 
-    baseline = M.generate_paged(ids, weights, cf, NEW_TOKENS)
-    with M.using_kernels(True):
-        with_kernels = M.generate_paged(ids, weights, cf, NEW_TOKENS)
+    # Per row, up to its first divergence both paths have the same history, so
+    # their recorded logits are directly comparable. The bar is the drift
+    # between them in ULPs of the model dtype -- not a token-mismatch fraction,
+    # which one early flip cascades to 95%, nor a fixed gap in fp16 units.
+    #
+    # Both runs use fp32 attention scores, so the ONLY difference between them
+    # is the kernels. Without it, the kernels-off path computes q.k in the model
+    # dtype, and on Qwen2.5-1.5B/bf16 that reference is itself up to 71 ULPs
+    # from an fp32 ground truth -- the kernel path measured 101 ULPs from it
+    # while sitting closer to the truth than it did. With fp32 scores the
+    # reference is within 4.9 ULPs of truth, and the drift left is the kernels'
+    # own: across 62 sequences per model, max 10.5u (0.5B/fp16), 5.7u (1.5B/bf16).
+    from tests._drift import KERNEL_DRIFT_ULPS, drift_between, first_divergence, record_step_logits
+    with M.using_fp32_attention_scores(True):
+        with record_step_logits("forward_paged") as off_logs:
+            baseline = M.generate_paged(ids, weights, cf, NEW_TOKENS)
+        with M.using_kernels(True), record_step_logits("forward_paged") as on_logs:
+            with_kernels = M.generate_paged(ids, weights, cf, NEW_TOKENS)
 
-    total = baseline.numel()
-    mismatch = (baseline != with_kernels)
-    n_diff = int(mismatch.sum())
-    print(f"\n[e2e paged batch {batch}] {n_diff}/{total} tokens differ "
-          f"({n_diff / total * 100:.2f}%)")
-
-    if n_diff == 0:
-        return
-
-    # Every divergence must be a demonstrated near-tie. Re-run the reference to
-    # the first differing step and measure the top-1/top-2 gap there.
-    b_idx, t_idx = [int(i) for i in mismatch.nonzero()[0]]
-    prefix = torch.cat([ids[b_idx:b_idx + 1],
-                        baseline[b_idx:b_idx + 1, :t_idx]], dim=1)
-    from nano_infer.cache import PagedKVCache
-    cache = PagedKVCache(cf.num_layers, (prefix.shape[1] + 8) // 16 + 4, 16,
-                         cf.num_kv_heads, cf.head_dim,
-                         dtype=cfg.DTYPE, device=cfg.DEVICE)
-    sid = [cache.add_sequence()]
-    rope = M.build_rope_cache(prefix.shape[1] + 2, cf.head_dim, cf.rope_theta,
-                              device=cfg.DEVICE, dtype=cfg.DTYPE)
-    start = torch.zeros(1, dtype=torch.long, device=cfg.DEVICE)
-    step_logits = M.forward_paged(prefix, weights, cf, cache, sid, start, rope)[0]
-    top2 = step_logits.float().topk(2).values
-    gap = float(top2[0] - top2[1])
-    print(f"  first divergence at batch {b_idx} step {t_idx}: "
-          f"top-1/top-2 gap {gap:.4f}")
-
-    assert n_diff / total <= 0.10, (
-        f"{n_diff / total * 100:.1f}% of tokens diverged — too many to be "
-        "explained by near-ties")
-    assert gap < NEAR_TIE_GAP, (
-        f"divergence at step {t_idx} had a decisive logit gap of {gap:.4f}; "
-        "that is a wrong answer, not a coin toss")
+    n_diff = int((baseline != with_kernels).sum())
+    print(f"\n[e2e paged batch {batch}] {n_diff}/{baseline.numel()} tokens differ "
+          f"(a cascade count, not a tally of independent errors)")
+    for row in range(batch):
+        div = first_divergence(baseline[row], with_kernels[row])
+        upto = NEW_TOKENS - 1 if div is None else div
+        worst, at = drift_between(on_logs, off_logs, row, upto)
+        print(f"  row {row}: first divergence {div}, worst kernel drift "
+              f"{worst:.1f} ULPs of {cfg.DTYPE_NAME} at step {at} (bound {KERNEL_DRIFT_ULPS})")
+        assert worst <= KERNEL_DRIFT_ULPS, (
+            f"row {row}: kernels moved logits {worst:.1f} ULPs at step {at}. RMSNorm, "
+            f"SwiGLU and RoPE are bit-exact at prefill and decode attention is "
+            f"fp64-checked, so this size of drift is a wiring bug, not rounding.")
 
 
 def test_decode_kernel_is_not_used_during_prefill(loaded, monkeypatch):

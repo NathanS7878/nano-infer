@@ -106,26 +106,38 @@ def test_paged_decode_matches_fixture(weights, tok):
     cf = M.QwenConfig()
     ref = load_reference()
 
-    divergences = []
-    total = 0
+    # The bar is on the DRIFT, in ULPs of the model dtype, not on a fixed logit
+    # gap or a divergence rate. Both of those encoded 0.5B-fp16 numerics: in
+    # bf16 an exact logit tie is common and a gap under 0.125 unrepresentable,
+    # so rate and absolute gap measure the dtype's resolution, not correctness.
+    # See tests/_drift.py and ROADMAP #44.
+    from tests._drift import (PATH_DRIFT_ULPS, drift_profile, first_divergence,
+                              record_step_logits)
+    worst_overall = 0.0
+    divergences = 0
     for i, (prompt, ref_p) in enumerate(zip(cfg.PROMPTS, ref["prompts"])):
         ids = encode_prompt(tok, prompt)
-        got = M.generate_paged(ids, weights, cf, cfg.PARITY_NEW_TOKENS)[0]
-        total += cfg.PARITY_NEW_TOKENS
-        ok, div = compare_tokens(ref_p["greedy_ids"], got)
-        print(f"[{i}] {'OK' if ok else f'diverges@{div}'}  {prompt!r}")
-        if not ok:
-            gap = abs(float(ref_p["topk_vals"][div][0]) -
-                      float(ref_p["topk_vals"][div][1]))
-            divergences.append((i, div, gap))
-
-    rate = len(divergences) / total * 100
-    print(f"\n[acceptance] {len(divergences)} divergence(s) in {total} tokens ({rate:.1f}%)")
-    for i, div, gap in divergences:
-        print(f"   prompt {i} step {div}: reference top-1/top-2 gap {gap:.4f}")
-    real = [d for d in divergences if d[2] >= NEAR_TIE_GAP]
-    assert not real, f"non-near-tie divergences: {real}"
-    assert rate < 1.0
+        with record_step_logits("forward_paged") as logs:
+            got = M.generate_paged(ids, weights, cf, cfg.PARITY_NEW_TOKENS)[0]
+        div = first_divergence(ref_p["greedy_ids"], got)
+        upto = cfg.PARITY_NEW_TOKENS - 1 if div is None else div
+        prof = drift_profile(ids, ref_p["greedy_ids"], logs, weights, cf, upto=upto)
+        worst = max(prof, key=lambda r: r["drift_ulps"])
+        worst_overall = max(worst_overall, worst["drift_ulps"])
+        if div is None:
+            print(f"[{i}] OK  worst drift {worst['drift_ulps']:.1f} ULPs (step {worst['step']})")
+        else:
+            divergences += 1
+            at = prof[-1]
+            print(f"[{i}] diverges@{div}  reference gap {at['ref_gap_ulps']:.1f} ULPs, "
+                  f"drift there {at['drift_ulps']:.1f} ULPs; worst before it "
+                  f"{worst['drift_ulps']:.1f} ULPs (step {worst['step']})")
+        assert worst["drift_ulps"] <= PATH_DRIFT_ULPS, (
+            f"prompt {i}: the paged path drifted {worst['drift_ulps']:.1f} ULPs from Phase 1 "
+            f"at step {worst['step']} (bound {PATH_DRIFT_ULPS}). That is not rounding "
+            f"from a different matmul shape; look for a wrong slot, position or KV row.")
+    print(f"\n[acceptance] {divergences}/{len(cfg.PROMPTS)} prompts diverge; worst drift "
+          f"{worst_overall:.1f} ULPs of {cfg.DTYPE_NAME} (bound {PATH_DRIFT_ULPS})")
 
 
 def test_paged_handles_uneven_lengths(weights, tok):

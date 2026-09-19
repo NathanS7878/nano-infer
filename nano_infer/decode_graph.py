@@ -96,6 +96,7 @@ class _StaticDecodeState:
         self.step = torch.ones(1, dtype=torch.long, device=dev)    # output column
         self.out = torch.zeros(b, max_new_tokens, dtype=torch.long, device=dev)
         self.out[:, 0] = first_ids
+        self.record: list | None = None      # see _decode_step; eager only
 
     def reset(self, first_ids: torch.Tensor, prompt_len: int) -> None:
         """Re-arm for a new prompt IN PLACE. The graph recorded these buffers'
@@ -154,7 +155,13 @@ def _decode_step(st: _StaticDecodeState, weights: dict, cf: "M.QwenConfig",
         x = residual + M.mlp(h, weights, i, use_kernels=M.kernels_enabled())
 
     x = M._rms(x, weights["model.norm.weight"], cf.rms_norm_eps)
-    nxt = F.linear(x, weights["model.embed_tokens.weight"])[:, 0].argmax(dim=-1)
+    logits = F.linear(x, weights["model.embed_tokens.weight"])[:, 0]
+    nxt = logits.argmax(dim=-1)
+    # Test observability only: eager runs can record each step's logits so a
+    # divergence can be attributed (tests/_drift.py). A host-side list append
+    # would record nothing under graph replay, so capture refuses to run with it.
+    if st.record is not None:
+        st.record.append(logits.detach().float().clone())
 
     # the step feeds itself: every write below is in place at a fixed address
     st.out.index_copy_(1, st.step, nxt.unsqueeze(1))
@@ -222,6 +229,9 @@ class DecodeGraphRunner:
                      self.cos_all, self.sin_all)
 
     def _capture(self):
+        if self.state.record is not None:
+            raise RuntimeError("logit recording is eager-only: a graph replays "
+                               "kernels, not the host-side list append")
         # Warm up on a side stream (cuBLAS handles, kernel JIT, allocator), then
         # capture. Both run the step for real, advancing ids/pos/step and writing
         # KV at the current slot, so state is restored after each. The KV they

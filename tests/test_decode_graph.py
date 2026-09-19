@@ -91,55 +91,59 @@ def test_kernels_on_matches_generate_paged_exactly(loaded, batch, plen, gen):
         f"width, so this is not the known kernels-off near-tie effect.")
 
 
-def test_kernels_off_divergences_are_near_ties(loaded):
-    """Claim 2, kernels off: any divergence from generate_paged is a near-tie.
+def test_kernels_off_divergences_are_bounded_drift(loaded, monkeypatch):
+    """Claim 2, kernels off: the static step drifts from generate_paged only by
+    rounding.
 
-    Measured on this exact case when it was written: 2 of 32 sequences diverge.
-    Sequence 17 at output step 1 with a reference top-1/top-2 gap of 0.0000 (an
-    exact tie), sequence 21 at step 62 with a gap of 0.0156 -- both below the
-    0.02-0.04 logit shift the width change causes. The bar is on the GAP.
-
-    Each sequence is checked at its FIRST divergent step only. After a flip the
-    sequence is conditioned on a different token, so later mismatches are a
-    cascade of the first, not independent errors.
+    Originally stated as "every divergence is a near-tie under 0.05", measured on
+    Qwen2.5-0.5B/fp16. That bar is in fp16 units; on Qwen2.5-1.5B/bf16 the
+    smallest representable gap near a logit of 20 is 0.125. So the eager static
+    step records its logits (graph replay is proven bitwise equal to eager in
+    test_graph_capture_is_exact), and up to each row's first divergence its
+    drift from generate_paged must stay within PATH_DRIFT_ULPS.
     """
+    import nano_infer.decode_graph as dg
+    from tests._drift import PATH_DRIFT_ULPS, drift_between, first_divergence, record_step_logits
+
     weights, cf = loaded
     b, plen, gen = 32, 32, 64
     g = torch.Generator(device="cpu").manual_seed(0)
-    for shape in [(1, 32), (4, 17)]:          # replay the generator to the
-        torch.randint(1000, 5000, shape, generator=g)   # originally measured case
+    for shape in [(1, 32), (4, 17)]:
+        torch.randint(1000, 5000, shape, generator=g)
     ids = torch.randint(1000, 5000, (b, plen), generator=g).to(cfg.DEVICE)
 
-    recorded = []
-    real = M.forward_paged
+    static_decode: list = []
+    real_init = dg._StaticDecodeState.__init__
 
-    def spy(*a, **k):
-        out = real(*a, **k)
-        recorded.append(out.float().clone())
-        return out
+    def recording_init(self, *a, **k):
+        real_init(self, *a, **k)
+        self.record = static_decode
 
     with M.using_kernels(False):
-        M.forward_paged = spy
-        try:
+        with record_step_logits("forward_paged") as paged_logs:
             ref = M.generate_paged(ids, weights, cf, gen)
-        finally:
-            M.forward_paged = real
-        got = generate_paged_static(ids, weights, cf, gen, use_graph=True)
+        monkeypatch.setattr(dg._StaticDecodeState, "__init__", recording_init)
+        with record_step_logits("forward_paged") as static_prefill:
+            got = generate_paged_static(ids, weights, cf, gen, use_graph=False)
+    static_logs = static_prefill[:1] + static_decode      # prefill, then each decode step
+    assert len(static_logs) == len(paged_logs) == gen
 
-    diverged = (ref != got).any(1).nonzero().flatten().tolist()
-    print(f"\n[static decode, kernels off] {len(diverged)} of {b} sequences diverge")
-    for s in diverged:
-        t = int((ref[s] != got[s]).nonzero()[0])
-        top2 = recorded[t][s].topk(2).values
-        gap = (top2[0] - top2[1]).item()
-        print(f"    seq {s}: first divergence at step {t}, reference gap {gap:.4f}")
-        assert gap < NEAR_TIE_GAP, (
-            f"seq {s} diverged at step {t} with a reference top-1/top-2 gap of "
-            f"{gap:.4f}. That is not a near-tie, so it is not explained by the "
-            f"read-table width's fp16 rounding.")
+    diverged = 0
+    worst_all = 0.0
+    for row in range(b):
+        div = first_divergence(ref[row], got[row])
+        upto = gen - 1 if div is None else div
+        worst, at = drift_between(static_logs, paged_logs, row, upto)
+        worst_all = max(worst_all, worst)
+        diverged += div is not None
+        assert worst <= PATH_DRIFT_ULPS, (
+            f"row {row}: static step drifted {worst:.1f} ULPs from generate_paged at "
+            f"step {at} (bound {PATH_DRIFT_ULPS}); that is not read-table rounding")
+    print(f"\n[static decode, kernels off] {diverged}/{b} rows diverge; worst drift "
+          f"{worst_all:.1f} ULPs of {cfg.DTYPE_NAME} (bound {PATH_DRIFT_ULPS})")
 
 
-def test_width_is_the_only_cause_of_divergence(loaded):
+def test_read_table_width_attribution(loaded):
     """Attribute the kernels-off divergence instead of merely bounding it.
 
     Holds everything fixed except the read table's width, on the same decode
@@ -194,10 +198,12 @@ def test_width_is_the_only_cause_of_divergence(loaded):
           f"kernel path 33 vs 96 equal: {torch.equal(kern_33, kern_96)}")
 
     assert torch.equal(torch_33a, torch_33b), "same width twice is not deterministic"
-    assert not torch.equal(torch_33a, torch_96), (
-        "width no longer changes the PyTorch attention output -- if cuBLAS now "
-        "picks the same kernel for both shapes, the kernels-off near-tie test "
-        "may be able to become an exact-match test")
+    # Whether width moves the PyTorch output is an OBSERVATION about which cuBLAS
+    # kernel a shape gets, not an invariant: it does on 0.5B/fp16 (1.5e-05), and
+    # does not on 1.5B/bf16 (exactly 0). So it is reported, not asserted. What
+    # must hold everywhere is that the decode kernel cannot see the width.
+    print(f"  PyTorch attention changes with read-table width: "
+          f"{not torch.equal(torch_33a, torch_96)}")
     assert torch.equal(kern_33, kern_96), (
         "the decode kernel's output depends on the read table's width; "
         "kernels-on exact parity would then be coincidence, not structure")

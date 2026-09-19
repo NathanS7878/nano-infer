@@ -537,6 +537,112 @@ These were all expensive to discover. Read before debugging anything.
     like a dequantization bug. Nathan's prediction for this kernel stays
     untested.
 
+41. **Qwen2.5-1.5B produces NaN in fp16, and it is the attention scores, not a
+    bug.** The 1.5B checkpoint generated a run of quote characters fifty
+    tokens long -- and so did HuggingFace's own fp16 load of it, which is what
+    ruled out our engine.
+    Cause: the raw product q.k reaches **264,115**, and fp16's largest finite
+    value is **65,504**. One layer's k_proj bias alone is 316. The overflow
+    happens inside the matmul, before any scaling can rescue it. bf16 has the
+    same 10-bit-vs-7-bit mantissa disadvantage but the *same exponent range as
+    fp32*, so it carries 264,115 without blinking. The checkpoint ships as
+    bf16; `config.py` now reads `torch_dtype` from the checkpoint and uses it,
+    rather than assuming the dev model's fp16.
+    **Lesson: dtype is not a free knob. Range and precision are separate
+    properties, and a model that needs one may not need the other.**
+
+42. **The 0.5B fixture and the engine disagreed at exact ties, with
+    bit-identical logits.** `tests/capture_reference.py` selected the greedy
+    token with `logits.topk(1)`; the engine uses `argmax`. On ties -- which bf16
+    makes common, because fewer fraction bits means more exactly-equal logits --
+    the two pick different indices from the *same* tensor. A whole class of
+    "the engine broke" investigations starts here and finds nothing, because
+    nothing is broken. Capture now uses `argmax`, and the committed 0.5B fixture
+    was verified to reproduce exactly under it.
+    **Lesson: a reference is only a reference if its tie-break matches.**
+
+43. **Scaling after the upcast instead of before it, hidden for a whole phase by
+    a power of two.** `attention_paged` computed `(q @ k).float() * scale`;
+    every other attention path in the project (Phase 1, cached, and HF) computes
+    `((q @ k) * scale).float()`. The paged-vs-contiguous prefill test existed
+    precisely to catch a difference like this and had passed since Phase 2 --
+    because on Qwen2.5-0.5B `head_dim` is 64, so `scale` is `1/8`, a power of
+    two, and multiplying by it in fp16 or in fp32 gives bit-identical results.
+    On Qwen2.5-1.5B, `head_dim` 128 makes `scale` `1/sqrt(128)`, which is not,
+    and the two paths' prefill logits differed by **1.31**. Matching the order
+    took it to **exactly 0.00**. The three-way control that found it ran the
+    same prompt through contiguous, paged, and paged-with-the-order-swapped.
+    **Lesson: a test that passes can still be passing for the wrong reason.
+    Architectural constants that happen to be powers of two hide rounding bugs.**
+
+44. **The kernel parity test was measuring the reference's error, not the
+    kernel's.** Kernel drift on 1.5B came in at **66 ULPs** against a bound of
+    64, and the obvious reading -- the kernels got worse -- was wrong. Measuring
+    both sides against an fp32 ground truth instead: kernels-OFF was **71.3u**
+    from truth, kernels-ON was **15.2u**. The kernel was the *accurate* one; the
+    bf16 PyTorch path it was being compared against was the inaccurate one,
+    because it computes q.k where bf16's resolution is already 1,024 while the
+    decode kernel accumulates that product in fp32. Fixed by giving the PyTorch
+    path an opt-in fp32-scores mode (`M.using_fp32_attention_scores`, OFF by
+    default so the engine stays HF-identical) and comparing kernels against
+    *that*: drift dropped to 3-4u and the bound tightened from 64 to 16.
+    **Lesson: when a parity test fails, ask which side moved. "Reference" is a
+    role, not a guarantee of accuracy.**
+
+45. **Absolute error bars do not survive a dtype change.** Phase 2/3 parity
+    tests used bars calibrated on 0.5B/fp16 -- "benign if the reference top-1/
+    top-2 gap is under 0.05". In bf16 near a logit of 20 the smallest
+    representable step is **0.125**, so a gap of 0.05 cannot even exist, and
+    ordinary cached-vs-uncached drift runs 0.3-1.25 logits. Every such bar was
+    rewritten in `tests/_drift.py` to count **ULPs of the model dtype at that
+    step's top-logit magnitude**, with each bound set from a recorded
+    measurement and a stated multiple (prefill 4u, path drift 32u, kernel drift
+    16u at ~1.5x the worst measured 10.5u, quantized-path drift 40u at ~1.6x
+    the worst measured 25.2u). Gotcha #16, a second time.
+    **Lesson: express a tolerance in units of the thing that produces it.**
+
+46. **The stored quantization scale has to be rounded UP, not to-nearest.**
+    Gotcha #23 established that codes must be chosen against the scale that will
+    actually be *stored* (the model dtype), not a more precise fp32 one. The
+    *direction* of that rounding turns out to matter too. Both schemes size the
+    grid so the extreme element lands exactly on the last code -- INT8
+    `scale = max|w|/127`, INT4 `scale = (hi-lo)/15` -- so if the stored scale is
+    even slightly *smaller* than the exact one, that quotient exceeds the last
+    code, `clamp` pulls it back, and the extreme element reconstructs more than
+    half a step away: the one guarantee round-to-nearest exists to give. Found
+    on 1.5B/bf16 at row 34, group 3, element 37 -- the group maximum, exact
+    scale 0.5562500 stored as 0.5546875, **0.281% low**, landing **0.0115
+    steps** past the bound. fp16 hid it for an entire phase: its rounding is at
+    most 2^-11 relative, which the test's 1% slack absorbed; bf16's is 2^-8 and
+    does not. Fixed by taking the next representable value up whenever the cast
+    rounds down (one int16 view serves fp16 and bf16 alike, since the IEEE bit
+    pattern of a positive float is monotonic). The grid step grows by at most
+    one ULP of the stored dtype.
+    This **changed 1.17% of INT8 codes and 0.77% of INT4 codes on the 0.5B
+    model**, so every published quantization quality number was re-measured
+    rather than left stale. All of them improved slightly: INT8 perplexity
+    22.2941 -> **22.2838**, INT4 g128 27.1472 -> **27.1170**, g64 26.0086 ->
+    **25.9810**, g32 25.6600 -> **25.6464**. Timing tables were not re-run: the
+    fix changes which codes are chosen, not how many bytes move.
+    **Lesson: when a rounding decision sits upstream of a clamp, its direction
+    is part of the algorithm.**
+
+47. **"The packed and round-trip paths must produce identical tokens" was never
+    the real claim.** The acceptance table measures perplexity on the
+    round-tripped-fp16 weights and speed/VRAM on the packed ones, so the two
+    must describe the same model. The test asserted that by generating from each
+    and requiring identical tokens -- which passed on 0.5B/fp16 and failed
+    **20/40** on 1.5B/bf16, with nothing wrong. The paths share a grid but not
+    an *arithmetic order*: one hands cuBLAS a materialized weight, the other
+    accumulates a 1536-long dot product inside the fused dequant-matmul kernel.
+    Split into the two claims that are actually being made: the grid claim,
+    asserted **exactly** (every quantized tensor reconstructs bit-identically --
+    196/196 on 1.5B, 168/168 on 0.5B, worst difference 0.000e+00), and the
+    arithmetic-order claim, asserted as bounded ULP drift (worst measured 25.2u
+    on 1.5B, 22.5u on 0.5B).
+    **Lesson: when a test fails on a new configuration, check whether it was
+    asserting its own claim or a stricter proxy that happened to hold.**
+
 ---
 
 ## Progress detail

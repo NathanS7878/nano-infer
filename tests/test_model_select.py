@@ -47,9 +47,9 @@ def test_selecting_another_model_reads_its_checkpoint():
     code = (
         "from nano_infer import config as cfg, model as M\n"
         "cf = M.QwenConfig()\n"
-        "print(cfg.MODEL_NAME, cfg.MODEL_SLUG, cfg.RESULTS_DIR.name, cfg.REFERENCE_FIXTURE.name,"
-        " cf.hidden_size, cf.intermediate_size, cf.num_layers, cf.num_q_heads,"
-        " cf.num_kv_heads, cf.head_dim)\n"
+        "print(cfg.MODEL_NAME, cfg.MODEL_SLUG, cfg.DTYPE_NAME, cfg.RESULTS_DIR.name,"
+        " cfg.REFERENCE_FIXTURE.name, cf.hidden_size, cf.intermediate_size,"
+        " cf.num_layers, cf.num_q_heads, cf.num_kv_heads, cf.head_dim)\n"
     )
     env = dict(os.environ, NANO_INFER_MODEL="Qwen/Qwen2.5-1.5B-Instruct",
                PYTHONPATH=str(cfg.REPO_ROOT))
@@ -60,9 +60,26 @@ def test_selecting_another_model_reads_its_checkpoint():
         if "LocalEntryNotFoundError" in e.stderr or "offline" in e.stderr.lower():
             pytest.skip("Qwen2.5-1.5B-Instruct config not available locally")
         raise
-    assert out == ["Qwen/Qwen2.5-1.5B-Instruct", "qwen2.5-1.5b", "qwen2.5-1.5b",
-                   "reference_qwen2.5-1.5b.pt",
+    # 1.5B defaults to its native bf16 -- fp16 overflows it (ROADMAP #41)
+    assert out == ["Qwen/Qwen2.5-1.5B-Instruct", "qwen2.5-1.5b", "bf16",
+                   "qwen2.5-1.5b-bf16", "reference_qwen2.5-1.5b-bf16.pt",
                    "1536", "8960", "28", "12", "2", "128"], out
+
+
+def test_precision_override_and_default():
+    """The default model stays fp16 unless told otherwise; an explicit
+    NANO_INFER_DTYPE wins, and moves results out of the default directory."""
+    code = ("from nano_infer import config as cfg\n"
+            "print(cfg.DTYPE_NAME, cfg.RESULTS_DIR.name, cfg.REFERENCE_FIXTURE.name)\n")
+    base = dict(os.environ, PYTHONPATH=str(cfg.REPO_ROOT))
+    base.pop("NANO_INFER_MODEL", None)
+    base.pop("NANO_INFER_DTYPE", None)
+    run = lambda env: subprocess.run([sys.executable, "-c", code], env=env,
+                                     capture_output=True, text=True, timeout=120,
+                                     check=True).stdout.split()
+    assert run(base) == ["fp16", "results", "reference_qwen2.5-0.5b.pt"]
+    assert run(dict(base, NANO_INFER_DTYPE="bfloat16")) == [
+        "bf16", "qwen2.5-0.5b-bf16", "reference_qwen2.5-0.5b-bf16.pt"]
 
 
 def test_unsupported_architectures_are_refused(tmp_path, monkeypatch):
@@ -83,3 +100,36 @@ def test_unsupported_architectures_are_refused(tmp_path, monkeypatch):
         name = f"fake/{label}"
         with pytest.raises(ValueError, match=label):
             M.checkpoint_config(name)
+
+
+# ---------------------------------------------------------------------------
+# fp32 attention scores (model._FP32_ATTENTION_SCORES)
+# ---------------------------------------------------------------------------
+
+def test_fp32_attention_scores_default_off_and_scoped():
+    """Off by default -- the engine must stay bit-identical to HF unless asked --
+    and the context manager must restore the previous setting."""
+    from nano_infer import model as M
+    assert M.fp32_attention_scores_enabled() is False
+    with M.using_fp32_attention_scores(True):
+        assert M.fp32_attention_scores_enabled() is True
+        with M.using_fp32_attention_scores(False):
+            assert M.fp32_attention_scores_enabled() is False
+        assert M.fp32_attention_scores_enabled() is True
+    assert M.fp32_attention_scores_enabled() is False
+
+
+def test_phase1_reference_ignores_fp32_attention_scores():
+    """The Phase 1 attention is the HF-identical answer key and must not change
+    when the switch is on, just as it ignores the kernel switch."""
+    import torch
+    from nano_infer import model as M
+    cf = M.QwenConfig()
+    w = M.load_weights()
+    torch.manual_seed(0)
+    x = torch.randn(1, 9, cf.hidden_size, dtype=cfg.DTYPE, device=cfg.DEVICE)
+    cos, sin = M.build_rope_cache(9, cf.head_dim, cf.rope_theta)
+    off = M.attention(x, w, 0, cos, sin, cf)
+    with M.using_fp32_attention_scores(True):
+        on = M.attention(x, w, 0, cos, sin, cf)
+    assert torch.equal(off, on), "Phase 1 attention changed under the fp32-scores switch"

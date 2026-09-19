@@ -51,7 +51,15 @@ def greedy_capture(model, input_ids, max_new_tokens: int):
         topk_ids[step] = ids.cpu()
         topk_vals[step] = vals.to(torch.float16).cpu()
 
-        next_id = int(ids[0].item())  # greedy = argmax = top-1
+        # Greedy selection uses torch.argmax, NOT topk's first index. On an exact
+        # logit tie they can disagree: argmax is documented to return the FIRST
+        # maximal index, topk makes no such promise. The engine decodes with
+        # argmax, so the answer key must too -- otherwise a tie is recorded as a
+        # divergence with bit-identical logits. Rare in fp16; common in bf16,
+        # whose 7-bit mantissa makes exact ties frequent (ROADMAP #42: at
+        # Qwen2.5-1.5B prompt 2 step 20 the top two logits are both exactly 18.25,
+        # argmax picks 2980 and topk 9645).
+        next_id = int(logits.squeeze(0).argmax().item())
         greedy_ids.append(next_id)
 
         seq = torch.cat([seq, torch.tensor([[next_id]], device=device)], dim=1)
