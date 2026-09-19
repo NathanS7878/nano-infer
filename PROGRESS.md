@@ -825,14 +825,14 @@ measurement. Every configuration sees identical windows in identical order.
 | Precision | Perplexity | vs fp16 | Model | Compression | bits/wt |
 |---|---|---|---|---|---|
 | fp16 | 22.4164 | — | 988 MB | 1.00× | 16.00 |
-| **INT8** | **22.2941** | **−0.55%** | 631 MB | 1.57× | 8.01 |
-| INT4 g32 | 25.6600 | +14.47% * | 485 MB | 2.04× | 4.75 |
-| INT4 g64 | 26.0086 | +16.02% * | 468 MB | 2.11× | 4.38 |
-| INT4 g128 | 27.1472 | +21.10% * | 460 MB | 2.15× | 4.19 |
+| **INT8** | **22.2838** | **−0.59%** | 631 MB | 1.57× | 8.01 |
+| INT4 g32 | 25.6464 | +14.41% * | 485 MB | 2.04× | 4.75 |
+| INT4 g64 | 25.9810 | +15.90% * | 468 MB | 2.11× | 4.38 |
+| INT4 g128 | 27.1170 | +20.97% * | 460 MB | 2.15× | 4.19 |
 
 **The baseline is 22.4164 ± 3.45% (one standard error).** A perplexity delta
 without an error bar is not interpretable, and this one earns its keep
-immediately: INT8's −0.55% is *smaller than the sampling error*, so the honest
+immediately: INT8's −0.59% is *smaller than the sampling error*, so the honest
 statement is **"INT8 is lossless within measurement precision"** — not "INT8
 improved the model", which is what the raw sign would have suggested. The `*`
 marks deltas larger than one standard error; only the INT4 rows have them.
@@ -1013,9 +1013,9 @@ All rows on packed weights.
 
 | Precision | Weights | Compression | bits/wt | tok/s (batch 1) | tok/s (batch 32) | Peak VRAM | Perplexity | vs fp16 |
 |---|---|---|---|---|---|---|---|---|
-| fp16 | 988 MB | 1.00× | 16.00 | 57.9 | **1646.0** | 1030 MiB | 22.42 | — |
-| **INT8** | 631 MB | 1.57× | 8.01 | **67.9** | 1274.9 | 682 MiB | 22.29 | −0.55% |
-| INT4 | 460 MB | 2.15× | 4.19 | 67.1 | 829.1 | **519 MiB** | 27.15 | +21.10% |
+| fp16 | 988 MB | 1.00× | 16.00 | 57.8 | **1679.5** | 1030 MiB | 22.42 | — |
+| **INT8** | 631 MB | 1.57× | 8.01 | **69.0** | 1325.1 | 682 MiB | 22.28 | −0.59% |
+| INT4 | 460 MB | 2.15× | 4.19 | 67.7 | 840.3 | **519 MiB** | 27.12 | +20.97% |
 
 Relative throughput: INT8 **1.17× at batch 1, 0.77× at batch 32**; INT4 **1.16×
 and 0.50×**. Peak VRAM 1030 → 519 MiB, a **1.99×** reduction.

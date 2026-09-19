@@ -26,7 +26,7 @@ reproducible by a script in this repo.
 | nano-infer, no cache (Phase 1) | 25.4 | 53.3 | 0.07× | `python -m bench.phase1_nocache` |
 | nano-infer, paged KV cache (Phase 2) | 24.6 | 724.1 | 1.01× | `python -m bench.phase2_cache` |
 | nano-infer + custom kernels (Phase 3) | 58.6 | 1739.1 | 2.43× | `python -m bench.phase3_end_to_end` |
-| nano-infer + INT8 weights (Phase 4) | 67.9 | 1274.9 | 1.78× | `python -m bench.quant_acceptance` |
+| nano-infer + INT8 weights (Phase 4) | 69.0 | 1325.1 | 1.85× | `python -m bench.quant_acceptance` |
 | nano-infer + kernels + CUDA-graph decode, capture every call | 178.2 | 5003.2 | 7.00× | `python -m bench.decode_graph_runner` |
 | **nano-infer + kernels + CUDA-graph decode, capture once** | **259.9** | **6909.0** | **9.67×** | `python -m bench.decode_graph_runner` |
 | vLLM | — | — | — | **not run — see below** |
@@ -179,16 +179,16 @@ WikiText-2 test split, 8,176 predicted tokens. Reproduce:
 
 | Precision | Weights | Compression | bits/wt | tok/s @1 | tok/s @32 | Peak VRAM | Perplexity | vs fp16 |
 |---|---|---|---|---|---|---|---|---|
-| fp16 | 988 MB | 1.00× | 16.00 | 57.9 | **1646.0** | 1030 MiB | 22.42 | — |
-| **INT8** | 631 MB | 1.57× | 8.01 | **67.9** | 1274.9 | 682 MiB | 22.29 | −0.55% |
-| INT4 g128 | 460 MB | 2.15× | 4.19 | 67.1 | 829.1 | **519 MiB** | 27.15 | +21.10% |
+| fp16 | 988 MB | 1.00× | 16.00 | 57.8 | **1679.5** | 1030 MiB | 22.42 | — |
+| **INT8** | 631 MB | 1.57× | 8.01 | **69.0** | 1325.1 | 682 MiB | 22.28 | −0.59% |
+| INT4 g128 | 460 MB | 2.15× | 4.19 | 67.7 | 840.3 | **519 MiB** | 27.12 | +20.97% |
 
 The `fp16` row here is the same configuration as the Phase 3 row in the
 benchmark table (custom kernels, unquantized weights), re-measured by a different
-script; the ~5% gap between 1646.0 and 1739.1 is run-to-run variance, not a
+script; the ~3% gap between 1679.5 and 1739.1 is run-to-run variance, not a
 disagreement. Each table cites the script that produced it.
 
-The fp16 perplexity baseline is **22.42 ± 3.45% (1 s.e.)**. INT8's −0.55% is
+The fp16 perplexity baseline is **22.42 ± 3.45% (1 s.e.)**. INT8's −0.59% is
 *inside* that error bar, so the honest claim is **"lossless within measurement
 precision"** — not that quantization improved the model, which the raw sign
 suggests. INT4's +21% is well outside it and is a real cost.

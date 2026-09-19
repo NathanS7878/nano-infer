@@ -58,15 +58,16 @@ def test_int8_error_is_bounded_by_half_a_step():
     err = (w.float() - deq.float()).abs()
     half_step = t.scale.float() / 2
 
-    # The bound is half a step PLUS one fp16 rounding of the reconstruction,
-    # because the dequantized value is itself stored in fp16. Both terms are
-    # derived, not tuned: round-to-nearest gives s/2, and fp16 has a 2^-11
-    # relative representation error.
-    bound = half_step + deq.float().abs() * 2 ** -11 * 1.01
+    # The bound is half a step PLUS one rounding of the reconstruction in the
+    # model dtype, because the dequantized value is itself stored in it. Both
+    # terms are derived, not tuned: round-to-nearest gives s/2, and a 16-bit
+    # float has an eps/2 relative representation error -- 2^-11 for fp16,
+    # 2^-8 for bf16.
+    bound = half_step + deq.float().abs() * (torch.finfo(cfg.DTYPE).eps / 2) * 1.01
     violations = int((err > bound).sum())
     print(f"\n[int8] max err {err.max():.3e}, max half-step {half_step.max():.3e}, "
           f"violations {violations}")
-    assert violations == 0, f"{violations} elements exceeded half a step + fp16 ulp"
+    assert violations == 0, f"{violations} elements exceeded half a step + one {cfg.DTYPE_NAME} rounding"
 
 
 def test_int4_packing_round_trips_exactly():
@@ -106,11 +107,12 @@ def test_int4_error_is_bounded_by_half_a_step():
     err = (w.float() - deq.float()).abs().reshape(64, 4, 128)
     half_step = t.scale.float().reshape(64, 4, 1) / 2
 
-    bound = half_step + deq.float().abs().reshape(64, 4, 128) * 2 ** -11 * 1.01
+    bound = (half_step + deq.float().abs().reshape(64, 4, 128)
+             * (torch.finfo(cfg.DTYPE).eps / 2) * 1.01)
     violations = int((err > bound).sum())
     print(f"\n[int4] max err {err.max():.3e}, max half-step {half_step.max():.3e}, "
           f"violations {violations}")
-    assert violations == 0, f"{violations} elements exceeded half a step + fp16 ulp"
+    assert violations == 0, f"{violations} elements exceeded half a step + one {cfg.DTYPE_NAME} rounding"
 
 
 def test_int4_group_boundaries_use_their_own_scale():
@@ -177,20 +179,33 @@ def test_quantize_weights_leaves_embeddings_and_norms_alone():
                            weights["model.layers.0.mlp.gate_proj.weight"]), \
         "gate_proj was NOT quantized"
 
-    # 7 projections x 24 layers
-    assert stats["quantized_tensors"] == 7 * 24, stats["quantized_tensors"]
+    # 7 projections per layer: 168 on 0.5B's 24 layers, 196 on 1.5B's 28
+    n_layers = M.QwenConfig().num_layers
+    assert stats["quantized_tensors"] == 7 * n_layers, stats["quantized_tensors"]
     print(f"\n[coverage] {stats['quantized_tensors']} tensors quantized, "
           f"{stats['bytes_quantizable_original']/1e6:.1f} MB of "
           f"{stats['bytes_original']/1e6:.1f} MB "
           f"({stats['bytes_quantizable_original']/stats['bytes_original']*100:.1f}%)")
 
 
-@pytest.mark.parametrize("mode,lo,hi", [("int8", 1.5, 1.7), ("int4", 2.0, 2.3)])
-def test_whole_model_compression_is_what_we_claim(mode, lo, hi):
+# Whole-model compression depends on how much of the model is the tied
+# embedding, which stays unquantized -- so the expected range is per model,
+# around the measured value, not one range for every checkpoint.
+EXPECTED_COMPRESSION = {
+    "qwen2.5-0.5b": {"int8": (1.5, 1.7), "int4": (2.0, 2.3)},     # 1.57x, 2.15x
+    "qwen2.5-1.5b": {"int8": (1.65, 1.85), "int4": (2.55, 2.8)},  # 1.74x, 2.68x
+}
+
+
+@pytest.mark.parametrize("mode", ["int8", "int4"])
+def test_whole_model_compression_is_what_we_claim(mode):
     """The model-level number, not the per-tensor one. Because the embedding
     stays fp16, INT4 gives ~2.2x on the whole model even though the tensors it
     touches shrink ~3.8x. Both numbers are reported; only one of them is 'the
     model is N times smaller'."""
+    if cfg.MODEL_SLUG not in EXPECTED_COMPRESSION:
+        pytest.skip(f"no measured compression range recorded for {cfg.MODEL_SLUG}")
+    lo, hi = EXPECTED_COMPRESSION[cfg.MODEL_SLUG][mode]
     weights = M.load_weights()
     _, s = Q.quantize_weights(weights, mode)
     print(f"\n[{mode}] whole model {s['bytes_original']/1e6:.1f} -> "
@@ -214,8 +229,12 @@ def test_whole_model_compression_is_what_we_claim(mode, lo, hi):
 kernels = pytest.importorskip("nano_infer.kernels")
 
 # Only the accumulation order differs from the reference (fp32 in the kernel vs
-# cuBLAS's own order), so the bar is tight.
-MATMUL_REL = 5e-3
+# cuBLAS's own order), so the bar is tight -- and stated in eps of the model
+# dtype. It was 5e-3, which is 5.1 eps in fp16 but only 0.64 eps in bf16. Against
+# an fp64 truth computed from the exactly-dequantized weights, the kernel is at
+# 0.39-0.40 eps and the dequantize-then-cuBLAS reference at 0.47-0.60 eps in
+# BOTH dtypes; they differ from each other by at most 0.86 eps.
+MATMUL_REL = 5 * torch.finfo(cfg.DTYPE).eps
 
 
 @pytest.fixture(scope="module")
@@ -344,34 +363,98 @@ def test_quantized_matmul_never_materializes_the_weight(kmod):
 # --- the packed path (what the engine actually runs) ------------------------
 
 @pytest.mark.parametrize("mode", ["int8", "int4"])
-def test_packed_weights_generate_identically_to_the_round_trip(kmod, mode):
-    """The packed path and the round-tripped-fp16 path use the SAME quantization
-    grid, so they must produce the same tokens.
+def test_packed_weights_land_on_exactly_the_round_trip_grid(mode):
+    """THE claim the acceptance table rests on, asserted exactly.
 
-    This is what lets the acceptance table carry the perplexity number measured
-    on the round-trip path: if the two agreed only approximately, the quality
-    column would be describing a different model than the speed column.
+    The table's perplexity column is measured on the round-tripped-fp16 path;
+    its speed and VRAM columns are measured on the packed path. That is only
+    honest if the two describe the same model -- if the packed weights encoded a
+    different grid, the quality number would belong to something else.
+
+    They do not merely agree closely: every quantized tensor reconstructs
+    BIT-IDENTICALLY, because both paths call the same quantize_int8/int4 and
+    differ only in whether the reconstruction is materialized. So this is an
+    exact bar, and it is the right place to put one -- see the sibling test for
+    why generation itself cannot carry one.
     """
+    weights = M.load_weights()
+    round_trip, _ = Q.quantize_weights(weights, mode)
+    packed, stats = Q.pack_weights(weights, mode)
+
+    checked, worst, worst_name = 0, 0.0, None
+    for name, obj in packed.items():
+        if isinstance(obj, torch.Tensor):
+            continue                      # left in fp16 on purpose (embedding)
+        checked += 1
+        diff = (obj.dequantize().float() - round_trip[name].float()).abs().max().item()
+        if diff > worst:
+            worst, worst_name = diff, name
+    print(f"\n[packed {mode}] {checked} quantized tensors; worst reconstruction "
+          f"difference from the round-trip path {worst:.3e}"
+          + (f" at {worst_name}" if worst_name else "")
+          + f"; {stats['bytes_quantized']/1e6:.1f} MB, {stats['compression']:.2f}x")
+    assert checked > 0, "pack_weights quantized nothing"
+    assert worst == 0.0, (
+        f"packed and round-trip weights differ by up to {worst:.3e} at "
+        f"{worst_name} — the acceptance table's perplexity column would not "
+        "describe the model its speed column measures")
+
+
+@pytest.mark.parametrize("mode", ["int8", "int4"])
+def test_packed_weights_generate_within_a_rounding_of_the_round_trip(kmod, mode):
+    """Same grid (above), so the only thing left between the two paths is the
+    ORDER OF THE ARITHMETIC -- and that cannot be asserted token-for-token.
+
+    WHY NOT. The round-trip path hands cuBLAS a materialized fp16/bf16 weight;
+    the packed path runs the fused dequant-matmul kernel, which unpacks in
+    registers and accumulates its dot products in a different order. Same
+    numbers, different summation order, so the last bits differ. This test used
+    to require identical tokens and passed on 0.5B/fp16 -- on Qwen2.5-1.5B/bf16
+    it failed 20/40, not because anything regressed but because bf16 has three
+    fewer fraction bits, so the same rounding lands on the far side of more
+    argmax ties. Gotcha #16 again: a bar calibrated on one dtype is not a bar.
+
+    THE BAR THAT DOES MEAN SOMETHING. Compare the two paths' logits, up to and
+    including the first token they disagree on (before which both have the same
+    history, so no teacher-forcing is needed), and require the difference to
+    stay within a rounding -- a few tens of ULPs. A real defect in the packed
+    path -- wrong nibble order, a row-wide scale where a per-group one belongs,
+    a dropped zero point -- moves logits by orders of magnitude more, which is
+    what the kernel-level tests above catch directly.
+    """
+    from tests._drift import (QUANT_PATH_DRIFT_ULPS, drift_between,
+                              first_divergence, record_step_logits)
     weights = M.load_weights()
     cf = M.QwenConfig()
     g = torch.Generator(device="cpu").manual_seed(0)
     ids = torch.randint(1000, 5000, (2, 12), generator=g).to(cfg.DEVICE)
+    steps = 20
 
     round_trip, _ = Q.quantize_weights(weights, mode)
     packed, stats = Q.pack_weights(weights, mode)
 
     with M.using_kernels(True):
-        a = M.generate_paged(ids, round_trip, cf, 20)
-        b = M.generate_paged(ids, packed, cf, 20)
+        with record_step_logits("forward_paged") as rt_logs:
+            a = M.generate_paged(ids, round_trip, cf, steps)
+        with record_step_logits("forward_paged") as pk_logs:
+            b = M.generate_paged(ids, packed, cf, steps)
 
     agree = int((a == b).sum())
     print(f"\n[packed {mode}] {agree}/{a.numel()} tokens match the round-trip "
           f"reference; {stats['bytes_quantized']/1e6:.1f} MB, "
           f"{stats['compression']:.2f}x")
-    assert agree == a.numel(), (
-        f"packed and round-trip paths disagree on {a.numel()-agree} tokens — "
-        "the acceptance table's perplexity column would not describe the model "
-        "its speed column measures")
+    for row in range(ids.shape[0]):
+        diverged = first_divergence(a[row], b[row])
+        upto = steps - 1 if diverged is None else diverged
+        worst, at = drift_between(rt_logs, pk_logs, row, upto)
+        print(f"  row {row}: first divergence "
+              f"{'none' if diverged is None else diverged}, "
+              f"{upto + 1} steps compared, worst {worst:.2f} {cfg.DTYPE_NAME} "
+              f"ULPs at step {at}")
+        assert worst <= QUANT_PATH_DRIFT_ULPS, (
+            f"packed vs round-trip drift {worst:.1f}u at step {at} of row {row} "
+            f"exceeds {QUANT_PATH_DRIFT_ULPS}u — too large to be a summation "
+            "order difference; the packed path is decoding a different grid")
 
 
 @pytest.mark.parametrize("mode", ["int8", "int4"])

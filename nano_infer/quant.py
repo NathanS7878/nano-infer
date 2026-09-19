@@ -116,27 +116,73 @@ class Int8Tensor:
         return self.q.numel() + self.scale.numel() * self.scale.element_size()
 
     def dequantize(self) -> torch.Tensor:
-        return (self.q.to(torch.float16) * self.scale).to(cfg.DTYPE)
+        return (self.q.to(self.scale.dtype) * self.scale).to(cfg.DTYPE)
+
+
+def _scale_to_stored_dtype(scale: torch.Tensor) -> torch.Tensor:
+    """Round a positive fp32 scale UP to the nearest value representable in
+    cfg.DTYPE -- never down.
+
+    WHY UP AND NOT TO-NEAREST (Gotcha #41). The scale is stored in the model
+    dtype, so that is the number dequantization multiplies by, and codes must
+    be chosen against it (Gotcha #23). But the *direction* of that rounding is
+    not free. Both schemes size the grid so the extreme element of a row/group
+    lands exactly on the last code:
+
+        INT8: scale = max|w| / 127        ->  max|w| / scale == 127
+        INT4: scale = (hi - lo) / 15      ->  (hi - lo) / scale == 15
+
+    If the stored scale is even slightly SMALLER than the exact one, that
+    quotient exceeds the last code, round() produces 128 (or 16), clamp pulls
+    it back, and the extreme element reconstructs more than half a step away --
+    the one guarantee round-to-nearest is supposed to give. Rounding the scale
+    up instead makes the grid a hair wider than the data, so every element
+    stays inside the code range and the half-step bound holds by construction.
+
+    The cost is bounded and tiny: the grid step grows by at most one ULP of the
+    stored dtype (2^-11 relative in fp16, 2^-8 in bf16), so the half-step bound
+    itself widens by the same relative amount.
+
+    WHY IT ONLY SURFACED ON bf16. In fp16 the downward rounding is at most
+    2^-11 relative, which the test's 1%-of-a-rounding slack absorbed. bf16 has
+    three fewer fraction bits -- 2^-8 -- and it does not. The bug was always
+    there; fp16 hid it. Found by test_int4_error_is_bounded_by_half_a_step on
+    Qwen2.5-1.5B/bf16: row 34, group 3, element 37, the group maximum, whose
+    exact scale 0.5562500 stored as 0.5546875 (0.281% low) pushed its code to
+    16 -> clamped to 15 -> 0.0115 steps past the bound.
+
+    Implementation: for positive finite floats the IEEE-754 bit pattern is
+    monotonic, so the next representable value up is the next integer bit
+    pattern. fp16 and bf16 are both 16-bit, so one int16 view serves both.
+    """
+    down = scale.to(cfg.DTYPE)
+    up = (down.view(torch.int16) + 1).view(cfg.DTYPE)
+    return torch.where(down.float() < scale, up, down)
 
 
 def quantize_int8(w: torch.Tensor) -> Int8Tensor:
     """Per-row symmetric INT8. `w` is [out, in].
 
-    NOTE THE SCALE IS ROUNDED TO fp16 BEFORE IT IS USED. The scale is *stored*
-    in fp16, so that is the value dequantization (and the kernel) will multiply
-    by. Choosing codes against a more precise fp32 scale than the one that will
-    later be used introduces error for free: at q = 127 an fp16 scale rounding
-    of 2^-11 relative shifts the reconstruction by ~0.06 of a step, which is
-    enough to push round-to-nearest past its half-step guarantee. Found by
+    NOTE THE SCALE IS ROUNDED TO THE STORED DTYPE BEFORE IT IS USED, AND
+    ROUNDED UP. The scale is *stored* in the model dtype, so that is the value
+    dequantization (and the kernel) will multiply by. Choosing codes against a
+    more precise fp32 scale than the one that will later be used introduces
+    error for free: at q = 127 an fp16 scale rounding of 2^-11 relative shifts
+    the reconstruction by ~0.06 of a step, which is enough to push
+    round-to-nearest past its half-step guarantee. Found by
     test_int8_error_is_bounded_by_half_a_step, which failed on 535 elements
-    before this line existed.
+    before this line existed. The *direction* matters too -- see
+    _scale_to_stored_dtype.
     """
     assert w.dim() == 2, "expected a 2-D weight"
     wf = w.float()
     scale = wf.abs().amax(dim=1, keepdim=True) / 127.0
     # A row of exact zeros would divide by zero; give it a harmless unit scale.
     scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-    scale = scale.to(torch.float16)                  # quantize with what we store
+    # Quantize with exactly what we store (Gotcha #23). The stored precision is
+    # the model dtype: fp16 on 0.5B, bf16 on Qwen2.5-1.5B, whose activations the
+    # dequant-matmul kernel must match.
+    scale = _scale_to_stored_dtype(scale)
     q = torch.round(wf / scale.float()).clamp_(-127, 127).to(torch.int8)
     return Int8Tensor(q=q, scale=scale, shape=tuple(w.shape))
 
@@ -195,11 +241,12 @@ def quantize_int4(w: torch.Tensor, group: int = INT4_GROUP) -> Int4Tensor:
 
     scale = (hi - lo) / 15.0
     scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-    # Same rule as INT8: round the scale to its stored fp16 precision BEFORE
+    # Same rule as INT8: round the scale to its stored precision BEFORE
     # choosing codes and the zero point, so quantization and dequantization
-    # agree on the grid. Otherwise the reconstruction misses by more than half
-    # a step for no reason.
-    scale = scale.to(torch.float16).float()
+    # agree on the grid -- and round it UP, so the group's extremes stay inside
+    # the 0..15 code range instead of clamping past the half-step bound.
+    stored_scale = _scale_to_stored_dtype(scale)
+    scale = stored_scale.float()
     zero = torch.round(-lo / scale).clamp_(0, 15)
 
     q = torch.round(wf / scale + zero).clamp_(0, 15).to(torch.uint8)
@@ -211,7 +258,7 @@ def quantize_int4(w: torch.Tensor, group: int = INT4_GROUP) -> Int4Tensor:
 
     return Int4Tensor(
         packed=packed,
-        scale=scale.reshape(out_f, g).to(torch.float16),
+        scale=stored_scale.reshape(out_f, g),
         zero=zero.reshape(out_f, g).to(torch.uint8),
         shape=(out_f, in_f),
         group=group,
