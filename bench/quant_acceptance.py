@@ -128,8 +128,8 @@ def main():
     before = gpu_idle()
     ppl = load_perplexity()
 
-    print(f"\nPhase 4 acceptance — {cfg.MODEL_NAME}, fp16 activations, "
-          f"weight-only quantization")
+    print(f"\nPhase 4 acceptance — {cfg.MODEL_NAME}, {cfg.DTYPE_NAME} "
+          f"activations, weight-only quantization")
     print(f"prompt {PROMPT_LEN}, {NEW_TOKENS} new tokens, median of "
           f"{args.repeats} runs after {args.warmup} warmups")
     if before:
@@ -137,20 +137,26 @@ def main():
               f"{before['memory_used_mib']} MiB used")
         if before["utilization_pct"] > 10:
             print("  ** WARNING: contended GPU — see Gotcha #18")
-    print("all rows run on PACKED weights; no fp16 copy is resident\n")
+    print(f"all rows run on PACKED weights; no {cfg.DTYPE_NAME} copy is "
+          f"resident\n")
 
     results = [measure(m, batches, args.repeats, args.warmup) for m in MODES]
+
+    # "fp16" is the mode IDENTIFIER (CLI value, JSON key); the label shown is
+    # the dtype actually in use, which is bf16 on Qwen2.5-1.5B.
+    def label(mode):
+        return cfg.DTYPE_NAME if mode == "fp16" else mode
 
     hdr = f"{'mode':>6}{'weights MB':>12}{'compress':>10}{'bits/wt':>9}"
     for b in batches:
         hdr += f"{'tok/s b' + str(b):>12}"
-    hdr += f"{'peak VRAM':>11}{'perplexity':>12}{'vs fp16':>9}"
+    hdr += f"{'peak VRAM':>11}{'perplexity':>12}{'vs ' + cfg.DTYPE_NAME:>9}"
     print(hdr)
     print("-" * len(hdr))
 
     for r in results:
         st = r["stats"]
-        line = (f"{r['mode']:>6}{st['bytes_quantized']/1e6:>12.1f}"
+        line = (f"{label(r['mode']):>6}{st['bytes_quantized']/1e6:>12.1f}"
                 f"{st['compression']:>9.2f}x{st['bits_per_weight']:>9.2f}")
         for b in batches:
             line += f"{r['batches'][b]['tok_s']:>12.1f}"
@@ -167,9 +173,10 @@ def main():
     for r in results[1:]:
         for b in batches:
             rel = r["batches"][b]["tok_s"] / base_row["batches"][b]["tok_s"]
-            print(f"  {r['mode']} vs fp16 at batch {b}: {rel:.2f}x tokens/sec")
+            print(f"  {r['mode']} vs {cfg.DTYPE_NAME} at batch {b}: "
+                  f"{rel:.2f}x tokens/sec")
     vram_saved = base_row["peak_vram_mib"] - results[-1]["peak_vram_mib"]
-    print(f"  peak VRAM saved, fp16 -> int4: {vram_saved:.0f} MiB "
+    print(f"  peak VRAM saved, {cfg.DTYPE_NAME} -> int4: {vram_saved:.0f} MiB "
           f"({base_row['peak_vram_mib']/max(results[-1]['peak_vram_mib'],1):.2f}x)")
     sem = (ppl.get("fp16") or {}).get("sem_pct")
     if sem:
@@ -188,12 +195,12 @@ def main():
 
     table = ["| Precision | Model size | Compression | bits/wt | "
              + " | ".join(f"tok/s (batch {b})" for b in batches)
-             + " | Peak VRAM | Perplexity | vs fp16 |",
+             + f" | Peak VRAM | Perplexity | vs {cfg.DTYPE_NAME} |",
              "|---" * (7 + len(batches)) + "|"]   # 7 fixed columns + one per batch
     for r in results:
         st = r["stats"]
         q = ppl.get(r["mode"], {})
-        cells = [r["mode"], f"{st['bytes_quantized']/1e6:.0f} MB",
+        cells = [label(r["mode"]), f"{st['bytes_quantized']/1e6:.0f} MB",
                  f"{st['compression']:.2f}x", f"{st['bits_per_weight']:.2f}"]
         cells += [f"{r['batches'][b]['tok_s']:.1f}" for b in batches]
         cells += [f"{r['peak_vram_mib']:.0f} MiB",

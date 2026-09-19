@@ -114,7 +114,7 @@ def main():
 
     before = gpu_state()
     print(f"\nDecode host overhead: paged vs static vs CUDA graph -- "
-          f"{cfg.MODEL_NAME}, fp16, greedy")
+          f"{cfg.MODEL_NAME}, {cfg.DTYPE_NAME}, greedy")
     print(f"warmup {args.warmup}, repeats {args.repeats}, all arms round-robin per repeat")
     if before:
         print(f"GPU at start: {before['utilization_pct']}% utilization, "

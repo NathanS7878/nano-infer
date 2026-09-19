@@ -194,14 +194,15 @@ def main():
     print("-" * 81)
     if fp16_ppl:
         sem = rows[0].get("sem_pct", 0.0)
-        print(f"fp16 baseline perplexity {fp16_ppl:.4f} +/- {sem:.2f}% (1 s.e.); "
+        print(f"{cfg.DTYPE_NAME} baseline perplexity {fp16_ppl:.4f} +/- "
+              f"{sem:.2f}% (1 s.e.); "
               f"deltas are relative to it.")
         print("'*' marks a delta larger than one standard error of the "
               "estimate; an unmarked delta is not distinguishable from "
               "sampling noise.")
     print("Compression is WHOLE MODEL. The quantized tensors alone shrink more "
           "(see\nthe 'quantized tensors' figure in tests/test_quant.py) — the "
-          "embedding stays fp16.")
+          f"embedding stays {cfg.DTYPE_NAME}.")
 
     generations = {}
     if not args.no_generations:
@@ -219,7 +220,8 @@ def main():
             print(f"\n  prompt: {generations[modes[0]][i]['prompt']!r}")
             for mode in modes:
                 text = generations[mode][i]["continuation"].replace("\n", " ")
-                print(f"    {mode:>5}: {text[:110]}")
+                shown = cfg.DTYPE_NAME if mode == "fp16" else mode
+                print(f"    {shown:>5}: {text[:110]}")
 
     cfg.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     (cfg.RESULTS_DIR / "perplexity.json").write_text(json.dumps({
@@ -229,10 +231,13 @@ def main():
         "results": rows, "generations": generations,
     }, indent=2), encoding="utf-8")
 
-    table = ["| Precision | Perplexity | vs fp16 | Model size | Compression | bits/weight |",
+    table = [f"| Precision | Perplexity | vs {cfg.DTYPE_NAME} | Model size "
+             f"| Compression | bits/weight |",
              "|---|---|---|---|---|---|"]
     for r in rows:
-        label = r["mode"]
+        # "fp16" is the mode IDENTIFIER (CLI value, JSON key); the label shown
+        # is the dtype actually in use, which is bf16 on Qwen2.5-1.5B.
+        label = cfg.DTYPE_NAME if r["mode"] == "fp16" else r["mode"]
         if r.get("group") and r["mode"] == "int4":
             label = f"int4 g{r['group']}"
         table.append(f"| {label} | {r['perplexity']:.4f} | "

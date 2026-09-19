@@ -115,7 +115,8 @@ def main():
     args = ap.parse_args()
 
     before = gpu_contention()
-    print(f"\nPhase 3 end-to-end — {cfg.MODEL_NAME}, fp16, paged cache, greedy")
+    print(f"\nPhase 3 end-to-end — {cfg.MODEL_NAME}, {cfg.DTYPE_NAME}, "
+          f"paged cache, greedy")
     print(f"prompt {PROMPT_LEN} tokens, {args.new_tokens} new tokens, "
           f"median of {args.repeats} runs")
     if before:

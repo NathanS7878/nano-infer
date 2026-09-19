@@ -177,7 +177,8 @@ def main():
 
             print(f"\nbatch {batch}")
             print(f"{'precision':>10}{'engine':>7}{'tok/s':>9}{'decode ms/step':>16}"
-                  f"{'vs fp16 (same eng)':>20}{'weight GB/s':>13}{'% peak':>8}{'cv':>7}")
+                  f"{'vs ' + cfg.DTYPE_NAME + ' (same eng)':>20}"
+                  f"{'weight GB/s':>13}{'% peak':>8}{'cv':>7}")
             for p in PRECISIONS:
                 for e in ENGINES:
                     r = res[(p, e)]

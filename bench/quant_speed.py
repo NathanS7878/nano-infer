@@ -50,12 +50,17 @@ import torch.nn.functional as F
 from nano_infer import config as cfg
 from nano_infer import kernels
 from nano_infer import quant as Q
+from nano_infer.model import QwenConfig
 
-# (out, in, label) — the projection shapes the model actually contains
+# (out, in, label) — the projection shapes the model actually contains, read
+# from the selected checkpoint rather than hard-coded. These were 896/4864
+# literals until the 1.5B scale-up, at which point they would have silently
+# kept measuring the 0.5B shapes under bf16 activations.
+_CF = QwenConfig()
 SHAPES = [
-    (896, 896, "q_proj / o_proj"),
-    (4864, 896, "gate_proj / up_proj"),
-    (896, 4864, "down_proj"),
+    (_CF.hidden_size, _CF.hidden_size, "q_proj / o_proj"),
+    (_CF.intermediate_size, _CF.hidden_size, "gate_proj / up_proj"),
+    (_CF.hidden_size, _CF.intermediate_size, "down_proj"),
 ]
 BATCHES = [1, 2, 4, 8, 16, 32]
 PREFILL_ROWS = 1024        # batch 32 x 32-token prompts, flattened
@@ -83,8 +88,9 @@ def main():
     mod = kernels.load()
     torch.manual_seed(0)
 
-    print(f"\nFused dequant-matmul — RTX 3070, fp16 activations, weight-only quant")
-    print("fp16 column is torch F.linear (cuBLAS, tensor cores)\n")
+    print(f"\nFused dequant-matmul — RTX 3070, {cfg.DTYPE_NAME} activations, "
+          f"weight-only quant")
+    print(f"{cfg.DTYPE_NAME} column is torch F.linear (cuBLAS, tensor cores)\n")
 
     rows = []
     for N, K, label in SHAPES:

@@ -1,0 +1,156 @@
+{
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "dataset": "Salesforce/wikitext/wikitext-2-raw-v1:test",
+  "window": 512,
+  "windows": 16,
+  "results": [
+    {
+      "perplexity": 15.109315872192383,
+      "mean_nll": 2.7153115272521973,
+      "sem_nll": 0.031873900443315506,
+      "sem_pct": 3.238738780248962,
+      "tokens": 8176,
+      "seconds": 1.660695600003237,
+      "mode": "fp16",
+      "quantized_tensors": 0,
+      "bytes_original": 3087428608,
+      "bytes_quantized": 3087428608,
+      "bytes_quantizable_original": 0,
+      "bytes_quantizable_quantized": 0,
+      "compression": 1.0,
+      "bits_per_weight": 16.0,
+      "max_rel_err": 0.0,
+      "mean_rel_err": 0.0,
+      "delta_pct": 0.0,
+      "group": null
+    },
+    {
+      "perplexity": 15.13469409942627,
+      "mean_nll": 2.716989755630493,
+      "sem_nll": 0.032004065811634064,
+      "sem_pct": 3.252180215385403,
+      "tokens": 8176,
+      "seconds": 1.1042737000025227,
+      "mode": "int8",
+      "quantized_tensors": 196,
+      "bytes_original": 3087428608,
+      "bytes_quantized": 1778523136,
+      "bytes_quantizable_original": 2620391424,
+      "bytes_quantizable_quantized": 1311485952,
+      "compression": 1.7359507703362258,
+      "quantizable_compression": 1.9980323998163574,
+      "bits_per_weight": 8.007878151260504,
+      "max_rel_err": 0.006535947788506746,
+      "mean_rel_err": 0.0006036132448459786,
+      "delta_pct": 0.1679641053808023,
+      "group": null
+    },
+    {
+      "perplexity": 16.731285095214844,
+      "mean_nll": 2.8172802925109863,
+      "sem_nll": 0.031846676021814346,
+      "sem_pct": 3.23592808582569,
+      "tokens": 8176,
+      "seconds": 1.1051917000004323,
+      "mode": "int4",
+      "quantized_tensors": 196,
+      "bytes_original": 3087428608,
+      "bytes_quantized": 1244965888,
+      "bytes_quantizable_original": 2620391424,
+      "bytes_quantizable_quantized": 777928704,
+      "compression": 2.4799302838408375,
+      "quantizable_compression": 3.3684210526315788,
+      "bits_per_weight": 4.75,
+      "max_rel_err": 0.05942622944712639,
+      "mean_rel_err": 0.0052865487933206395,
+      "delta_pct": 10.734895191433381,
+      "group": 32
+    },
+    {
+      "perplexity": 17.24291229248047,
+      "mean_nll": 2.8474011421203613,
+      "sem_nll": 0.032249197363853455,
+      "sem_pct": 3.2774860700785835,
+      "tokens": 8176,
+      "seconds": 1.1014438999991398,
+      "mode": "int4",
+      "quantized_tensors": 196,
+      "bytes_original": 3087428608,
+      "bytes_quantized": 1183550464,
+      "bytes_quantizable_original": 2620391424,
+      "bytes_quantizable_quantized": 716513280,
+      "compression": 2.6086159415336936,
+      "quantizable_compression": 3.657142857142857,
+      "bits_per_weight": 4.375,
+      "max_rel_err": 0.06315789371728897,
+      "mean_rel_err": 0.006078600250327085,
+      "delta_pct": 14.121065694409229,
+      "group": 64
+    },
+    {
+      "perplexity": 17.814533233642578,
+      "mean_nll": 2.880014657974243,
+      "sem_nll": 0.032675888389348984,
+      "sem_pct": 3.32157166647431,
+      "tokens": 8176,
+      "seconds": 1.1023086000059266,
+      "mode": "int4",
+      "quantized_tensors": 196,
+      "bytes_original": 3087428608,
+      "bytes_quantized": 1152842752,
+      "bytes_quantizable_original": 2620391424,
+      "bytes_quantizable_quantized": 685805568,
+      "compression": 2.6781003763469036,
+      "quantizable_compression": 3.8208955223880596,
+      "bits_per_weight": 4.1875,
+      "max_rel_err": 0.06392045319080353,
+      "mean_rel_err": 0.006834699671919819,
+      "delta_pct": 17.904300792525984,
+      "group": 128
+    }
+  ],
+  "generations": {
+    "fp16": [
+      {
+        "prompt": "What is the capital of France?",
+        "continuation": " The capital of France is Paris. It is located in the north of the country and is the largest city in France."
+      },
+      {
+        "prompt": "If a train travels 60 miles in 1.5 hours, what is its average speed?",
+        "continuation": " To find the average speed of the train, we use the formula for average speed, which which is the total distance traveled"
+      },
+      {
+        "prompt": "Write a one-line Python function that returns the square of a number.",
+        "continuation": " def square(num):\n    return num ** 2\n\nsquare(5) # 25Human: Can you"
+      }
+    ],
+    "int8": [
+      {
+        "prompt": "What is the capital of France?",
+        "continuation": " The capital of France is Paris. It is located in the north of the country and is the largest city in France."
+      },
+      {
+        "prompt": "If a train travels 60 miles in 1.5 hours, what is its average speed?",
+        "continuation": " To find the average speed of the train, we use the formula for average speed, which which is given by:\n\n\\"
+      },
+      {
+        "prompt": "Write a one-line Python function that returns the square of a number.",
+        "continuation": " def square(num):\n    return num ** 2\n\nsquare(5) # 25Human: Can you"
+      }
+    ],
+    "int4": [
+      {
+        "prompt": "What is the capital of France?",
+        "continuation": " The capital of France is Paris. Paris is a beautiful city located on the River Seine in the north of France."
+      },
+      {
+        "prompt": "If a train travels 60 miles in 1.5 hours, what is its average speed?",
+        "continuation": " To find the average speed of the train, you can use the formula for average speed, which is:\n\n\\[\n\\"
+      },
+      {
+        "prompt": "Write a one-line Python function that returns the square of a number.",
+        "continuation": " def square(num):\n    return num ** 2\n\nsquare(5) # 25Human resources management is"
+      }
+    ]
+  }
+}

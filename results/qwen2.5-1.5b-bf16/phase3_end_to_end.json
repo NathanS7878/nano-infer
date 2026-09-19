@@ -1,0 +1,79 @@
+{
+  "hardware": "NVIDIA GeForce RTX 3070 (see HARDWARE.md)",
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "dtype": "torch.bfloat16",
+  "prompt_len": 32,
+  "new_tokens": 64,
+  "repeats": 3,
+  "warmup": 2,
+  "max_spread_pct": 4.919939195412966,
+  "max_cv_pct": 2.5135022902966457,
+  "gpu_before": {
+    "utilization_pct": 1,
+    "memory_used_mib": 131,
+    "memory_total_mib": 8192
+  },
+  "gpu_after": {
+    "utilization_pct": 51,
+    "memory_used_mib": 3657,
+    "memory_total_mib": 8192
+  },
+  "results": [
+    {
+      "batch": 1,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "torch_s": 3.034013900003629,
+      "kernels_s": 1.3071283999961452,
+      "torch_tok_s": 21.09416835563062,
+      "kernels_tok_s": 48.96229016230444,
+      "speedup": 2.3211292020069156,
+      "torch_spread_pct": 0.6583720662461255,
+      "kernels_spread_pct": 0.5813200907498286,
+      "torch_cv_pct": 0.34389041491990713,
+      "kernels_cv_pct": 0.3195156816173476
+    },
+    {
+      "batch": 4,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "torch_s": 3.034631000002264,
+      "kernels_s": 1.3300308999969275,
+      "torch_tok_s": 84.35951520952926,
+      "kernels_tok_s": 192.47673118014882,
+      "speedup": 2.2816244344468046,
+      "torch_spread_pct": 4.919939195412966,
+      "kernels_spread_pct": 3.100679841253852,
+      "torch_cv_pct": 2.5135022902966457,
+      "kernels_cv_pct": 1.6446353650958725
+    },
+    {
+      "batch": 16,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "torch_s": 3.084064800001215,
+      "kernels_s": 1.3988011999972514,
+      "torch_tok_s": 332.02933998001487,
+      "kernels_tok_s": 732.0554200282443,
+      "speedup": 2.204791359921106,
+      "torch_spread_pct": 1.9914432407576277,
+      "kernels_spread_pct": 1.0256496779109179,
+      "torch_cv_pct": 1.114678946018102,
+      "kernels_cv_pct": 0.5543790536473705
+    },
+    {
+      "batch": 32,
+      "prompt_len": 32,
+      "new_tokens": 64,
+      "torch_s": 3.2026085999968927,
+      "kernels_s": 1.4523133999973652,
+      "torch_tok_s": 639.4787049538264,
+      "kernels_tok_s": 1410.1639494641552,
+      "speedup": 2.205177339823968,
+      "torch_spread_pct": 2.5111123475903394,
+      "kernels_spread_pct": 2.3589329962006564,
+      "torch_cv_pct": 1.26240275878199,
+      "kernels_cv_pct": 1.1845422487172244
+    }
+  ]
+}
