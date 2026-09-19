@@ -5,7 +5,7 @@ cache, CUDA kernels, and INT8/INT4 quantization. This document is the complete
 record — what it is, how it was built, what was measured, what was learned, and
 what went wrong along the way.
 
-**Author:** Nathan (Iceboy66) · **Started:** 2026-08-20 · **Status:** Phases 0–2 complete, Phase 3 in progress
+**Author:** Nathan (NathanS7878) · **Started:** 2026-08-20 · **Status:** Phases 0–5 complete, on two models
 
 > **Headline (RTX 3070, Qwen2.5-0.5B-Instruct, fp16, 128 new tokens):** at batch 32
 > the engine reaches **831.6 tok/s — 15.6× faster than its own no-cache version and
@@ -1503,7 +1503,7 @@ and it is the one the measurements support.
 | 1 — Correct but slow | ✅ Complete | Full forward pass from scratch, token-for-token match, no cache |
 | 2 — KV cache & batching | ✅ Complete | Contiguous cache + prefill/decode split (15.6× at batch 32), paged cache (3.8× memory), continuous batching (1.55× on a request stream) |
 | 3 — Custom CUDA kernels | ✅ Complete | RMSNorm 7.7× @ 75.5%; SwiGLU 1.65× @ 89.5%; RoPE 5.03× @ 87.6%; decode attention **6.89× @ 30.3%** after the head-group refit (was 2.48× @ 11.1% — the denominator was wrong, see PROGRESS 2026-09-04). **End-to-end 2.19–2.35× vs PyTorch** |
-| + CUDA-graph decode | ✅ Landed | Eager decode was host-bound (3,200 dispatches, 65 syncs/step). Static sync-free step + graph capture: **decode 4.9–5.2× (short ctx), 3.8× (long)**, weights streamed at **64% of peak** (was 12.3%). Syncs alone: 1.00–1.20×. Reused runner (capture once): **6,909 tok/s at batch 32, 4.38× the eager kernels engine** end to end (clean rerun). Quantization re-measured under graphs: INT8 1.34× / INT4 1.42× at batch 1, but INT4 **0.16×** at batch 32. See PROGRESS 2026-09-16 |
+| + CUDA-graph decode | ✅ Landed | Eager decode was host-bound (3,200 dispatches, 65 syncs/step). Static sync-free step + graph capture: **decode 4.75–5.07× (short ctx), 3.74–3.77× (long)**, weights streamed at **66.0% of peak** (eager: 13.1%), and **78.3%** on Qwen2.5-1.5B. Syncs alone: 1.00–1.20×. Reused runner (capture once): **7,114 tok/s at batch 32, 4.21× the eager kernels engine** end to end (idle-GPU rerun). Quantization re-measured under graphs: INT8 1.34× / INT4 1.40× at batch 1, but INT4 **0.16×** at batch 32. See PROGRESS 2026-09-16 |
 | 4 — Quantization | ✅ Complete | **INT8: lossless, 1.57× smaller, 1.17× tok/s at batch 1.** INT4: 2.15× smaller, 1.99× less VRAM, +21.1% ppl. Crossover reported |
 | 5 — Make it legible | ◐ Nearly done | README benchmark table, architecture diagram, WRITEUP.md, limitations |
 
@@ -1575,3 +1575,90 @@ Phase 0: benchmark harness + HF baseline — ground truth complete
 Phase 0: capture HF reference fixture and parity tests
 Phase 0: scaffold repo and record hardware ground truth
 ```
+
+
+---
+
+## 2026-09-19 — The benchmark model, and what scaling found
+
+Phases 0-5 were built and measured on Qwen2.5-0.5B in fp16, the *dev* model.
+The spec always named Qwen2.5-1.5B as the *benchmark* model. Moving to it was
+meant to be a configuration change; it was the most productive debugging session
+of the project. The full account is in PROGRESS (2026-09-18/19) and gotchas
+#41-#47 of ROADMAP; the short version:
+
+**Five bugs had been present the whole time**, invisible because fp16 on a
+head_dim-64 model rounds in forgiving directions:
+
+1. **fp16 cannot hold this model's attention scores.** Raw q.k reaches 264,115;
+   fp16's ceiling is 65,504. HuggingFace's own fp16 load of the checkpoint
+   produced the same garbage, which is what ruled out this engine in minutes.
+   The checkpoint ships as bf16, which has fp32's exponent range.
+2. **The reference fixture's tie-break did not match the engine's** (`topk` vs
+   `argmax`), so they disagreed on bit-identical logits wherever bf16 produced
+   an exact tie -- which it does far more often than fp16.
+3. **`attention_paged` applied its scale after upcasting to fp32**, unlike every
+   other path in the project and unlike HF. The test that exists to catch this
+   had passed since Phase 2 only because 0.5B's head_dim of 64 makes the scale
+   exactly 1/8 -- a power of two, bit-identical either way. On 1.5B the two
+   orders differed by 1.31 logits.
+4. **The kernel parity test was measuring the reference's error, not the
+   kernel's.** Drift came in at 66 ULPs against a bound of 64; against an fp32
+   ground truth, the PyTorch reference was 71.3u from truth and the kernel 15.2u.
+   The kernel was the accurate side.
+5. **The quantization scale was rounded to nearest rather than up**, so the
+   extreme element of a row or group could clamp past the half-step guarantee.
+
+The fifth changed 1.17% of INT8 and 0.77% of INT4 codes on 0.5B, which made the
+published 0.5B quality numbers stale. They were re-measured rather than left
+(all improved slightly: INT8 22.2941 -> 22.2838, INT4 g128 27.1472 -> 27.1170).
+Every absolute parity bar in the suite was rewritten in ULPs of the model dtype,
+because bars calibrated on fp16 cannot mean anything in bf16 -- near a logit of
+20, bf16's smallest step is 0.125, and the old bar asked for 0.05.
+
+### The numbers
+
+Qwen2.5-1.5B-Instruct, bf16, RTX 3070, one idle session:
+
+| Engine | tok/s @1 | tok/s @32 | vs HF |
+|---|---|---|---|
+| HuggingFace `generate()` | 20.6 | 646.1 | 1.00x |
+| paged KV cache (Phase 2) | 21.2 | 650.0 | 1.01x |
+| + custom kernels (Phase 3) | 49.0 | 1410.2 | 2.18x |
+| **+ CUDA-graph decode, capture once** | **108.5** | **2844.2** | **4.40x** |
+
+**The project's best bandwidth figure came from the bigger model: 350.6 GB/s at
+batch 1, 78.3% of the card's 448 GB/s peak**, against 66.0% on 0.5B. Decode is
+weight-bandwidth-bound, so a 3.1 GB model amortises the per-step fixed costs
+over twice the bytes.
+
+Two predictions had been written down in advance about what a bigger model would
+change. One held and one did not, which is the useful part:
+
+- **INT4's perplexity cost fell as predicted** -- +20.97% on 0.5B to +17.90% on
+  1.5B -- for the predicted reason, more redundancy per weight.
+- **The batch crossover was predicted to be a 0.5B artifact. It got worse.**
+  INT8 at batch 32 is 0.79x the unquantized engine on 0.5B and 0.29x on 1.5B.
+  The fused dequant-matmul accumulates in scalar fp32 while cuBLAS rides tensor
+  cores, so wider matrices favour cuBLAS *sooner*. The crossover is a property
+  of the kernel, not of the model size -- and the tensor-core fix that would
+  address it is the one proven blocked in gotcha #40.
+
+### Two ways the harness would have lied about a new model
+
+Both found by running it. Four benchmark scripts printed "fp16" in their
+methodology line while the engine ran bf16, and `bench/quant_speed.py`
+hard-coded the 0.5B projection shapes -- on 1.5B it would have measured the
+wrong matrices and labelled the result 1.5B. Under rule 3 of this project, a
+false methodology line is worse than a missing number.
+
+### And the 0.5B table was re-run to match
+
+Two 0.5B result files stated in their own footers that they came from a
+contended GPU and that their absolute numbers were not publishable -- and two
+headline claims cited them anyway. Every row of the headline table was re-run
+in one idle session, which retired the ~10% cross-session caveat the "vs HF"
+column had been carrying: **7,114.2 tok/s at batch 32, 9.40x HF** (was 6,909.0
+and 9.67x across sessions). No ratio moved enough to change a conclusion, which
+is the argument for round-robin arms rather than for trusting contended
+absolutes.

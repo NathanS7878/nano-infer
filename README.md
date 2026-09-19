@@ -8,7 +8,8 @@ It is the GPU-worker layer beneath [MiniDynamo](https://github.com/NathanS7878/M
 a distributed KV-cache-aware inference router. MiniDynamo decides *which worker*
 runs a request; nano-infer is what that worker actually does on the GPU.
 
-> **Status: Phases 0–4 complete.** 118 tests passing.
+> **Status: Phases 0–5 complete**, on two models. 165 tests passing on
+> Qwen2.5-0.5B/fp16, 164 on Qwen2.5-1.5B/bf16.
 > Full write-up: **[SUMMARY.md](SUMMARY.md)** — what was built, what was measured,
 > and what went wrong. One lesson in depth: **[WRITEUP.md](WRITEUP.md)**.
 > Current state: [ROADMAP.md](ROADMAP.md). Dated log: [PROGRESS.md](PROGRESS.md).
@@ -17,33 +18,100 @@ runs a request; nano-infer is what that worker actually does on the GPU.
 ## The benchmark table
 
 **Qwen2.5-0.5B-Instruct, fp16, RTX 3070, 32-token prompt, 64 new tokens, greedy.**
-Median of 3 runs after 2 discarded warmups, on an idle GPU. Every row is
-reproducible by a script in this repo.
+Median of 3 runs after 2 discarded warmups. Every row is reproducible by a
+script in this repo.
 
 | Engine | tok/s @ batch 1 | tok/s @ batch 32 | vs HF | Reproduce |
 |---|---|---|---|---|
-| HuggingFace `generate()` | 22.9 | 714.6 | 1.00× | `python -m bench.phase2_cache` |
+| HuggingFace `generate()` | 24.5 | 756.8 | 1.00× | `python -m bench.phase2_cache` |
 | nano-infer, no cache (Phase 1) | 25.4 | 53.3 | 0.07× | `python -m bench.phase1_nocache` |
-| nano-infer, paged KV cache (Phase 2) | 24.6 | 724.1 | 1.01× | `python -m bench.phase2_cache` |
-| nano-infer + custom kernels (Phase 3) | 58.6 | 1739.1 | 2.43× | `python -m bench.phase3_end_to_end` |
-| nano-infer + INT8 weights (Phase 4) | 69.0 | 1325.1 | 1.85× | `python -m bench.quant_acceptance` |
-| nano-infer + kernels + CUDA-graph decode, capture every call | 178.2 | 5003.2 | 7.00× | `python -m bench.decode_graph_runner` |
-| **nano-infer + kernels + CUDA-graph decode, capture once** | **259.9** | **6909.0** | **9.67×** | `python -m bench.decode_graph_runner` |
+| nano-infer, paged KV cache (Phase 2) | 24.8 | 749.2 | 0.99× | `python -m bench.phase2_cache` |
+| nano-infer + custom kernels (Phase 3) | 57.7 | 1694.4 | 2.24× | `python -m bench.phase3_end_to_end` |
+| nano-infer + INT8 weights (Phase 4) | 69.0 | 1325.1 | 1.75× | `python -m bench.quant_acceptance` |
+| nano-infer + kernels + CUDA-graph decode, capture every call | 184.2 | 5141.4 | 6.79× | `python -m bench.decode_graph_runner` |
+| **nano-infer + kernels + CUDA-graph decode, capture once** | **267.3** | **7114.2** | **9.40×** | `python -m bench.decode_graph_runner` |
 | vLLM | — | — | — | **not run — see below** |
 
-**About the two CUDA-graph rows.** They were measured on 2026-09-16, a later
-session than the HF row, and cross-session numbers on this desktop move by
-several percent (ROADMAP #18, #21): in the same run, the eager kernels engine
-measured 1579.1 tok/s at batch 32, ~9% below the Phase 3 row. So the
-same-session ratio is the firmer claim — **4.38× the eager kernels engine at
-batch 32** — and the "vs HF" figure carries that ~10% uncertainty. Median of 5
-runs after 2 warmups; GPU at 0–1% utilization during the run; 870–960 MiB was still held by idle desktop processes (Wallpaper Engine, Edge, Discord, a Steam helper), above the 500 MiB target of ROADMAP #18. "Capture once" reuses one
-`DecodeGraphRunner`, as a server handling one request shape would; every timed
-call still gets a different prompt.
+**Every row above is from one session on an idle GPU** (0% utilization, 140–262
+MiB held at start), which is why the "vs HF" column is quoted without a
+tolerance. An earlier version of this table mixed sessions — the CUDA-graph rows
+came from a later run than the HF row — and carried a ~10% caveat on that
+column, because cross-session numbers on this desktop move by several percent
+(ROADMAP #18, #21). Re-running every row together removed the caveat instead of
+restating it, and moved the headline from 9.67× to **9.40×**. "Capture once"
+reuses one `DecodeGraphRunner`, as a server handling one request shape would;
+every timed call still gets a different prompt.
+
+The same numbers on the **benchmark model, Qwen2.5-1.5B**, are
+[below](#the-benchmark-model-qwen25-15b) — including this project's best
+bandwidth figure, **78.3% of peak**.
 
 **The INT8 row is faster at batch 1 and slower at batch 32, and that is the
 point.** It is not a worse engine; it is a different trade. See
 [Quantization](#quantization-what-it-costs).
+
+### The benchmark model: Qwen2.5-1.5B
+
+The spec calls 0.5B the *dev* model and 1.5B the *benchmark* model. Same engine,
+same code, one environment variable:
+
+```
+NANO_INFER_MODEL=Qwen/Qwen2.5-1.5B-Instruct python -m bench.decode_graph_runner
+```
+
+`config.py` reads the architecture and the dtype from the checkpoint rather than
+assuming the dev model's, and refuses any config the engine does not implement.
+**Qwen2.5-1.5B runs in bf16, not fp16** — its raw attention product q·k reaches
+264,115 and fp16 tops out at 65,504, so an fp16 load produces NaN. So does
+HuggingFace's, which is how that was pinned on the dtype rather than on this
+engine (ROADMAP #41).
+
+**Qwen2.5-1.5B-Instruct, bf16, RTX 3070, 32-token prompt, 64 new tokens, greedy,
+idle GPU.** Results in [`results/qwen2.5-1.5b-bf16/`](results/qwen2.5-1.5b-bf16/).
+
+| Engine | tok/s @ batch 1 | tok/s @ batch 32 | vs HF | Reproduce |
+|---|---|---|---|---|
+| HuggingFace `generate()` | 20.6 | 646.1 | 1.00× | `python -m bench.phase2_cache` |
+| nano-infer, paged KV cache (Phase 2) | 21.2 | 650.0 | 1.01× | `python -m bench.phase2_cache` |
+| nano-infer + custom kernels (Phase 3) | 49.0 | 1410.2 | 2.18× | `python -m bench.phase3_end_to_end` |
+| nano-infer + kernels + CUDA-graph decode, capture every call | 90.3 | 2428.5 | 3.76× | `python -m bench.decode_graph_runner` |
+| **nano-infer + kernels + CUDA-graph decode, capture once** | **108.5** | **2844.2** | **4.40×** | `python -m bench.decode_graph_runner` |
+
+Unlike the 0.5B table, every row here was measured in one session on an idle
+GPU, so the "vs HF" column does not carry the cross-session uncertainty
+discussed above.
+
+**The bandwidth number improves with the bigger model: 350.6 GB/s at batch 1,
+78.3% of this card's 448 GB/s peak** (`python -m bench.quant_graph`), against
+64% on 0.5B. Decode is weight-bandwidth-bound, and a 3.1 GB model amortises the
+per-step fixed costs over twice the bytes that a 1.0 GB model does.
+
+#### Quantization on 1.5B, and what the bigger model changes
+
+| Precision | Weights | Compression | bits/wt | tok/s @1 | tok/s @32 | Peak VRAM | Perplexity | vs bf16 |
+|---|---|---|---|---|---|---|---|---|
+| bf16 | 3087 MB | 1.00× | 16.00 | 48.9 | **1388.2** | 3103 MiB | 15.11 | — |
+| **INT8** | 1778 MB | 1.74× | 8.01 | **57.0** | 401.7 | 1855 MiB | 15.13 | +0.17% |
+| INT4 g128 | 1153 MB | 2.68× | 4.19 | 52.8 | 272.9 | **1290 MiB** | 17.81 | +17.90% |
+
+The bf16 perplexity baseline is **15.11 ± 3.24% (1 s.e.)**, so INT8's +0.17% is
+again *lossless within measurement precision*. Three things are different at
+this size, all of them measured:
+
+- **INT4 costs less, not more.** +17.90% perplexity here against **+20.97%** on
+  0.5B. Bigger models carry more redundancy per weight, so the same 4-bit grid
+  throws away proportionally less. The group-size sweep moves the same way:
+  g32 +10.73%, g64 +14.12%, g128 +17.90% (`python -m bench.perplexity`).
+- **Whole-model compression is better** — 2.68× against 2.15× — for a reason
+  that has nothing to do with the quantizer. The tied embedding stays in bf16
+  and is a *smaller share* of a bigger model: 27.6% of 0.5B, 15% of 1.5B. The
+  quantized tensors themselves compress identically at both sizes.
+- **The batch crossover gets worse.** INT8 at batch 32 is 0.29× the bf16 engine
+  here against 0.79× on 0.5B. The fused dequant-matmul accumulates in scalar
+  fp32 while cuBLAS rides tensor cores, so the wider the matrix the sooner
+  cuBLAS wins — and 1.5B's matrices are wider. Under CUDA graphs at batch 1 the
+  trade is still clearly good: INT8 decode is **1.61× the bf16 graph engine**,
+  at 324.2 GB/s.
 
 ### The vLLM row is missing, and here is why
 
@@ -147,30 +215,41 @@ decode step with no host inputs at all (every KV block allocated up front, all
 bookkeeping derived on the GPU), then captures it as a CUDA graph. Reproduce:
 `python -m bench.decode_graph`.
 
-Decode ms/step, kernels on. GPU at 0–1% utilization during the run; 870–960 MiB was still held by idle desktop processes (Wallpaper Engine, Edge, Discord, a Steam helper), above the 500 MiB target of ROADMAP #18:
+Decode ms/step, kernels on, on an idle GPU (0% utilization, 140 MiB held at
+start):
 
 | Batch | Prompt | Eager paged | Eager, syncs removed | **CUDA graph** | Speedup |
 |---|---|---|---|---|---|
-| 1 | 32 | 17.88 | 16.71 | **3.45** | **5.19×** |
-| 32 | 32 | 20.43 | 17.61 | **4.14** | **4.94×** |
-| 32 | 512 | 20.54 | 17.45 | **5.33** | **3.85×** |
-| 8 | 1024 | 18.49 | 17.12 | **4.85** | **3.81×** |
+| 1 | 32 | 16.93 | 15.65 | **3.34** | **5.07×** |
+| 4 | 32 | 17.98 | 16.39 | **3.59** | **5.00×** |
+| 16 | 32 | 18.57 | 16.41 | **3.70** | **5.02×** |
+| 32 | 32 | 19.10 | 16.43 | **4.03** | **4.75×** |
+| 32 | 512 | 19.33 | 16.36 | **5.17** | **3.74×** |
+| 8 | 1024 | 17.77 | 15.95 | **4.71** | **3.77×** |
 
 Two things this separated that one number would have hidden. Removing all 65
-syncs alone bought only **1.01–1.18×** — dispatch, not synchronisation, was the
-cost. And once graphed, a batch-1 step streams **988 MB of weights at 64% of
-peak bandwidth** (the eager engine: 12.3%), with step time finally growing with
+syncs alone bought only **1.08–1.18×** — dispatch, not synchronisation, was the
+cost. And once graphed, a batch-1 step streams **988 MB of weights at 66.0% of
+peak bandwidth** (the eager engine: 13.1%), with step time finally growing with
 context — decode is now bound by the GPU, which is where the kernels live.
 Token output is identical to the eager engine with kernels on.
 
-These were first measured on a contended desktop (23% utilization) with every
-arm run round-robin so the ratios would survive; the clean rerun above landed
-within a few percent of them (e.g. batch 32: 5.28× contended, 4.94× clean).
+That 3.34 ms is corroborated by `bench.quant_graph`, a separate script with its
+own timing loop, to the same two decimals. On Qwen2.5-1.5B the same batch-1
+graphed step reaches **78.3% of peak** — a 3.1 GB model amortises the per-step
+fixed costs over twice the bytes.
+
+This table was measured three times: first on a contended desktop (23%
+utilization) with every arm run round-robin so the ratios would survive, then
+twice more as the machine got quieter. The ratios moved by a few percent and
+never changed the conclusion (batch 32: 5.28× contended, 4.94×, 4.75× idle) —
+which is the argument for round-robin arms, not for trusting a contended
+absolute.
 
 Capture costs 0.11–0.21 s, so it has to be paid once, not per call. A reused
 `DecodeGraphRunner` (`python -m bench.decode_graph_runner`) takes a batch-32
-call from **3.17× to 4.38×** the eager engine at 64 tokens, and from **1.61× to
-3.51×** at 16 tokens, where per-call capture had eaten most of the win.
+call from **3.04× to 4.21×** the eager engine at 64 tokens, and from **1.55× to
+3.39×** at 16 tokens, where per-call capture had eaten most of the win.
 
 ## Quantization: what it costs
 
@@ -185,7 +264,7 @@ WikiText-2 test split, 8,176 predicted tokens. Reproduce:
 
 The `fp16` row here is the same configuration as the Phase 3 row in the
 benchmark table (custom kernels, unquantized weights), re-measured by a different
-script; the ~3% gap between 1679.5 and 1739.1 is run-to-run variance, not a
+script; the ~1% gap between 1679.5 and 1694.4 is run-to-run variance, not a
 disagreement. Each table cites the script that produced it.
 
 The fp16 perplexity baseline is **22.42 ± 3.45% (1 s.e.)**. INT8's −0.59% is
@@ -208,15 +287,15 @@ with CUDA-graph decode (`python -m bench.quant_graph`), decode speed vs fp16:
 
 | | batch 1 | batch 4 | batch 32 |
 |---|---|---|---|
-| INT8, eager | 1.15× | 1.20× | 1.05× |
-| INT8, **CUDA graph** | **1.34×** | 1.10× | **0.27×** |
-| INT4, eager | 1.13× | 1.18× | 0.67× |
-| INT4, **CUDA graph** | **1.42×** | **0.82×** | **0.16×** |
+| INT8, eager | 1.18× | 1.21× | 1.04× |
+| INT8, **CUDA graph** | **1.34×** | 1.09× | **0.26×** |
+| INT4, eager | 1.17× | 1.20× | 0.65× |
+| INT4, **CUDA graph** | **1.40×** | **0.82×** | **0.16×** |
 
 With the host out of the loop, quantization finally pays at batch 1 — INT8
 reaches 85% of its 1.57× byte-counted ceiling. But above batch 1 the dequant
-kernel becomes the whole bottleneck: fp16 decode at batch 32 drops to 4.15 ms
-while INT4 stays at 26.40 ms. The tied `lm_head` stays fp16 and is 59% of INT4's
+kernel becomes the whole bottleneck: fp16 decode at batch 32 drops to 4.03 ms
+while INT4 stays at 25.81 ms. The tied `lm_head` stays fp16 and is 59% of INT4's
 per-step weight traffic, which caps INT4's ceiling at 2.15× regardless.
 
 ## Limitations
@@ -227,7 +306,7 @@ Stated plainly, because a repo that only lists wins is not reporting.
   eager step costs ~20 ms regardless of batch size or context length — ~3,200
   aten dispatches and 65 GPU→host syncs per step. CUDA-graph decode
   (`nano_infer/decode_graph.py`) removes that for `generate_paged`-style static
-  batches: **4.9–5.2× faster decode at short context, 3.8× at long**. The
+  batches: **4.75–5.07× faster decode at short context, 3.74–3.77× at long**. The
   continuous-batching engine (`engine.py`) is **not** graphed and still pays
   it. Graphs are also exact-shape only: `DecodeGraphRunner` captures once per
   (batch, prompt length, new tokens), with no bucketing or padding, and the
@@ -281,10 +360,23 @@ System Python is not used; see [ROADMAP.md](ROADMAP.md) for the exact interprete
 path and environment notes.
 
 ```bash
-python -m pytest tests/ -q          # 118 tests
-python -m bench.phase3_end_to_end   # the headline number
-python -m bench.quant_acceptance    # the quantization table
+python -m pytest tests/ -q             # 165 tests, dev model
+python -m bench.decode_graph_runner    # the headline number
+python -m bench.quant_acceptance       # the quantization table
 ```
+
+The dev model (Qwen2.5-0.5B, fp16) is the default. Everything above also runs
+on the benchmark model by setting one variable — the architecture and the dtype
+are read from the checkpoint, not assumed:
+
+```bash
+NANO_INFER_MODEL=Qwen/Qwen2.5-1.5B-Instruct python -m bench.decode_graph_runner
+```
+
+Results and the parity fixture are written per configuration
+(`results/qwen2.5-1.5b-bf16/`), so the two models' numbers cannot be mistaken
+for each other. A checkpoint this engine does not implement is refused rather
+than approximated.
 
 CUDA kernels JIT-compile on first use (~40 s), then cache.
 

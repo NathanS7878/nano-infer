@@ -42,7 +42,7 @@ and this file.
 
 ## Status at a glance
 
-_Last updated: 2026-09-16. CUDA-graph decode rerun clean. Tensor-core quantized matmul BLOCKED (#40). Next: Qwen2.5-1.5B._
+_Last updated: 2026-09-19. **Scaled to the benchmark model Qwen2.5-1.5B** (bf16); five bugs fp16 had hidden, found and fixed (#41-#47). Whole 0.5B headline table re-run in one idle session. Tensor-core quantized matmul BLOCKED (#40). Next: the repo is ready to push._
 
 | Phase | Status | Headline |
 |---|---|---|
@@ -50,12 +50,14 @@ _Last updated: 2026-09-16. CUDA-graph decode rerun clean. Tensor-core quantized 
 | 1 — Correct but slow | ✅ Complete | From-scratch forward pass, token-for-token vs HF |
 | 2 — KV cache & batching | ✅ Complete | 831 tok/s @ batch 32 = 15.6× vs Phase 1, 1.21× vs HF |
 | 3 — Custom CUDA kernels | ✅ Complete | 4/4 kernels + **4b head-group fusion**. Decode attention **6.89× vs Phase 2 paged, 30.3% of peak** (was 2.52× / 11.1%). End-to-end 2.19–2.35× vs PyTorch |
-| + CUDA-graph decode | ✅ Landed | **Decode 4.9–5.2× faster at short context, 3.8× long** (graph+kernels vs paged+kernels, clean rerun). Weights streamed at **64% of peak** (was 12.3%). Reused runner: **6,909 tok/s at batch 32, 4.38× the eager kernels engine, 9.67× HF** (cross-session) |
-| 4 — Quantization | ✅ Complete (speed re-measured under graphs, #38) | **INT8 lossless, 1.57× smaller, 1.17× tok/s @ b1.** INT4 2.15× smaller, **1.99× less VRAM**, +21.1% ppl |
-| 5 — Make it legible | ✅ Complete | README + benchmark table + mermaid diagram + limitations ✅, WRITEUP.md ✅, MiniDynamo link ✅. **vLLM row blocked (Gotcha #27); reciprocal link blocked on publishing this repo** |
+| + CUDA-graph decode | ✅ Landed | **Decode 4.75–5.07× faster at short context, 3.74–3.77× long** (graph+kernels vs paged+kernels, idle-GPU rerun). Weights streamed at **66.0% of peak** (eager: 13.1%); **78.3% on Qwen2.5-1.5B**. Reused runner: **7,114 tok/s at batch 32, 4.21× the eager kernels engine, 9.40× HF** (whole table one idle session) |
+| 4 — Quantization | ✅ Complete (speed re-measured under graphs, #38; scale rounding fixed, #46) | **INT8 lossless within measurement precision** at both sizes. 0.5B: 1.57× smaller, 1.19× tok/s @ b1, INT4 +20.97% ppl. 1.5B: 1.74× smaller, INT4 **2.68× smaller / 2.41× less VRAM** and only **+17.90%** ppl — the bigger model tolerates INT4 better |
+| 5 — Make it legible | ✅ Complete | README + both benchmark tables + mermaid diagram + limitations ✅, WRITEUP.md ✅, MiniDynamo link ✅. **vLLM row blocked (Gotcha #27); reciprocal link blocked on publishing this repo** |
+| + Benchmark model (1.5B) | ✅ Landed | Model and dtype read from the checkpoint; unsupported configs refused. **108.5 / 2,844.2 tok/s (b1/b32) = 4.40× HF**, and the project's best bandwidth figure: **78.3% of peak** at batch 1 |
 
-- **Tests:** 155 passing (`python -m pytest tests/ -q`)
-- **Commits:** 38 on `main`
+- **Tests:** 165 passing on 0.5B/fp16, 164 passing + 2 skipped on 1.5B/bf16
+  (`python -m pytest tests/ -q`, and again with `NANO_INFER_MODEL=Qwen/Qwen2.5-1.5B-Instruct`)
+- **Commits:** 42 on `main`
 - **Hardware:** RTX 3070, 8 GB, sm_86, **448 GB/s peak** (the Phase 3 denominator)
 
 ---
@@ -460,8 +462,11 @@ These were all expensive to discover. Read before debugging anything.
     **Capture is not free:** 0.12–0.25 s per call (more ops to record with
     kernels off), about 28% of a 64-token batch-32 call, because the graph is
     rebuilt every call. Production engines capture once per batch size.
-    (Clean rerun: 3.45 ms/step at batch 1 = 286 GB/s = 64% of peak; eager
-    engine 17.88 ms = 12.3%. Graph vs eager 5.19x at b1, 4.94x at b32.)
+    (Idle-GPU rerun: 3.34 ms/step at batch 1 = 295.5 GB/s = 66.0% of peak,
+    confirmed to the same 3.34 ms by bench.quant_graph, a separate script;
+    78.3% on Qwen2.5-1.5B, where a 3.1 GB model amortises the per-step
+    fixed costs over twice the bytes. Eager
+    engine 16.93 ms = 13.1%. Graph vs eager 5.07x at b1, 4.75x at b32.)
 
 37. **A graphed step whose read table is padded to final length is exact under
     the decode kernel and only near-tie-exact under PyTorch attention.** The
@@ -510,7 +515,7 @@ These were all expensive to discover. Read before debugging anything.
     slot before anything can read it. Tested with three different prompts
     through one runner against fresh runs, kernels on and off -- a leak would
     otherwise produce fluent, wrong text.
-    (Clean rerun: 64 tokens 3.17x -> 4.38x; 16 tokens 1.61x -> 3.51x.)
+    (Idle-GPU rerun: 64 tokens 3.04x -> 4.21x; 16 tokens 1.55x -> 3.39x.)
 
 40. **The tensor-core quantized matmul is a dead end with the interfaces
     available, and the evidence is reproducible** (`python -m bench.hmma_probe`).
@@ -859,7 +864,7 @@ which is the round-robin design working:
 | INT4 graph vs fp16 graph, b32 | 0.16x | 0.16x |
 | reused runner vs eager, b32 g64 | 4.62x | 4.38x |
 | graphed fp16 b32 decode ms/step | 4.41 | **4.14** |
-| graphed fp16 b1 weight bandwidth | 60.1% | **64.4%** |
+| graphed fp16 b1 weight bandwidth | 60.1% | **66.0%** (idle-GPU rerun) |
 
 Absolutes are now in the README headline table, with the conditions and the
 cross-session caveat stated beside them.
@@ -915,20 +920,19 @@ block-size fix that followed.
 
 Two things remain, and **neither is code**:
 
-1. **MiniDynamo cross-link: outbound done, reciprocal STILL OPEN.**
-   `README.md` line 7 points at https://github.com/NathanS7878/MiniDynamo.
-   nano-infer is now published at https://github.com/NathanS7878/nano-infer, so
-   the blocker is gone -- **MiniDynamo's README still has no link back here**
-   (verified 2026-09-06: no match for "nano-infer" in that file).
+1. **MiniDynamo cross-link: both directions written; the return link is live
+   but its target does not exist yet.** nano-infer's `README.md` line 7 points
+   at https://github.com/NathanS7878/MiniDynamo. MiniDynamo's README now points
+   back (commit `1d2a1aa`, "README: link nano-infer, the GPU-worker layer below
+   the router"), staged alone so it did not fold into the router work that was
+   in flight, and **it is pushed** (verified 2026-09-19: `HEAD` == `origin/main`
+   at `1d2a1aa`).
 
-   To finish: add the reciprocal line to MiniDynamo's README. That repo is
-   checked out at `../MiniDynamo` on `main` and **still had uncommitted work in
-   flight** as of 2026-09-06 (`router/src/main.rs`, `router/src/router.rs`,
-   untracked `router/src/dashboard.html`) -- do not fold a README link into that
-   change; stage README.md alone and commit it separately.
-
-   The two repos are meant to read as one story ("router down to the CUDA
-   kernel"), and that only works if a reader can get from either to the other.
+   **The one thing left is not a link, it is a repository.** That reciprocal
+   line points at https://github.com/NathanS7878/nano-infer, which 404s until
+   Nathan creates it and pushes (see "How to publish" under Known open items).
+   Nothing else needs writing; the story reads end to end the moment that push
+   lands.
 
 2. **The vLLM row is blocked, not pending** (Gotcha #27). vLLM has no Windows
    wheels and its sdist will not unpack here. Options, in order of honesty:
@@ -951,10 +955,24 @@ because it accumulates in scalar fp32 while cuBLAS rides HMMA (Gotcha #25).
 Dequantizing into fp16 fragments and issuing tensor-core instructions is the
 real fix, and a much larger kernel.
 
-**Scale to a bigger model.** CLAUDE.md suggests Qwen2.5-1.5B or Llama-3.2-1B for
-the headline numbers if VRAM allows. Two conclusions here are explicitly
-0.5B-specific and would likely change: INT4's 21% perplexity cost (larger models
-have more redundancy and quantize better), and the batch-4 crossover.
+**✅ DONE 2026-09-19 — scaled to Qwen2.5-1.5B.** Both of the predictions in
+this item were tested, and they did not both hold:
+
+- **INT4's perplexity cost did fall** — +20.97% on 0.5B to **+17.90%** on 1.5B,
+  for the predicted reason (more redundancy per weight).
+- **The batch crossover moved the wrong way.** It was supposed to be a
+  0.5B artifact; it got *worse*. INT8 at batch 32 is 0.79x the unquantized
+  engine on 0.5B and **0.29x** on 1.5B, because the fused kernel accumulates in
+  scalar fp32 while cuBLAS rides tensor cores — wider matrices favour cuBLAS
+  sooner. The crossover is a property of the kernel, not of the model size.
+
+The scale-up also found five latent bugs (#41-#47) and produced the project's
+best bandwidth figure, **78.3% of peak**. See PROGRESS 2026-09-18/19.
+
+**Still untried: Llama-3.2-1B.** `config.py` would refuse it today — its
+`model_type` is `llama`, which this engine does not claim to implement. The
+refusal is the correct behaviour; adding support would mean reading the
+architecture differences rather than assuming they are absent.
 
 ### Phase 4 — Quantization
 
@@ -974,9 +992,22 @@ section.
 
 ### Known open items
 
-- **PUBLISHED** at https://github.com/NathanS7878/nano-infer (2026-09-06),
-  MIT licensed. Two history rewrites happened before the push, both verified
-  content-identical (same HEAD tree hash, same commit count, empty diff):
+- **NOT YET PUBLISHED — prepared, and the push is Nathan's to make.**
+  A 2026-09-06 entry here claimed the repo was live at
+  https://github.com/NathanS7878/nano-infer; it is not. That push failed with
+  `remote: Repository not found` because **the repository had never been
+  created on GitHub**, and the entry recorded the intent rather than the
+  outcome. Corrected 2026-09-19. (Lesson worth the line: record what a command
+  returned, not what it was supposed to do.)
+
+  The local repository is ready: MIT licensed, `origin` already configured,
+  **42 commits on `main`**, every one authored `NathanS7878
+  <988dragons@gmail.com>` and free of `Co-Authored-By` trailers (verified:
+  `git log --format='%an <%ae>' | sort -u` yields exactly one line).
+  Creating the repo and pushing are steps Nathan does himself — see
+  "How to publish" below. Two history rewrites happened before that, both
+  verified content-identical (same HEAD tree hash, same commit count, empty
+  diff):
   1. every commit re-authored to `NathanS7878 <988dragons@gmail.com>` (was
      `Iceboy66 <98899dragons@gmail.com>`), so GitHub attributes the history to
      the account MiniDynamo lives on;
@@ -988,11 +1019,20 @@ section.
   Backup refs (`pre-author-rewrite`, `refs/original/`, `refs/backup/`) have all
   been deleted; the pre-rewrite history no longer exists locally. Repo-local
   `user.name`/`user.email` are set so future commits match.
-  - **Possible loose end:** GitHub's contributors list is cached and still
-    showed the stripped co-author after the force-push. It usually clears on
-    its own. If it has not, the definitive fix is deleting and recreating the
-    repo, then `git push -u origin main` -- cheap only while there are no
-    stars, forks or issues to lose.
+
+  **How to publish (Nathan's steps — nothing here touches GitHub on his
+  behalf).** Create the repository on GitHub first, named `nano-infer`, owner
+  `NathanS7878`, **empty** — no README, no .gitignore, no licence, or the push
+  will be rejected as a non-fast-forward. Then:
+
+  ```
+  git push -u origin main
+  ```
+
+  `origin` is already set to `https://github.com/NathanS7878/nano-infer.git`,
+  so nothing else needs configuring. Afterwards, check the contributors list
+  shows only NathanS7878; GitHub caches it, and since this history has no
+  co-author trailers at all there is nothing for it to pick up.
 - **Prefill is one request at a time** in `engine.py` (avoids padding ragged
   prompts). A production engine batches or chunks prefills; at high admission
   rates this would bottleneck. Recorded as a limitation, not hidden.

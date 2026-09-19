@@ -1475,10 +1475,10 @@ else ran during it: no kernel compile, no download.
 
 | measure | contended | clean |
 |---|---|---|
-| graph vs eager decode, b1 p32 (kernels on) | 5.49x | **5.19x** (17.88 -> 3.45 ms) |
+| graph vs eager decode, b1 p32 (kernels on) | 5.49x | **5.07x** (16.93 -> 3.34 ms, idle-GPU rerun) |
 | graph vs eager decode, b4 p32 | 5.35x | **5.18x** |
 | graph vs eager decode, b16 p32 | 5.47x | **5.02x** |
-| graph vs eager decode, b32 p32 | 5.28x | **4.94x** (20.43 -> 4.14 ms) |
+| graph vs eager decode, b32 p32 | 5.28x | **4.75x** (19.10 -> 4.03 ms, idle-GPU rerun) |
 | graph vs eager decode, b32 p512 | 3.97x | **3.85x** |
 | graph vs eager decode, b8 p1024 | 4.22x | **3.81x** |
 | syncs removed only (static vs eager) | 1.00-1.20x | 1.01-1.18x |
@@ -1486,9 +1486,9 @@ else ran during it: no kernel compile, no download.
 | INT8 / INT4 graph vs fp16, b1 | 1.35x / 1.42x | 1.34x / 1.42x |
 | INT8 / INT4 graph vs fp16, b4 | 1.09x / 0.82x | 1.10x / 0.82x |
 | INT8 / INT4 graph vs fp16, b32 | 0.27x / 0.16x | 0.27x / 0.16x |
-| reused runner vs eager, b32 g64 | 4.62x | 4.38x |
+| reused runner vs eager, b32 g64 | 4.62x | 4.38x (later idle-GPU rerun: 4.21x) |
 | reused runner vs eager, b32 g16 | 3.61x | 3.51x |
-| graphed fp16 b1, weight bandwidth | 60.1% | 64.4% |
+| graphed fp16 b1, weight bandwidth | 60.1% | 66.0% (idle-GPU rerun) |
 
 Every ratio landed within a few percent of its contended measurement -- the
 round-robin design doing its job. Absolutes went into the README headline table
@@ -1497,6 +1497,9 @@ at batch 32**, which is 9.67x the HF row. That HF row is from an earlier
 session, and in this run the eager kernels engine measured ~9% below its own
 older Phase 3 row, so the README gives the same-session ratio (4.38x) as the
 firmer claim and states the cross-session uncertainty.
+(**Superseded 2026-09-19**: the whole headline table was re-run in one idle
+session, which removed the cross-session caveat rather than restating it —
+7,114.2 tok/s at batch 32, 9.40x HF. See that day's entry.)
 
 ### Nathan's prediction for the tensor-core quantized matmul
 
@@ -1623,3 +1626,183 @@ before the attempt; 155 tests still pass.
 tested only the layout, which is why this surfaced as one small, attributable
 experiment rather than as a mysterious error inside a quantized kernel, where it
 would have looked like a dequantization bug.
+
+
+## 2026-09-18/19 — Qwen2.5-1.5B: the benchmark model, and the five bugs fp16 hid
+
+The spec called 0.5B the *dev* model and 1.5B the *benchmark* model. Scaling to
+it was supposed to be a configuration change. It found five real defects instead
+— every one of them present the whole time, invisible because fp16 on a
+head_dim-64 model happens to round in forgiving directions.
+
+Selection is one environment variable:
+
+```
+NANO_INFER_MODEL=Qwen/Qwen2.5-1.5B-Instruct python -m bench.decode_graph_runner
+```
+
+`config.py` reads `hidden_size`, `num_attention_heads`, `num_key_value_heads`,
+`head_dim`, `intermediate_size`, `rope_theta`, `vocab_size` and `torch_dtype`
+from the checkpoint's own `config.json`, and **refuses** any model whose
+`model_type`, `hidden_act`, `rope_scaling`, `tie_word_embeddings` or
+`use_sliding_window` this engine does not implement — a wrong answer from an
+unsupported config is worse than a refusal. Results and the parity fixture are
+written per configuration (`results/qwen2.5-1.5b-bf16/`,
+`tests/fixtures/reference_qwen2.5-1.5b-bf16.pt`), so the two models' numbers
+cannot be confused for each other.
+
+### The five bugs
+
+**1. fp16 produces NaN on 1.5B (Gotcha #41).** The model emitted a run of quote
+characters fifty tokens long. So did HuggingFace's own fp16 load of the same
+checkpoint, which is what ruled out this engine within minutes rather than
+hours. Raw q·k reaches **264,115**; fp16's largest finite value is **65,504**.
+One layer's k_proj bias alone is 316. The overflow is inside the matmul, before
+any scaling can rescue it. bf16 has fp16's mantissa disadvantage (7 fraction
+bits to 10) but fp32's exponent range, and the checkpoint ships as bf16.
+
+**2. The fixture's tie-break did not match the engine's (Gotcha #42).**
+`capture_reference.py` used `logits.topk(1)`, the engine uses `argmax`. On exact
+ties — which bf16 makes common — they pick different indices from bit-identical
+logits. Capture now uses `argmax`; the committed 0.5B fixture was verified to
+still reproduce exactly.
+
+**3. `attention_paged` scaled after the upcast (Gotcha #43).** It computed
+`(q @ k).float() * scale`; Phase 1, `attention_cached` and HF all compute
+`((q @ k) * scale).float()`. The paged-vs-contiguous prefill test exists to
+catch exactly this and had passed since Phase 2 — because on 0.5B `head_dim` is
+64, so `scale` is `1/8`, a power of two, and the two orders are bit-identical.
+On 1.5B (`head_dim` 128) they differed by **1.31 logits** after prefill.
+Matching the order: **0.00**. Attributed with a three-way control — contiguous,
+paged, and paged-with-the-order-swapped on one prompt.
+
+**4. The kernel parity test was measuring the reference (Gotcha #44).** Kernel
+drift came in at **66 ULPs** against a bound of 64, and the obvious reading —
+the kernels regressed — was wrong. Against an fp32 ground truth, kernels-OFF was
+**71.3u** away and kernels-ON was **15.2u**: the kernel was the accurate side,
+because it accumulates q·k in fp32 while the bf16 PyTorch path computes it where
+bf16's resolution is already 1,024. Added `M.using_fp32_attention_scores` (OFF
+by default, so the engine stays HF-identical) and compared kernels against that
+instead. Drift fell to **3–4u**; the bound *tightened* from 64 to 16.
+
+**5. The quantization scale was rounded to nearest, not up (Gotcha #46).**
+Gotcha #23 already established that codes must be chosen against the scale that
+is *stored*. The direction matters too. Both schemes size the grid so the
+extreme element lands on the last code (INT8 `max|w|/127`, INT4 `(hi-lo)/15`),
+so a stored scale even slightly *below* the exact one pushes that element's
+code past the range, `clamp` pulls it back, and it reconstructs more than half a
+step away. Found at row 34, group 3, element 37: exact scale 0.5562500 stored as
+0.5546875, **0.281% low**, **0.0115 steps** past the bound. fp16's rounding is
+at most 2⁻¹¹ relative and the test's 1% slack absorbed it; bf16's is 2⁻⁸ and it
+does not. Fixed by taking the next representable value up whenever the cast
+rounds down — one `int16` view serves both dtypes, since the IEEE bit pattern of
+a positive float is monotonic.
+
+That fix **changed 1.17% of INT8 codes and 0.77% of INT4 codes on 0.5B**, which
+made every published 0.5B quantization quality number stale. They were re-run
+rather than left: INT8 22.2941 → **22.2838**, INT4 g32 25.6600 → **25.6464**,
+g64 26.0086 → **25.9810**, g128 27.1472 → **27.1170**. All improved slightly,
+which is what removing a clamp overshoot should do. Pure-timing tables were not
+re-run for this: the fix changes which codes are chosen, not how many bytes move.
+
+### Every parity bar rewritten in ULPs (Gotcha #45)
+
+The Phase 2/3 bars were fp16 absolutes — "benign if the reference top-1/top-2
+gap is under 0.05". Near a logit of 20, bf16's smallest step is **0.125**; a gap
+of 0.05 cannot be represented, and ordinary cached-vs-uncached drift runs
+0.3–1.25 logits. `tests/_drift.py` now expresses every bar in ULPs of the model
+dtype at that step's top-logit magnitude, each bound set from a recorded
+measurement times a stated factor:
+
+| bar | worst measured | bound |
+|---|---|---|
+| prefill, cached vs uncached | 0.5–1u | 4u |
+| cached/paged decode vs Phase 1 | 19.7u (0.5B), 11.4u (1.5B) | 32u |
+| kernels on vs off, fp32 scores both sides | 10.5u (0.5B), 5.7u (1.5B) | 16u |
+| packed vs round-trip quantized | 22.5u (0.5B), 25.2u (1.5B) | 40u |
+
+One test was asserting a stricter proxy than its own claim (Gotcha #47).
+`test_packed_weights_generate_identically_to_the_round_trip` required the packed
+and round-trip paths to emit identical tokens; it failed **20/40** on 1.5B with
+nothing wrong. The paths share a grid but not an arithmetic order — one hands
+cuBLAS a materialized weight, the other accumulates a 1536-long dot product
+inside the fused kernel. Split into the grid claim, asserted **exactly**
+(196/196 tensors reconstruct bit-identically, worst difference 0.000e+00), and
+the arithmetic-order claim, asserted as bounded ULP drift.
+
+**165 pass on 0.5B/fp16; 164 pass, 2 skip on 1.5B/bf16.**
+
+### The 1.5B numbers
+
+All measured in one session on an idle GPU (0–1% utilization, ~140 MiB held).
+32-token prompt, 64 new tokens, greedy.
+
+| Engine | tok/s @1 | tok/s @32 | vs HF |
+|---|---|---|---|
+| HuggingFace `generate()` | 20.6 | 646.1 | 1.00x |
+| paged KV cache (Phase 2) | 21.2 | 650.0 | 1.01x |
+| + custom kernels (Phase 3) | 49.0 | 1410.2 | 2.18x |
+| + CUDA-graph decode, capture every call | 90.3 | 2428.5 | 3.76x |
+| **+ CUDA-graph decode, capture once** | **108.5** | **2844.2** | **4.40x** |
+
+**The bandwidth number improves with model size: 350.6 GB/s at batch 1, 78.3% of
+this card's 448 GB/s peak**, against 66.0% on 0.5B. Decode is weight-bandwidth-
+bound, so a 3.1 GB model amortises the per-step fixed costs over twice the bytes
+a 1.0 GB model does. This is the best bandwidth figure in the project.
+
+Quantization, and three things the bigger model changes:
+
+| Precision | Weights | Compression | tok/s @1 | tok/s @32 | Peak VRAM | Perplexity | vs bf16 |
+|---|---|---|---|---|---|---|---|
+| bf16 | 3087 MB | 1.00x | 48.9 | **1388.2** | 3103 MiB | 15.11 | — |
+| **INT8** | 1778 MB | 1.74x | **57.0** | 401.7 | 1855 MiB | 15.13 | +0.17% |
+| INT4 g128 | 1153 MB | 2.68x | 52.8 | 272.9 | **1290 MiB** | 17.81 | +17.90% |
+
+- **INT4 costs less on the bigger model**: +17.90% against **+20.97%** on 0.5B.
+  More redundancy per weight, so the same 4-bit grid discards proportionally
+  less. Group sweep: g32 +10.73%, g64 +14.12%, g128 +17.90%.
+- **Whole-model compression is better (2.68x vs 2.15x) for a reason unrelated to
+  the quantizer.** The tied embedding stays unquantized and is a smaller share
+  of a bigger model: 27.6% of 0.5B, 15.1% of 1.5B. The quantized tensors
+  themselves compress identically at both sizes.
+- **The batch crossover arrives sooner.** INT8 at batch 32 is 0.29x the bf16
+  engine here against 0.79x on 0.5B. The fused kernel accumulates in scalar fp32
+  while cuBLAS rides tensor cores, so wider matrices favour cuBLAS earlier. At
+  batch 1 under graphs the trade is still good: INT8 decode **1.61x** the bf16
+  graph engine, at 324.2 GB/s.
+
+bf16 perplexity baseline **15.11 ± 3.24% (1 s.e.)**, so INT8's +0.17% is again
+lossless within measurement precision.
+
+### Two ways the harness would have misreported a non-default model
+
+Both found by running it, not by reading it. Four scripts printed **"fp16"** in
+their methodology line and their unquantized row while the engine ran bf16 — a
+false statement about the measurement, which under rule 3 is worse than a
+missing one. And `bench/quant_speed.py` hard-coded the 0.5B projection shapes
+(896, 4864), so on 1.5B it would have measured the wrong matrices under the
+right activations and labelled the result 1.5B. Mode *identifiers* stay "fp16"
+(they are CLI values and JSON keys); every displayed label now names the dtype
+in use, and shapes come from the selected checkpoint.
+
+### The 0.5B headline table is now one session
+
+Two 0.5B result files said in their own footers that they were measured on a
+contended GPU and that their absolutes were not publishable — and two headline
+claims cited them anyway. With the machine idle, `decode_graph`, `quant_graph`,
+`phase2_cache`, `phase3_end_to_end` and `decode_graph_runner` were all re-run
+together, so the README's "vs HF" column no longer needs the ~10% cross-session
+caveat it used to carry:
+
+| | was | now |
+|---|---|---|
+| headline, capture once, batch 32 | 6,909.0 tok/s, 9.67x HF (cross-session) | **7,114.2 tok/s, 9.40x HF** (one session) |
+| graphed decode vs eager, b1 | 5.19x (17.88 → 3.45 ms) | **5.07x** (16.93 → 3.34 ms) |
+| graphed decode vs eager, b32 | 4.94x (20.43 → 4.14 ms) | **4.75x** (19.10 → 4.03 ms) |
+| graphed fp16 b1 bandwidth | 64.4% of peak | **66.0%** of peak |
+| reused runner vs one-shot, b32, 64 tok | 3.17x → 4.38x | 3.04x → **4.21x** |
+
+Every ratio moved by a few percent and none changed a conclusion — which is the
+argument for round-robin arms, not for trusting a contended absolute. The
+batch-1 graphed step is now corroborated at **3.34 ms by two separate scripts**
+with independent timing loops (`decode_graph` and `quant_graph`).
